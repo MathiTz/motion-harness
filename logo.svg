@@ -1,0 +1,17 @@
+<svg width="200" height="200" viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
+  <!-- Background -->
+  <rect width="200" height="200" rx="40" fill="#1a1b26" />
+  
+  <!-- Orbital Ring (The Harness) -->
+  <circle cx="100" cy="100" r="70" stroke="#7aa2f7" stroke-width="8" fill="none" stroke-dasharray="400 100" stroke-linecap="round" />
+  
+  <!-- The Stylized 'M' (Motion) -->
+  <path d="M60 130 V70 L100 110 L140 70 V130" 
+        stroke="#bb9af7" stroke-width="12" fill="none" stroke-linejoin="round" stroke-linecap="round" />
+  
+  <!-- Accent Dot (The Core/Agent) -->
+  <circle cx="100" cy="110" r="6" fill="#f7768e" />
+  
+  <!-- Subtle Glow -->
+  <circle cx="100" cy="100" r="85" stroke="#7aa2f7" stroke-width="2" fill="none" opacity="0.3" />
+</svg>
