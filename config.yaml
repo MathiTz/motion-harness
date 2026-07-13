@@ -1,0 +1,36 @@
+# Motion Harness Configuration
+
+# General Settings
+workspace_path: "/Users/user/Documents/projects/motion-harness"
+default_theme: "one_dark"
+max_parallel_tasks: null  # Set to integer to override CPU-based auto-scaling
+
+# Provider Configuration
+# You can define multiple providers and pick one as default.
+providers:
+  default: "claude-3-5"
+  
+  claude-3-5:
+    name: "Claude 3.5 Sonnet"
+    endpoint: "https://api.anthropic.com"
+    api_key: "your-anthropic-key-here"
+    provider_type: "cloud"
+    options:
+      temperature: 0.7
+      max_tokens: 4096
+
+  local-llama:
+    name: "Llama 3 (Local)"
+    endpoint: "http://localhost:11434"
+    api_key: null
+    provider_type: "local"
+    options:
+      temperature: 0.6
+
+  gpt-4o:
+    name: "GPT-4o"
+    endpoint: "https://api.openai.com/v1"
+    api_key: "your-openai-key-here"
+    provider_type: "cloud"
+    options:
+      temperature: 0.8
