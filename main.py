@@ -1,0 +1,60 @@
+from core.providers import ModelConfig, ProviderFactory
+from core.caveman import CavemanProtocol
+from memory.db import MemoryDB
+from memory.retriever import HybridRetriever
+import asyncio
+
+class MotionAgent:
+    def __init__(self, model_config: ModelConfig, memory_path: str = "motion_memory.db"):
+        self.provider = ProviderFactory.get_provider(model_config)
+        self.memory = MemoryDB(memory_path)
+        self.retriever = HybridRetriever(self.memory, self) # The agent acts as the embedding provider for now
+        self.caveman = CavemanProtocol(enabled=True)
+
+    async def get_embedding(self, text: str):
+        # Mock embedding for architectural verification
+        return [float(len(text)) / 100.0] * 128
+
+    async def run(self, prompt: str, target: str = "user"):
+        # 1. Memory Recall (Retrieve relevant context)
+        context_chunks = await self.retriever.retrieve(prompt)
+        context_text = "\n".join([c["content"] for c in context_chunks])
+        
+        # 2. Construct System Prompt
+        system_prompt = f"You are Motion Agent. Memory Context:\n{context_text}"
+        
+        # 3. Model Completion
+        raw_response = await self.provider.complete(prompt, system_prompt=system_prompt)
+        
+        # 4. Caveman Compression (if target is not the user)
+        final_response = self.caveman.process_outgoing(raw_response, target=target)
+        
+        return final_response
+
+async def test_compression():
+    # Config for a mock cloud provider
+    config = ModelConfig(name="Claude-3.5", endpoint="https://api.anthropic.com", provider_type="cloud")
+    agent = MotionAgent(config)
+
+    # A typical "fluffy" response that an LLM would generate
+    fluffy_response = "Certainly! I have analyzed the files and found that the bug is in line 42. I'm sorry for the inconvenience. Please let me know if you need further assistance."
+    
+    # Case 1: Target is User (Should NOT be compressed)
+    user_output = agent.caveman.process_outgoing(fluffy_response, target="user")
+    
+    # Case 2: Target is another Agent (Should be compressed)
+    agent_output = agent.caveman.process_outgoing(fluffy_response, target="agent")
+
+    print(f"Original: {fluffy_response}")
+    print(f"To User:   {user_output}")
+    print(f"To Agent:  {agent_output}")
+    
+    # Verification
+    assert user_output == fluffy_response
+    assert "Certainly!" not in agent_output
+    assert "I'm sorry" not in agent_output
+    assert len(agent_output) < len(fluffy_response)
+    print("\n✅ Caveman integration verified: Tokens reduced for internal communication!")
+
+if __name__ == "__main__":
+    asyncio.run(test_compression())
