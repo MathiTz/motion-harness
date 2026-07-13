@@ -22,7 +22,7 @@ jobs:
       - name: Run Integration Tests
         run: |
           pip install -r requirements.txt
-          pytest tests/test_integration.py
+          PYTHONPATH=. pytest tests/test_integration.py
 
       - name: Read Version
         id: version_step
