@@ -1,0 +1,7 @@
+textual
+pytest
+sqlite-vec
+pyyaml
+# For async support and potential API calls
+httpx
+asyncio
