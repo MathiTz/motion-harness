@@ -1,9 +1,10 @@
-from core.providers import ModelConfig, ProviderFactory
+from core.providers import ModelConfig, ProviderFactory, LocalProvider
 from core.caveman import CavemanProtocol
 from core.learning import SkillSynthesizer, Trajectory
-from memory.db import MemoryDB
+from memory.db import MemoryDB, EMBEDDING_DIM
 from memory.retriever import HybridRetriever
 import asyncio
+import hashlib
 import logging
 
 logger = logging.getLogger(__name__)
@@ -17,8 +18,23 @@ class MotionAgent:
         self.synthesizer = SkillSynthesizer(model_config, self.memory)
 
     async def get_embedding(self, text: str):
-        # Default embedding provider; replace with real model embedding in production
-        return [float(len(text)) / 100.0] * 128
+        """Generate embeddings using the provider's embedding endpoint.
+        Falls back to a deterministic hash-based vector if the provider
+        does not support embeddings (e.g. cloud-only setups without a
+        local model).
+        """
+        if isinstance(self.provider, LocalProvider):
+            try:
+                return await self.provider.embed(text)
+            except Exception as e:
+                logger.warning(f"Embedding call failed, using fallback: {e}")
+
+        # Fallback: deterministic hash-based vector for testing / cloud-only setups
+        import hashlib
+        h = hashlib.sha256(text.encode()).digest()
+        vec = [float(b) / 255.0 for b in h[:EMBEDDING_DIM]]
+        norm = sum(v * v for v in vec) ** 0.5 or 1.0
+        return [v / norm for v in vec]
 
     async def run(self, prompt: str, target: str = "user"):
         # 1. Memory Recall

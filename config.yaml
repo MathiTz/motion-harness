@@ -7,15 +7,18 @@ max_parallel_tasks: null  # Set to integer to override CPU-based auto-scaling
 
 # Provider Configuration
 # You can define multiple providers and pick one as default.
+# API keys can be set here or via environment variables:
+#   ANTHROPIC_API_KEY, OPENAI_API_KEY, PROXY_API_KEY
 providers:
   default: "claude-3-5"
-  
+
   claude-3-5:
     name: "Claude 3.5 Sonnet"
     endpoint: "https://api.anthropic.com"
-    api_key: "your-anthropic-key-here"
+    api_key: null  # Set via ANTHROPIC_API_KEY env var
     provider_type: "cloud"
     options:
+      model: "claude-3-5-sonnet-20241022"
       temperature: 0.7
       max_tokens: 4096
 
@@ -25,12 +28,24 @@ providers:
     api_key: null
     provider_type: "local"
     options:
+      model: "llama3"
       temperature: 0.6
+      embed_model: "nomic-embed-text"
 
   gpt-4o:
     name: "GPT-4o"
     endpoint: "https://api.openai.com/v1"
-    api_key: "your-openai-key-here"
+    api_key: null  # Set via OPENAI_API_KEY env var
     provider_type: "cloud"
     options:
+      model: "gpt-4o"
       temperature: 0.8
+      max_tokens: 4096
+
+# Embedding configuration
+# Used for semantic search in the Hybrid Memory layer.
+# Local providers use Ollama /api/embeddings; cloud-only setups
+# fall back to a deterministic hash-based vector.
+embedding:
+  provider: "local-llama"  # Which provider to use for embeddings
+  dimension: 128
