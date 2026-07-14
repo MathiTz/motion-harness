@@ -208,19 +208,19 @@ class ProviderSelectScreen(Screen):
     }
     #provider_subtitle {
         text-align: center;
-        color: $secondary;
+        color: $text-muted;
         margin-bottom: 1;
     }
     #provider_list {
         height: auto;
         max-height: 22;
-        border: solid $panel;
+        border: solid $border;
         padding: 0 1;
         background: $surface;
     }
     #provider_status {
         text-align: center;
-        color: $secondary;
+        color: $text-muted;
         margin-top: 1;
     }
     """
@@ -369,7 +369,7 @@ class ChatPane(Container):
         margin: 0 0;
     }
     .system_msg {
-        color: $secondary;
+        color: $text-muted;
         text-style: italic;
         padding: 0 1;
         margin: 0 0;
@@ -844,7 +844,7 @@ class SettingsPane(Container):
     .settings_row {
         margin-top: 0;
         height: auto;
-        color: $secondary;
+        color: $text-muted;
     }
     #provider_select {
         margin-top: 0;
@@ -865,7 +865,7 @@ class SettingsPane(Container):
         color: $foreground;
     }
     #settings_workers {
-        color: $secondary;
+        color: $text-muted;
     }
     """
 
@@ -1004,7 +1004,7 @@ class MotionTUI(App):
     .msg { margin: 0 0; padding: 0 1; }
     .user_msg { color: $primary; text-style: bold; }
     .agent_msg { color: $foreground; }
-    .system_msg { color: $secondary; text-style: italic; }
+    .system_msg { color: $text-muted; text-style: italic; }
     """
 
     BINDINGS = [
