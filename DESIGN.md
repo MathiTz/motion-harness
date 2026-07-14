@@ -53,11 +53,11 @@ The "Aha!" moment. When a task is completed:
 4. Saves the skill to the filesystem and the vector DB for future retrieval.
 
 ### 4. Ergonomic Optimizations
-- **Caveman Protocol**: Internal prompts and tool outputs are passed through a "compressor" that removes polite fillers and redundancies, reducing token cost by ~30-50%.
-- **Ponytail UI**: A streaming-first terminal interface that renders tool logs in real-time, allowing the user to interrupt or steer the agent mid-execution.
+- **Caveman Protocol**: Internal prompts and tool outputs are passed through a "compressor" that removes polite fillers and redundancies, reducing token cost by ~30-50%. The compression is reversible: `CavemanCompressor.expand()` reconstructs natural language from compressed fragments using tracked tag maps.
+- **Motion TUI**: A streaming-first terminal interface (built with Textual) that renders tool logs in real-time, displays task orchestration status, and allows the user to interrupt or steer the agent mid-execution.
 
 ## 🗺️ Implementation Phases
-1. **Phase 1: Memory Foundation** (SQLite setup + Facilitator).
-2. **Phase 2: Retrieval Integration** (Integrating semantic search into the system prompt).
-3. **Phase 3: The Learning Loop** (Implementing Skill Synthesis).
-4. **Phase 4: DX & Optimization** (Caveman mode & TUI).
+1. **Phase 1: Memory Foundation** (SQLite setup + Facilitator) — ✅ Complete
+2. **Phase 2: Retrieval Integration** (Integrating semantic search into the system prompt) — ✅ Complete (sqlite-vec wired, numpy cosine fallback)
+3. **Phase 3: The Learning Loop** (Implementing Skill Synthesis) — ✅ Complete (wired into MotionAgent.run)
+4. **Phase 4: DX & Optimization** (Caveman mode & TUI) — 🟡 In Progress (Caveman bidirectional, TUI with orchestration panel; providers still mock)

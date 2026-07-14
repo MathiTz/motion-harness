@@ -67,7 +67,7 @@ When a complex task is solved, the harness doesn't just forget. It analyzes the 
 
 ### 🎨 Pro-Grade TUI
 A high-performance terminal interface built with `Textual`. Featuring:
-- **Multi-Theme Support**: One Dark, Nord, Dracula.
+- **Multi-Theme Support**: One Dark, Solarized Light, Nord, Dracula.
 - **Live Task Monitoring**: Real-time status of parallel agent workers.
 - **Workspace Management**: Instant context switching between projects.
 

@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5.6.0
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Integration Tests
+        run: PYTHONPATH=. pytest tests/
+
+      - name: Lint
+        run: python -m py_compile main.py && python -m py_compile core/caveman.py && python -m py_compile core/config.py && python -m py_compile core/learning.py && python -m py_compile core/orchestrator.py && python -m py_compile core/providers.py && python -m py_compile memory/db.py && python -m py_compile memory/facilitator.py && python -m py_compile memory/retriever.py

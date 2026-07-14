@@ -35,10 +35,10 @@ fi
 
 # Add the alias to the config file
 # We use a function for fish and an alias for bash/zsh
-if [[ "$SHELL_FILE" == *".fish" ]]; then
-    ALIAS_CMD="function motion; docker run -it --rm -v \"(pwd):/app\" -v \"\$HOME/.motion_harness:/root/.hermes\" motion-harness; end"
+if [[ "$SHELL_FILE" == *.fish ]]; then
+    ALIAS_CMD="function motion; docker run -it --rm -v \"(pwd):/app\" -v \"$HOME/.motion_harness:/root/.hermes\" motion-harness; end"
 else
-    ALIAS_CMD="alias motion='docker run -it --rm -v \"\$(pwd):/app\" -v \"\$HOME/.motion_harness:/root/.hermes\" motion-harness'"
+    ALIAS_CMD="alias motion='docker run -it --rm -v \"$(pwd):/app\" -v \"$HOME/.motion_harness:/root/.hermes\" motion-harness'"
 fi
 
 # Check if alias already exists to avoid duplicates
@@ -52,6 +52,6 @@ fi
 echo "-----------------------------------------------------------------"
 echo "✨ Installation Complete!"
 echo "1. Please restart your terminal or run: source $SHELL_FILE"
-echo, "2. You can now launch the harness from any project folder using:"
+echo "2. You can now launch the harness from any project folder using:"
 echo "   motion"
 echo "-----------------------------------------------------------------"

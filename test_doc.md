@@ -1,1 +1,0 @@
-The Motion Harness uses a hybrid retrieval system with FTS5 and Vector DB.

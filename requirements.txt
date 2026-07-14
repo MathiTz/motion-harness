@@ -1,8 +1,7 @@
-textual
-pytest
-pytest-asyncio
-sqlite-vec
-pyyaml
-# For async support and potential API calls
-httpx
-asyncio
+textual>=3.0,<4.0
+pytest>=8.0,<9.0
+pytest-asyncio>=0.24,<1.0
+sqlite-vec>=0.1,<1.0
+pyyaml>=6.0,<7.0
+httpx>=0.27,<1.0
+numpy>=2.0,<3.0
