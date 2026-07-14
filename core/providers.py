@@ -74,7 +74,7 @@ class CloudProvider(BaseProvider):
 
     async def complete(self, prompt: str, system_prompt: str = "", **kwargs) -> str:
         endpoint = self.config.endpoint
-        api_key = self.config.api_key or os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
+        api_key = self.config.api_key or os.environ.get("OLLAMA_API_KEY") or os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
 
         # Detect provider family from endpoint
         if "anthropic" in endpoint:

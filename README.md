@@ -37,14 +37,28 @@ It treats every successful task trajectory as a learning event, crystallizing ex
 Get the harness running in under 60 seconds.
 
 ```bash
-# 1. Run the automated installer
+# 1. Run the installer
 chmod +x install.sh && ./install.sh
 
 # 2. Refresh your shell
-source ~/.config/fish/config.fish # or your shell equivalent
+source ~/.config/fish/config.fish  # or .zshrc / .bashrc
 
-# 3. Launch the TUI
+# 3. Configure your provider
+cp config.example.yml config.yml
+# Edit config.yml — set your API keys in .env or directly in config.yml
+
+# 4. Launch
 motion
+```
+
+### CLI Usage
+
+```
+motion                                    # Launch TUI (default)
+motion --provider ollama-cloud/glm-5.2    # TUI with specific provider/model
+motion --chat                             # Legacy REPL mode
+motion --list                             # List available providers/models
+motion --test                             # Run Caveman compression test
 ```
 
 *For detailed native installation and GPU configuration, see the [Setup Guide](docs/setup.md).*
@@ -67,9 +81,14 @@ When a complex task is solved, the harness doesn't just forget. It analyzes the 
 
 ### 🎨 Pro-Grade TUI
 A high-performance terminal interface built with `Textual`. Featuring:
-- **Multi-Theme Support**: One Dark, Solarized Light, Nord, Dracula.
-- **Live Task Monitoring**: Real-time status of parallel agent workers.
-- **Workspace Management**: Instant context switching between projects.
+- **5-Tab Interface**: Chat, Tasks, Skills, Memory, Settings
+- **Provider Dropdown**: Switch models at runtime without restarting
+- **4 Native Themes**: One Dark, Solarized Light, Nord, Dracula — cascade through every widget
+- **Live Task Monitoring**: Real-time status of parallel agent workers with ⏳⚙️✅❌ indicators
+- **Memory Search**: Hybrid semantic + keyword search directly in the TUI
+- **Skill Browser**: Browse, search, and inspect crystallized skills
+- **Dashboard Integration**: One-click open to the admin dashboard at `https://localhost:7860/`
+- **Ctrl+C cancels requests** (doesn't kill the app), **Ctrl+Q quits**
 
 ---
 

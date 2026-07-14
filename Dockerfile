@@ -23,4 +23,4 @@ ENV PYTHONPATH=/app
 ENV PYTHONUNBUFFERED=1
 
 # Command to run the TUI
-CMD ["python3", "ui/tui.py"]
+CMD ["python3", "main.py"]

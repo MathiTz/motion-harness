@@ -1,4 +1,5 @@
 from core.providers import ModelConfig, ProviderFactory, LocalProvider
+from core.config import ConfigManager
 from core.caveman import CavemanProtocol
 from core.learning import SkillSynthesizer, Trajectory
 from memory.db import MemoryDB, EMBEDDING_DIM
@@ -6,7 +7,9 @@ from memory.retriever import HybridRetriever
 import asyncio
 import hashlib
 import logging
+import os
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 class MotionAgent:
@@ -67,8 +70,59 @@ class MotionAgent:
 
         return final_response
 
+def load_agent_from_config(config_path: str = "", provider_id: str | None = None) -> MotionAgent:
+    """Load a MotionAgent using settings from config.yml (or config.example.yml) and .env."""
+    # Load .env file if present
+    config_dir = os.path.dirname(os.path.abspath(config_path)) if config_path else "."
+    env_path = os.path.join(config_dir, ".env")
+    if os.path.exists(env_path):
+        with open(env_path) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key, _, value = line.partition("=")
+                    key, value = key.strip(), value.strip()
+                    if key and value:
+                        os.environ.setdefault(key, value)
+
+    cm = ConfigManager(config_path)
+    provider_id = provider_id or cm.get_default_provider()
+    provider_cfg = cm.get_provider_config(provider_id)
+
+    model_config = ModelConfig(
+        name=provider_cfg.get("name", provider_id),
+        endpoint=provider_cfg["endpoint"],
+        api_key=provider_cfg.get("api_key"),
+        provider_type=provider_cfg.get("provider_type", "cloud"),
+        options=provider_cfg.get("options", {}),
+    )
+    return MotionAgent(model_config)
+
+
+def list_providers(config_path: str = ""):
+    """Print available providers and models from config."""
+    cm = ConfigManager(config_path)
+    default = cm.get_default_provider()
+    print("Available providers:")
+    for pid, name, models, is_default, has_key in cm.list_providers():
+        marker = " ← default" if is_default and '/' not in default else ""
+        key_icon = "🔑" if has_key else "🔒"
+        if len(models) > 1:
+            print(f"  {key_icon} {pid:20s} {name}")
+            for m in models:
+                sel = "*" if (is_default and f"{pid}/{m}" == default) or (is_default and m == models[0] and '/' not in default) else " "
+                print(f"    {sel} {m}")
+        else:
+            m = models[0] if models else "?"
+            sel = "*" if is_default else " "
+            print(f"  {key_icon} {pid:20s} {name:30s} model={m}{marker}")
+    print(f"\nUsage: python main.py --provider ollama-cloud/gemma4:31b")
+    print(f"       python main.py --provider ollama-cloud          # uses default model")
+
+
 async def test_compression():
-    config = ModelConfig(name="Claude-3.5", endpoint="https://api.anthropic.com", provider_type="cloud")
+    """Test Caveman compression without needing a live model."""
+    config = ModelConfig(name="Test", endpoint="https://ollama.com/v1", provider_type="cloud")
     agent = MotionAgent(config)
 
     fluffy_response = "Certainly! I have analyzed the files and found that the bug is in line 42. I'm sorry for the inconvenience. Please let me know if you need further assistance."
@@ -92,5 +146,65 @@ async def test_compression():
     assert len(agent_output) < len(fluffy_response)
     print("\n✅ Caveman integration verified: Tokens reduced for internal communication!")
 
+
+async def interactive_chat(provider_id: str | None = None):
+    """Interactive chat using the configured provider (fallback non-TUI mode)."""
+    agent = load_agent_from_config(provider_id=provider_id)
+    provider_name = agent.provider.config.name
+    print(f"🤖 Motion Agent — using {provider_name}")
+    print("Type a message (or 'quit' to exit):\n")
+
+    try:
+        while True:
+            try:
+                prompt = input("You> ").strip()
+            except EOFError:
+                break
+            if not prompt or prompt.lower() in ("quit", "exit", "q"):
+                break
+            try:
+                response = await agent.run(prompt)
+                print(f"\nAgent> {response}\n")
+            except Exception as e:
+                print(f"\n❌ Error: {e}\n")
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        print("\n\n👋 Bye!")
+    finally:
+        try:
+            await asyncio.wait_for(agent.provider.close(), timeout=2.0)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            pass
+        agent.memory.close()
+
+
 if __name__ == "__main__":
-    asyncio.run(test_compression())
+    import sys
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Motion Agent")
+    parser.add_argument("--test", action="store_true", help="Run Caveman compression test (no model needed)")
+    parser.add_argument("--list", action="store_true", help="List available providers")
+    parser.add_argument("--provider", type=str, default=None, help="Provider to use (e.g. ollama-cloud, ollama-cloud/gemma4:31b, claude-3-5)")
+    parser.add_argument("--chat", action="store_true", help="Launch in chat REPL mode instead of TUI")
+    args = parser.parse_args()
+
+    if args.list:
+        list_providers()
+    elif args.test:
+        asyncio.run(test_compression())
+    elif args.chat:
+        asyncio.run(interactive_chat(provider_id=args.provider))
+    else:
+        # Launch the TUI by default
+        from ui.tui import launch_tui
+        config = ConfigManager()
+        provider_id = args.provider or config.get_default_provider()
+        provider_cfg = config.get_provider_config(provider_id)
+        model_config = ModelConfig(
+            name=provider_cfg.get("name", provider_id),
+            endpoint=provider_cfg["endpoint"],
+            api_key=provider_cfg.get("api_key"),
+            provider_type=provider_cfg.get("provider_type", "cloud"),
+            options=provider_cfg.get("options", {}),
+        )
+        launch_tui(model_config, provider_id=provider_id)
