@@ -5,13 +5,14 @@ Built on Textual with native theme switching and runtime provider selection.
 
 Screens:
   - ProviderSelect: Pick a provider/model at startup
-  - MainScreen:     Tabbed hub (Chat, Tasks, Skills, Memory, Settings)
+  - MainScreen:     Tabbed hub (Chat, Tasks, Skills, KB, Memory, Settings)
 
 Key features:
   - Themes cascade through every widget via Textual's ``$variable`` system
   - Ctrl+T cycles themes instantly
   - Settings tab has a SelectableDropdown for switching provider/model at runtime
   - Ctrl+C cancels the current request; Ctrl+Q quits
+  - KB tab: knowledge base for reference docs that don't become skills
 
 Launch:  python main.py              → TUI (default)
          python main.py --chat       → old REPL
@@ -53,6 +54,7 @@ from main import MotionAgent
 from ui.themes import ThemeRegistry
 
 WORKSPACE = os.getenv("MOTION_WORKSPACE", os.getcwd())
+KB_DIR = os.path.join(WORKSPACE, "knowledge")
 DASHBOARD_URL = "https://localhost:7860/"
 DASHBOARD_ADMIN_KEY = "ME27dXc6uoEC_dWXJCyPVDPN"
 
@@ -137,6 +139,17 @@ class ChatMessage(Static):
         super().__init__(formatted, classes=f"msg {sender}_msg", **kwargs)
 
 
+class KBEntry(Static):
+    """A single knowledge base entry row."""
+
+    def __init__(self, title: str, preview: str, entry_type: str = "doc", **kwargs) -> None:
+        safe_title = title.replace("[", "\\[").replace("]", "\\]")
+        safe_preview = preview.replace("[", "\\[").replace("]", "\\]")[:120]
+        icon = {"doc": "📄", "url": "🔗", "snippet": "✂️", "note": "📝"}.get(entry_type, "📄")
+        display = f"{icon} [bold]{safe_title}[/]\n  [dim]{safe_preview}[/]"
+        super().__init__(display, classes="kb_entry", **kwargs)
+
+
 class TaskRow(Static):
     """One row in the task panel."""
 
@@ -195,19 +208,19 @@ class ProviderSelectScreen(Screen):
     }
     #provider_subtitle {
         text-align: center;
-        color: $text-muted;
+        color: $secondary;
         margin-bottom: 1;
     }
     #provider_list {
         height: auto;
         max-height: 22;
-        border: solid $border;
+        border: solid $panel;
         padding: 0 1;
-        background: $background;
+        background: $surface;
     }
     #provider_status {
         text-align: center;
-        color: $text-muted;
+        color: $secondary;
         margin-top: 1;
     }
     """
@@ -293,6 +306,8 @@ class MainScreen(Screen):
                 yield TasksPane(self.state)
             with TabPane("🎓 Skills", id="skills_tab"):
                 yield SkillsPane(self.state)
+            with TabPane("📚 KB", id="kb_tab"):
+                yield KBPane(self.state)
             with TabPane("🧠 Memory", id="memory_tab"):
                 yield MemoryPane(self.state)
             with TabPane("🔧 Settings", id="settings_tab"):
@@ -325,10 +340,11 @@ class ChatPane(Container):
         padding: 0 1;
         overflow-y: auto;
         scrollbar-size: 1 1;
-        background: $background;
+        background: $surface;
     }
     #chat_input_row {
         height: auto;
+        dock: bottom;
         padding: 1 0 0 0;
     }
     #chat_input {
@@ -353,7 +369,7 @@ class ChatPane(Container):
         margin: 0 0;
     }
     .system_msg {
-        color: $text-muted;
+        color: $secondary;
         text-style: italic;
         padding: 0 1;
         margin: 0 0;
@@ -418,7 +434,7 @@ class TasksPane(Container):
         border: round $primary;
         border-title: " Tasks ";
         padding: 1;
-        background: $background;
+        background: $surface;
     }
     #tasks_header {
         height: auto;
@@ -511,7 +527,7 @@ class SkillsPane(Container):
         border: round $primary;
         border-title: " Skills ";
         padding: 1;
-        background: $background;
+        background: $surface;
     }
     #skills_header {
         color: $primary;
@@ -576,6 +592,151 @@ class SkillsPane(Container):
         self._load_skills(query=event.value.strip().lower())
 
 
+# ─── Knowledge Base pane ──────────────────────────────────────────────────────
+
+class KBPane(Container):
+    """Browse and search the knowledge base (reference docs that aren't skills)."""
+
+    CSS = """
+    #kb_container {
+        height: 1fr;
+        border: round $primary;
+        border-title: " Knowledge Base ";
+        padding: 1;
+        background: $surface;
+    }
+    #kb_header {
+        color: $primary;
+        text-style: bold;
+    }
+    #kb_list {
+        height: 1fr;
+        scrollbar-size: 1 1;
+    }
+    #kb_search {
+        height: auto;
+        padding: 0 0 1 0;
+    }
+    #kb_search_input {
+        border: round $primary;
+    }
+    #kb_add_row {
+        height: auto;
+        padding: 0 0 0 0;
+    }
+    #kb_add_title {
+        height: 3;
+        margin-right: 1;
+    }
+    #kb_add_btn {
+        margin-right: 1;
+    }
+    #kb_add_area {
+        height: 5;
+        margin-top: 1;
+        border: round $primary;
+    }
+    .kb_entry {
+        padding: 0 1;
+        margin: 0 0;
+    }
+    """
+
+    def __init__(self, state: AppState, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.state = state
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="kb_container"):
+            yield Label("📚 Knowledge Base", id="kb_header")
+            with Horizontal(id="kb_search"):
+                yield Input(placeholder="Search knowledge base…", id="kb_search_input")
+            yield VerticalScroll(id="kb_list")
+            with Horizontal(id="kb_add_row"):
+                yield Input(placeholder="Title for new entry…", id="kb_add_title")
+                yield Button("Add", id="kb_add_btn", classes="settings_btn")
+            yield Input(placeholder="Content or paste text…", id="kb_add_area")
+
+    def on_mount(self) -> None:
+        self._load_kb()
+
+    def _load_kb(self, query: str = "") -> None:
+        kb_dir = Path(KB_DIR)
+        kl = self.query_one("#kb_list", VerticalScroll)
+        for child in list(kl.children):
+            child.remove()
+
+        if not kb_dir.exists():
+            kl.mount(Static("[dim]No knowledge base entries yet. Use the form below to add one.[/]", classes="kb_entry"))
+            return
+
+        md_files = sorted(kb_dir.glob("*.md"))
+        if query:
+            md_files = [f for f in md_files if query in f.stem.lower() or query in f.read_text(errors="replace").lower()]
+
+        if not md_files:
+            kl.mount(Static(f"[dim]No entries matching '{query}'.[/]", classes="kb_entry"))
+            return
+
+        for f in md_files:
+            name = f.stem.replace("_", " ").title()
+            sz = f.stat().st_size
+            mtime = datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+            entry_type = "note"
+            # Read first line for type hint
+            first_line = f.read_text(errors="replace").split("\n", 1)[0].lower()
+            if first_line.startswith("http"):
+                entry_type = "url"
+            elif first_line.startswith("#"):
+                entry_type = "doc"
+            kl.mount(KBEntry(name, f.read_text(errors="replace")[:200], entry_type=entry_type))
+
+    async def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "kb_search_input":
+            self._load_kb(query=event.value.strip().lower())
+
+    async def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "kb_add_btn":
+            title_input = self.query_one("#kb_add_title", Input)
+            content_input = self.query_one("#kb_add_area", Input)
+            title = title_input.value.strip()
+            content = content_input.value.strip()
+            if not title:
+                self.notify("Enter a title for the KB entry", severity="warning")
+                return
+            if not content:
+                self.notify("Enter content for the KB entry", severity="warning")
+                return
+
+            # Save to knowledge/ directory
+            kb_dir = Path(KB_DIR)
+            kb_dir.mkdir(parents=True, exist_ok=True)
+            safe_name = title.replace(" ", "_").lower()
+            # Remove any path separators or unsafe chars
+            safe_name = "".join(c for c in safe_name if c.isalnum() or c in "_-")
+            file_path = kb_dir / f"{safe_name}.md"
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(f"# {title}\n\n{content}\n")
+
+            # Also index into memory DB if agent is available
+            if self.state.agent:
+                from memory.db import MemoryChunk
+                try:
+                    self.state.agent.memory.add_memory(MemoryChunk(
+                        content=content,
+                        embedding=[0.0] * 128,
+                        metadata={"file": str(file_path), "type": "KB"},
+                        mem_type="DOC",
+                    ))
+                except Exception:
+                    pass
+
+            title_input.value = ""
+            content_input.value = ""
+            self.notify(f"Added KB entry: {title}")
+            self._load_kb()
+
+
 # ─── Memory pane ──────────────────────────────────────────────────────────────
 
 class MemoryPane(Container):
@@ -587,7 +748,7 @@ class MemoryPane(Container):
         border: round $primary;
         border-title: " Memory ";
         padding: 1;
-        background: $background;
+        background: $surface;
     }
     #memory_results {
         height: 1fr;
@@ -666,7 +827,7 @@ class SettingsPane(Container):
         border: round $primary;
         border-title: " Settings ";
         padding: 1 2;
-        background: $background;
+        background: $surface;
         scrollbar-size: 1 1;
     }
     .settings_label {
@@ -683,7 +844,7 @@ class SettingsPane(Container):
     .settings_row {
         margin-top: 0;
         height: auto;
-        color: $text-muted;
+        color: $secondary;
     }
     #provider_select {
         margin-top: 0;
@@ -704,7 +865,7 @@ class SettingsPane(Container):
         color: $foreground;
     }
     #settings_workers {
-        color: $text-muted;
+        color: $secondary;
     }
     """
 
@@ -843,7 +1004,7 @@ class MotionTUI(App):
     .msg { margin: 0 0; padding: 0 1; }
     .user_msg { color: $primary; text-style: bold; }
     .agent_msg { color: $foreground; }
-    .system_msg { color: $text-muted; text-style: italic; }
+    .system_msg { color: $secondary; text-style: italic; }
     """
 
     BINDINGS = [
