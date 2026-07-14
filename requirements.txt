@@ -1,5 +1,6 @@
 textual
 pytest
+pytest-asyncio
 sqlite-vec
 pyyaml
 # For async support and potential API calls

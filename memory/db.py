@@ -32,16 +32,14 @@ class MemoryDB:
     def keyword_search(self, query: str, limit: int = 5) -> List[Tuple[float, str]]:
         if not query:
             return []
-        
-        # FTS5 MATCH requires the query to be a literal string wrapped in double quotes.
-        # We escape any double quotes inside the query by doubling them.
-        sanitized_query = f'"{query.replace('"', '""')}"'
-        
-        with sqlite3.connect(self.db_path) as conn:
-            # FTS5 MATCH does not support parameterization via '?', so we use an f-string.
-            sql = f"SELECT rank, content FROM memories_fts WHERE memories_fts MATCH {sanitized_query} ORDER BY rank LIMIT {limit}"
-            cursor = conn.execute(sql)
-            return cursor.fetchall()
+
+        # Treat the input as a phrase to avoid FTS parser issues with punctuation.
+        escaped_query = query.replace('"', '""')
+        phrase_query = f'"{escaped_query}"'
+
+        sql = "SELECT rank, content FROM memories_fts WHERE memories_fts MATCH ? ORDER BY rank LIMIT ?"
+        cursor = self.conn.execute(sql, (phrase_query, limit))
+        return cursor.fetchall()
 
     def semantic_search(self, query_embedding: List[float], limit: int = 5) -> List[Tuple[float, str]]:
         cursor = self.conn.execute("SELECT content, embedding FROM memories LIMIT 100")
