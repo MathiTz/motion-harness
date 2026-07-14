@@ -84,9 +84,8 @@ class MemoryDB:
                 """SELECT m.content, v.distance
                    FROM memories_vec v
                    JOIN memories m ON m.id = v.rowid
-                   WHERE v.embedding MATCH ?
-                   ORDER BY v.distance
-                   LIMIT ?""",
+                   WHERE v.embedding MATCH ? AND k = ?
+                   ORDER BY v.distance""",
                 (query_blob, limit),
             ).fetchall()
             return [(row[1], row[0]) for row in rows]

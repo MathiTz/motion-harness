@@ -30,9 +30,9 @@ class MotionAgent:
                 logger.warning(f"Embedding call failed, using fallback: {e}")
 
         # Fallback: deterministic hash-based vector for testing / cloud-only setups
-        import hashlib
         h = hashlib.sha256(text.encode()).digest()
-        vec = [float(b) / 255.0 for b in h[:EMBEDDING_DIM]]
+        raw = [float(b) / 255.0 for b in h]  # 32 floats from 32 bytes
+        vec = (raw * ((EMBEDDING_DIM // len(raw)) + 1))[:EMBEDDING_DIM]
         norm = sum(v * v for v in vec) ** 0.5 or 1.0
         return [v / norm for v in vec]
 

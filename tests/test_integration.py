@@ -18,9 +18,11 @@ class MockProvider:
 
 class MockEmbeddingProvider:
     async def get_embedding(self, text):
-        # Deterministic test embedding matching the fallback logic
+        # Produce a deterministic EMBEDDING_DIM-length vector from the text hash.
+        # We cycle the SHA-256 hash bytes to fill all 128 dimensions.
         h = hashlib.sha256(text.encode()).digest()
-        vec = [float(b) / 255.0 for b in h[:EMBEDDING_DIM]]
+        raw = [float(b) / 255.0 for b in h]  # 32 floats from 32 bytes
+        vec = (raw * ((EMBEDDING_DIM // len(raw)) + 1))[:EMBEDDING_DIM]
         norm = sum(v * v for v in vec) ** 0.5 or 1.0
         return [v / norm for v in vec]
 
