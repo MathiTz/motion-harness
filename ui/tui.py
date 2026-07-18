@@ -190,8 +190,9 @@ class UserMessage(Static):
     """A user message bubble — primary accent, left border."""
     DEFAULT_CSS = """
     UserMessage {
-        background: $primary 12%;
-        border: round $primary;
+        background: $surface;
+        border-left: heavy $primary;
+        border-right: blank;
         padding: 1 2;
         margin: 1 10 0 0;
         color: $text;
@@ -203,8 +204,9 @@ class ReasoningMessage(Static):
     """Collapsible-style block used to surface model reasoning stream."""
     DEFAULT_CSS = """
     ReasoningMessage {
-        background: $warning 10%;
-        border: round $warning;
+        background: $panel;
+        border-left: heavy $warning;
+        border-right: blank;
         padding: 1 2;
         margin: 1 0 0 10;
         color: $text-muted;
@@ -217,7 +219,8 @@ class AgentMessage(Static):
     DEFAULT_CSS = """
     AgentMessage {
         background: $surface;
-        border: round $primary;
+        border-left: heavy $accent;
+        border-right: blank;
         padding: 1 2;
         margin: 1 0 0 10;
         color: $text;
@@ -358,7 +361,7 @@ class ActivityRail(Vertical):
         max-width: 42;
         border-left: heavy $border;
         padding: 1 1;
-        background: $surface;
+        background: $panel;
     }
     #activity_header {
         color: $accent;
@@ -373,7 +376,7 @@ class ActivityRail(Vertical):
         padding: 0 1;
         margin: 0 0 1 0;
         color: $text;
-        background: $background 20%;
+        background: $surface;
         border: round $border;
     }
     """
@@ -432,7 +435,7 @@ class MainScreen(Screen):
     #tab_quick_nav {
         height: auto;
         padding: 0 1 1 1;
-        background: $surface;
+        background: $panel;
         border: round $border;
     }
     .tab_nav_btn {
@@ -626,13 +629,13 @@ class ChatPane(Vertical):
         border: round $primary;
         padding: 1 2;
         scrollbar-size: 1 1;
-        background: $background 15%;
+        background: $surface;
     }
     #trace_panel {
         width: 42;
         height: 1fr;
         border: round $accent;
-        background: $surface;
+        background: $panel;
         padding: 1 1;
         margin-left: 1;
     }
@@ -650,7 +653,7 @@ class ChatPane(Vertical):
     #chat_input_row {
         height: auto;
         padding: 1 1 1 1;
-        background: $surface;
+        background: $panel;
         border: round $border;
     }
     #chat_controls {
@@ -668,7 +671,7 @@ class ChatPane(Vertical):
         margin-left: 1;
     }
     #chat_metrics {
-        color: $text;
+        color: $text-muted;
         margin-top: 0;
         margin-bottom: 1;
         padding: 0 2;
