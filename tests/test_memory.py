@@ -1,4 +1,6 @@
 import asyncio
+from pathlib import Path
+import tempfile
 from unittest.mock import AsyncMock, MagicMock
 from memory.db import MemoryDB, MemoryChunk
 from memory.facilitator import MDFacilitator
@@ -19,11 +21,14 @@ async def test_memory_pipeline():
     retriever = HybridRetriever(db, emb_provider)
 
     # 1. Test Ingestion (Facilitator)
-    # Create a dummy md file
-    with open("test_doc.md", "w") as f:
-        f.write("The Motion Harness uses a hybrid retrieval system with FTS5 and Vector DB.")
-
-    await facilitator.ingest_files(["test_doc.md"])
+    # Create a dummy md file in an isolated temp dir
+    with tempfile.TemporaryDirectory() as tmpdir:
+        doc_path = Path(tmpdir) / "test_doc.md"
+        doc_path.write_text(
+            "The Motion Harness uses a hybrid retrieval system with FTS5 and Vector DB.",
+            encoding="utf-8",
+        )
+        await facilitator.ingest_files([str(doc_path)])
     
     # 2. Test Keyword Search (Sparse)
     # 'FTS5' is a very specific keyword

@@ -9,6 +9,11 @@ import hashlib
 
 
 class MockProvider:
+    class _Config:
+        provider_type = "local"
+
+    def __init__(self):
+        self.config = self._Config()
     async def complete(self, prompt, system_prompt="", **kwargs):
         return "Certainly! I have analyzed the files and found the bug is in line 42. I'm sorry for the inconvenience."
 
@@ -29,8 +34,8 @@ class MockEmbeddingProvider:
 
 async def test_golden_path():
     """
-    Tests the full 'Golden Path':
-    User Prompt -> Hybrid Recall -> Model completion -> Caveman Compression -> Skill Crystallization
+    Tests the main end-to-end path:
+    User Prompt -> Hybrid Recall -> Model completion -> Caveman Compression
     """
     model_config = ModelConfig(name="test-model", endpoint="http://localhost", provider_type="local")
     agent = MotionAgent(model_config)

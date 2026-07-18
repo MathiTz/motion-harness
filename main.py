@@ -66,11 +66,12 @@ class MotionAgent:
 
         # 3. Model Completion (streaming if callback is provided)
         stream_chunk_count = 0
+        provider_type = getattr(getattr(self.provider, "config", None), "provider_type", "unknown")
         await emit_trace(
             "model_start",
             "Calling provider for completion",
             mode="stream" if on_stream_chunk else "oneshot",
-            provider=self.provider.config.provider_type,
+            provider=provider_type,
         )
         if on_stream_chunk:
             raw_chunks = []
