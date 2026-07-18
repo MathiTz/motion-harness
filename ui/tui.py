@@ -88,9 +88,10 @@ class AppState:
         self.current_provider_id: str = ""
         self.current_theme: str = "one_dark"
         self.caveman_enabled: bool = True
+        self.auto_synthesis_enabled: bool = False
         self.ui_mode: str = "conservative"
         self.show_activity_rail: bool = True
-        self.show_trace_panel: bool = True
+        self.show_trace_panel: bool = False
         self.last_agent_response: str = ""
         self.last_turn_metrics: dict = {}
         self.session_metrics: dict = {
@@ -118,6 +119,7 @@ class AppState:
             except Exception:
                 pass
         self.agent = MotionAgent(model_config)
+        self.agent.auto_skill_synthesis = self.auto_synthesis_enabled
         self.task_manager = TaskManager(model_config, WORKSPACE)
         self.current_provider_id = provider_id
 
@@ -187,14 +189,16 @@ def _extract_reasoning_and_answer(text: str) -> tuple[str, str]:
 # ─── Chat message widgets ─────────────────────────────────────────────────────
 
 class UserMessage(Static):
-    """A user message bubble — primary accent, left border."""
+    """A user message card — primary accent header, markdown body."""
     DEFAULT_CSS = """
     UserMessage {
         background: $surface;
         border-left: heavy $primary;
         border-right: blank;
+        border-top: blank;
+        border-bottom: blank;
         padding: 1 2;
-        margin: 1 10 0 0;
+        margin: 1 8 0 0;
         color: $text;
     }
     """
@@ -207,28 +211,32 @@ class ReasoningMessage(Static):
         background: $panel;
         border-left: heavy $warning;
         border-right: blank;
+        border-top: blank;
+        border-bottom: blank;
         padding: 1 2;
-        margin: 1 0 0 10;
+        margin: 1 0 0 8;
         color: $text-muted;
         text-style: dim italic;
     }
     """
 
 class AgentMessage(Static):
-    """An agent message bubble — success accent, left border."""
+    """An agent message card — accent header, markdown body."""
     DEFAULT_CSS = """
     AgentMessage {
         background: $surface;
         border-left: heavy $accent;
         border-right: blank;
+        border-top: blank;
+        border-bottom: blank;
         padding: 1 2;
-        margin: 1 0 0 10;
+        margin: 1 0 0 8;
         color: $text;
     }
     """
 
 class SystemMessage(Static):
-    """A system/info message — muted, italic."""
+    """A system/info message — muted, single-line metadata."""
     DEFAULT_CSS = """
     SystemMessage {
         color: $text-muted;
@@ -426,23 +434,124 @@ class ActivityRail(Vertical):
             container.mount(Static(row, classes="activity_row"))
 
 
+# ─── Shortcuts overlay ────────────────────────────────────────────────────────
+
+class ShortcutsOverlay(Screen):
+    """Unified shortcuts help overlay generated from real bindings."""
+
+    CSS = """
+    ShortcutsOverlay {
+        align: center middle;
+    }
+    #shortcuts_box {
+        width: 78;
+        max-height: 80%;
+        border: round $primary;
+        background: $surface;
+        padding: 1 2;
+        scrollbar-size: 1 1;
+    }
+    #shortcuts_title {
+        color: $primary;
+        text-style: bold;
+        text-align: center;
+        margin-bottom: 1;
+    }
+    #shortcuts_body {
+        height: auto;
+        max-height: 70%;
+        scrollbar-size: 1 1;
+    }
+    .shortcut_section {
+        color: $accent;
+        text-style: bold;
+        margin-top: 1;
+        margin-bottom: 0;
+    }
+    .shortcut_row {
+        color: $text;
+        padding: 0 1;
+    }
+    #shortcuts_hint {
+        color: $text-muted;
+        text-align: center;
+        margin-top: 1;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "dismiss_overlay", "Close"),
+        Binding("question_sign", "dismiss_overlay", "Close"),
+        Binding("q", "dismiss_overlay", "Close"),
+    ]
+
+    def __init__(self, main_screen: "MainScreen", **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._main = main_screen
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll(id="shortcuts_box"):
+            yield Label("⌨️  Keyboard Shortcuts", id="shortcuts_title")
+            yield VerticalScroll(id="shortcuts_body")
+            yield Label("Press ? / Esc / q to close", id="shortcuts_hint")
+
+    def on_mount(self) -> None:
+        self.query_one("#shortcuts_box", VerticalScroll).border_title = " Shortcuts "
+        body = self.query_one("#shortcuts_body", VerticalScroll)
+        sections = self._collect_bindings()
+        for section_title, rows in sections.items():
+            body.mount(Label(section_title, classes="shortcut_section"))
+            for key, label in rows:
+                body.mount(Static(f"  [bold]{key}[/]  [dim]·[/]  {label}", classes="shortcut_row"))
+
+    def _collect_bindings(self) -> dict:
+        groups: dict[str, list[tuple[str, str]]] = {}
+        seen_keys: set[str] = set()
+        global_bindings = getattr(self._main, "BINDINGS", []) or []
+        groups["Global"] = []
+        for b in global_bindings:
+            key = getattr(b, "key", "")
+            label = getattr(b, "description", "") or key
+            if not key or key in seen_keys:
+                continue
+            seen_keys.add(key)
+            groups["Global"].append(self._pretty_key(key, label))
+        try:
+            chat = self._main.query_one(ChatPane)
+            chat_bindings = getattr(chat, "BINDINGS", []) or []
+            groups["Chat"] = []
+            for b in chat_bindings:
+                key = getattr(b, "key", "")
+                label = getattr(b, "description", "") or key
+                if not key or key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                groups["Chat"].append(self._pretty_key(key, label))
+        except Exception:
+            pass
+        return {k: v for k, v in groups.items() if v}
+
+    @staticmethod
+    def _pretty_key(key: str, label: str) -> tuple[str, str]:
+        pretty = (
+            key.replace("ctrl+", "Ctrl+")
+                .replace("alt+", "Alt+")
+                .replace("shift+", "Shift+")
+                .replace("_", " ")
+        )
+        pretty = pretty.replace("question sign", "?")
+        return pretty, label
+
+    def action_dismiss_overlay(self) -> None:
+        self.app.pop_screen()
+
+
 class MainScreen(Screen):
     """The main hub with Chat, Tasks, Skills, Memory, Settings tabs."""
 
     CSS = """
     #main_shell { height: 1fr; background: $background; }
     #main_body { width: 1fr; padding: 0 1 0 0; }
-    #tab_quick_nav {
-        height: auto;
-        padding: 0 1 1 1;
-        background: $panel;
-        border: round $border;
-    }
-    .tab_nav_btn {
-        margin-right: 1;
-        min-width: 11;
-        height: 3;
-    }
     #main_tabs { height: 1fr; }
     #session_metrics_footer {
         height: auto;
@@ -482,6 +591,7 @@ class MainScreen(Screen):
         Binding("ctrl+]", "next_tab", "Next Tab", priority=True),
         Binding("ctrl+[", "prev_tab", "Prev Tab", priority=True),
         Binding("ctrl+q", "quit", "Quit", priority=True),
+        Binding("question_sign", "show_shortcuts", "Shortcuts", priority=True),
     ]
 
     def __init__(self, state: AppState, **kwargs) -> None:
@@ -492,13 +602,6 @@ class MainScreen(Screen):
         yield Header(show_clock=True)
         with Horizontal(id="main_shell"):
             with Vertical(id="main_body"):
-                with Horizontal(id="tab_quick_nav"):
-                    yield Button("Chat", id="tab_btn_chat", classes="tab_nav_btn")
-                    yield Button("Tasks", id="tab_btn_tasks", classes="tab_nav_btn")
-                    yield Button("Skills", id="tab_btn_skills", classes="tab_nav_btn")
-                    yield Button("Knowledge", id="tab_btn_kb", classes="tab_nav_btn")
-                    yield Button("Memory", id="tab_btn_memory", classes="tab_nav_btn")
-                    yield Button("Settings", id="tab_btn_settings", classes="tab_nav_btn")
                 with TabbedContent(id="main_tabs"):
                     with TabPane("💬 Chat", id="chat_tab"):
                         yield ChatPane(self.state)
@@ -517,17 +620,9 @@ class MainScreen(Screen):
         yield Footer()
 
     async def on_button_pressed(self, event: Button.Pressed) -> None:
-        mapping = {
-            "tab_btn_chat": "chat_tab",
-            "tab_btn_tasks": "tasks_tab",
-            "tab_btn_skills": "skills_tab",
-            "tab_btn_kb": "kb_tab",
-            "tab_btn_memory": "memory_tab",
-            "tab_btn_settings": "settings_tab",
-        }
-        tab = mapping.get(event.button.id or "")
-        if tab:
-            self._activate_tab(tab)
+        # Chat-local buttons (trace/copy/stats/save) are handled in ChatPane.
+        # No global tab buttons remain; tab headers are the canonical nav.
+        pass
 
     def on_mount(self) -> None:
         if not self.state.show_activity_rail:
@@ -603,6 +698,9 @@ class MainScreen(Screen):
             idx = 0
         self._activate_tab(order[(idx - 1) % len(order)])
 
+    def action_show_shortcuts(self) -> None:
+        self.app.push_screen(ShortcutsOverlay(self))
+
 
 # ─── Chat pane ────────────────────────────────────────────────────────────────
 
@@ -634,13 +732,13 @@ class ChatPane(Vertical):
     #trace_panel {
         width: 42;
         height: 1fr;
-        border: round $accent;
+        border: round $border;
         background: $panel;
         padding: 1 1;
         margin-left: 1;
     }
     #trace_header {
-        color: $accent;
+        color: $text-muted;
         text-style: bold;
         margin-bottom: 0;
     }
@@ -650,11 +748,20 @@ class ChatPane(Vertical):
         border-top: solid $border;
         padding-top: 1;
     }
+    #trace_summary_chip {
+        height: auto;
+        width: auto;
+        padding: 0 2;
+        margin: 0 0 1 0;
+        background: $panel;
+        border: round $border;
+        color: $text-muted;
+    }
     #chat_input_row {
         height: auto;
         padding: 1 1 1 1;
         background: $panel;
-        border: round $border;
+        border: solid $border;
     }
     #chat_controls {
         height: auto;
@@ -672,8 +779,7 @@ class ChatPane(Vertical):
     }
     #chat_metrics {
         color: $text-muted;
-        margin-top: 0;
-        margin-bottom: 1;
+        margin: 0 0 0 0;
         padding: 0 2;
     }
     #chat_input {
@@ -691,6 +797,7 @@ class ChatPane(Vertical):
     def __init__(self, state: AppState, **kwargs) -> None:
         super().__init__(**kwargs)
         self.state = state
+        self._last_trace_stage: str = ""
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="chat_body"):
@@ -698,16 +805,21 @@ class ChatPane(Vertical):
             with Vertical(id="trace_panel"):
                 yield Label("Interaction Trace", id="trace_header")
                 yield VerticalScroll(id="trace_log")
+        yield Label("", id="trace_summary_chip")
         yield Label("", id="chat_metrics")
         with Horizontal(id="chat_input_row"):
             yield Input(placeholder="Type a message… (Enter to send)", id="chat_input")
             with Horizontal(id="chat_controls"):
                 with Horizontal(id="chat_primary_actions"):
-                    yield Button("Trace On", id="chat_toggle_trace_btn", classes="chat_btn")
+                    yield Button("Trace", id="chat_toggle_trace_btn", classes="chat_btn")
                     yield Button("Copy", id="chat_copy_btn", classes="chat_btn")
                     yield Button("Stats", id="chat_stats_btn", classes="chat_btn")
                 with Horizontal(id="chat_secondary_actions"):
                     yield Button("Save Skill", id="chat_save_skill_btn", classes="chat_btn")
+
+    def on_click(self, event) -> None:
+        if getattr(event.control, "id", None) == "trace_summary_chip":
+            self._set_trace_panel_visible(True)
 
     def on_mount(self) -> None:
         name = self.state.agent.provider.config.name if self.state.agent else "?"
@@ -724,9 +836,28 @@ class ChatPane(Vertical):
         self.state.show_trace_panel = visible
         panel = self.query_one("#trace_panel", Vertical)
         panel.styles.display = "block" if visible else "none"
+        chip = self.query_one("#trace_summary_chip", Label)
+        chip.styles.display = "none" if visible else "block"
         button = self.query_one("#chat_toggle_trace_btn", Button)
-        button.label = "Trace On" if visible else "Trace Off"
+        button.label = "Trace On" if visible else "Trace"
+        self._refresh_trace_chip()
         self.notify("Trace panel shown" if visible else "Trace panel hidden")
+        # Preserve composer focus: expanding the trace panel must never steal focus
+        # from the input unless the user explicitly clicked into the panel.
+        try:
+            self.query_one("#chat_input", Input).focus()
+        except Exception:
+            pass
+
+    def _refresh_trace_chip(self) -> None:
+        try:
+            trace_log = self.query_one("#trace_log", VerticalScroll)
+            chip = self.query_one("#trace_summary_chip", Label)
+        except Exception:
+            return
+        count = len(trace_log.children)
+        last_stage = self._last_trace_stage
+        chip.update(f" trace · {count} events · {last_stage} " if last_stage else f" trace · {count} events ")
 
     def action_toggle_trace_panel(self) -> None:
         self._set_trace_panel_visible(not self.state.show_trace_panel)
@@ -758,6 +889,14 @@ class ChatPane(Vertical):
         self._copy_last_response()
 
     @staticmethod
+    def _render_user_markdown(timestamp: str, text: str):
+        safe = text.strip() or "_Empty message._"
+        return Group(
+            Text(f"{timestamp} • You", style="bold"),
+            RichMarkdown(safe),
+        )
+
+    @staticmethod
     def _render_agent_markdown(timestamp: str, answer: str):
         safe_answer = answer.strip() or "_No response content._"
         return Group(
@@ -777,7 +916,9 @@ class ChatPane(Vertical):
             log.scroll_end(animate=False)
             return
         ts = datetime.now().strftime("%H:%M:%S")
-        log.mount(UserMessage(f"[dim]{ts} • You[/]\n{text}"))
+        user_msg = UserMessage("")
+        user_msg.update(self._render_user_markdown(ts, text))
+        log.mount(user_msg)
         thinking = SystemMessage("⚙️ Thinking…")
         live_response = AgentMessage(f"[dim]{ts} • Motion[/]\n")
         log.mount(thinking)
@@ -826,11 +967,13 @@ class ChatPane(Vertical):
         line = f"[dim]{ts}[/] {label}"
         if safe_detail:
             line += f" [dim]· {safe_detail[:220]}[/]"
+        self._last_trace_stage = f"{label}"
         trace_log.mount(SystemMessage(line))
         trace_log.scroll_end(animate=False)
         self.query_one("#trace_header", Label).update(
             f"Interaction Trace ({len(trace_log.children)})"
         )
+        self._refresh_trace_chip()
 
     @work(exclusive=True, name="agent_chat")
     async def _run_agent(self, prompt: str, thinking: SystemMessage, live_response: AgentMessage) -> None:
@@ -1241,7 +1384,7 @@ class TasksPane(Vertical):
     }
     #tasks_header_row {
         height: auto;
-        margin-bottom: 0;
+        margin-bottom: 1;
     }
     #tasks_header {
         color: $primary;
@@ -1367,13 +1510,14 @@ class SkillsPane(Container):
     CSS = """
     #skills_container {
         height: 1fr;
-        border: round $primary;
+        border: round $border;
         padding: 1;
         background: $surface;
     }
     #skills_header {
         color: $primary;
         text-style: bold;
+        margin-bottom: 0;
     }
     #skills_list {
         height: 1fr;
@@ -1384,7 +1528,7 @@ class SkillsPane(Container):
         padding: 0 0 1 0;
     }
     #skills_search_input {
-        border: round $primary;
+        border: round $border;
     }
     #skills_editor_row {
         height: auto;
@@ -1394,7 +1538,7 @@ class SkillsPane(Container):
         margin-right: 1;
     }
     #skills_content_input {
-        border: round $primary;
+        border: round $border;
         margin-top: 1;
     }
     #skills_status {
@@ -1566,13 +1710,14 @@ class KBPane(Container):
     CSS = """
     #kb_container {
         height: 1fr;
-        border: round $primary;
+        border: round $border;
         padding: 1;
         background: $surface;
     }
     #kb_header {
         color: $primary;
         text-style: bold;
+        margin-bottom: 0;
     }
     #kb_list {
         height: 1fr;
@@ -1583,7 +1728,7 @@ class KBPane(Container):
         padding: 0 0 1 0;
     }
     #kb_search_input {
-        border: round $primary;
+        border: round $border;
     }
     #kb_add_row {
         height: auto;
@@ -1602,7 +1747,7 @@ class KBPane(Container):
     #kb_add_area {
         height: 5;
         margin-top: 1;
-        border: round $primary;
+        border: round $border;
     }
     #kb_mode_select {
         margin-top: 1;
@@ -1617,8 +1762,8 @@ class KBPane(Container):
     #kb_memory_results {
         height: 8;
         scrollbar-size: 1 1;
-        border: round $border;
-        background: $background 25%;
+        border: solid $border;
+        background: $panel;
         padding: 0 1;
         margin-top: 1;
     }
@@ -1819,7 +1964,7 @@ class MemoryPane(Container):
     CSS = """
     #memory_container {
         height: 1fr;
-        border: round $primary;
+        border: round $border;
         padding: 1;
         background: $surface;
     }
@@ -1832,15 +1977,17 @@ class MemoryPane(Container):
         padding: 0 0 1 0;
     }
     #memory_search_input {
-        border: round $primary;
+        border: round $border;
     }
     #memory_header {
         color: $primary;
         text-style: bold;
+        margin-bottom: 0;
     }
     .memory_entry {
         padding: 0 1;
-        margin: 0 0;
+        margin: 0 0 1 0;
+        border-top: solid $border;
     }
     """
 
@@ -1900,7 +2047,7 @@ class SettingsPane(Container):
     CSS = """
     #settings_container {
         height: 1fr;
-        border: round $primary;
+        border: round $border;
         padding: 1 2;
         background: $surface;
         scrollbar-size: 1 1;
@@ -1987,6 +2134,11 @@ class SettingsPane(Container):
             yield Label(f"  Status: {cstatus}", id="settings_caveman")
             yield Button("Toggle Caveman", id="btn_toggle_caveman", classes="settings_btn")
 
+            yield Label("Auto Skill Synthesis", classes="settings_label")
+            syn_status = "ON" if self.state.auto_synthesis_enabled else "OFF"
+            yield Label(f"  Status: {syn_status} (crystallize skills from each reply)", id="settings_synthesis")
+            yield Button("Toggle Auto-Synthesis", id="btn_toggle_synthesis", classes="settings_btn")
+
             yield Label("Workspace", classes="settings_label")
             yield Label(f"  {WORKSPACE}", classes="settings_row")
 
@@ -2061,6 +2213,16 @@ class SettingsPane(Container):
             s = "ON" if self.state.caveman_enabled else "OFF"
             self.query_one("#settings_caveman", Label).update(f"  Status: {s}")
             self.notify(f"Caveman: {s}")
+
+        elif bid == "btn_toggle_synthesis":
+            self.state.auto_synthesis_enabled = not self.state.auto_synthesis_enabled
+            if self.state.agent:
+                self.state.agent.auto_skill_synthesis = self.state.auto_synthesis_enabled
+            s = "ON" if self.state.auto_synthesis_enabled else "OFF"
+            self.query_one("#settings_synthesis", Label).update(
+                f"  Status: {s} (crystallize skills from each reply)"
+            )
+            self.notify(f"Auto Skill Synthesis: {s}")
 
         elif bid == "btn_dashboard":
             webbrowser.open(f"{DASHBOARD_URL}?key={DASHBOARD_ADMIN_KEY}")
