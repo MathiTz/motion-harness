@@ -5,6 +5,7 @@ from core.learning import SkillSynthesizer, Trajectory
 from memory.db import MemoryDB, EMBEDDING_DIM
 from memory.retriever import HybridRetriever
 import asyncio
+import inspect
 import hashlib
 import logging
 import os
@@ -13,12 +14,13 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 logger = logging.getLogger(__name__)
 
 class MotionAgent:
-    def __init__(self, model_config: ModelConfig, memory_path: str = "motion_memory.db"):
+    def __init__(self, model_config: ModelConfig, memory_path: str = "motion_memory.db", auto_skill_synthesis: bool = False):
         self.provider = ProviderFactory.get_provider(model_config)
         self.memory = MemoryDB(memory_path)
         self.retriever = HybridRetriever(self.memory, self)
         self.caveman = CavemanProtocol(enabled=True)
         self.synthesizer = SkillSynthesizer(model_config, self.memory)
+        self.auto_skill_synthesis = auto_skill_synthesis
 
     async def get_embedding(self, text: str):
         """Generate embeddings using the provider's embedding endpoint.
@@ -39,34 +41,81 @@ class MotionAgent:
         norm = sum(v * v for v in vec) ** 0.5 or 1.0
         return [v / norm for v in vec]
 
-    async def run(self, prompt: str, target: str = "user"):
+    async def run(self, prompt: str, target: str = "user", on_stream_chunk=None, on_trace_event=None):
+        async def emit_trace(stage: str, message: str, **extra):
+            if not on_trace_event:
+                return
+            payload = {"stage": stage, "message": message, **extra}
+            try:
+                try:
+                    maybe = on_trace_event(stage, payload)
+                except TypeError:
+                    maybe = on_trace_event(payload)
+                if inspect.isawaitable(maybe):
+                    await maybe
+            except Exception:
+                pass
         # 1. Memory Recall
+        await emit_trace("memory_recall_start", "Running retriever.retrieve")
         context_chunks = await self.retriever.retrieve(prompt)
+        await emit_trace("memory_recall_done", "Memory recall complete", chunks=len(context_chunks))
         context_text = "\n".join([c["content"] for c in context_chunks])
 
         # 2. Construct System Prompt
         system_prompt = f"You are Motion Agent. Memory Context:\n{context_text}"
 
-        # 3. Model Completion
-        raw_response = await self.provider.complete(prompt, system_prompt=system_prompt)
+        # 3. Model Completion (streaming if callback is provided)
+        stream_chunk_count = 0
+        await emit_trace(
+            "model_start",
+            "Calling provider for completion",
+            mode="stream" if on_stream_chunk else "oneshot",
+            provider=self.provider.config.provider_type,
+        )
+        if on_stream_chunk:
+            raw_chunks = []
+            async for chunk in self.provider.stream_complete(prompt, system_prompt=system_prompt):
+                stream_chunk_count += 1
+                raw_chunks.append(chunk)
+                await emit_trace("stream_chunk", "Received stream chunk", chunk_index=stream_chunk_count, chars=len(chunk or ""))
+                try:
+                    maybe = on_stream_chunk(chunk)
+                    if inspect.isawaitable(maybe):
+                        await maybe
+                except Exception:
+                    pass
+            raw_response = "".join(raw_chunks)
+            await emit_trace("model_done", "Streaming completion finished", stream_chunks=stream_chunk_count, chars=len(raw_response))
+        else:
+            raw_response = await self.provider.complete(prompt, system_prompt=system_prompt)
+            await emit_trace("model_done", "One-shot completion finished", chars=len(raw_response or ""))
 
         # 4. Caveman Compression
         final_response = self.caveman.process_outgoing(raw_response, target=target)
+        await emit_trace("finalize", "Post-processing completed", chars=len(final_response or ""))
 
-        # 5. Skill Crystallization (on success)
-        try:
-            trajectory = Trajectory(
-                task_id="single",
-                prompt=prompt,
-                steps=[{"tool": "model", "input": prompt, "output": raw_response}],
-                final_result=raw_response,
-                success=True,
-            )
-            skill_path = await self.synthesizer.synthesize(trajectory)
-            if skill_path:
-                logger.info(f"Skill crystallized: {skill_path}")
-        except Exception as e:
-            logger.debug(f"Skill synthesis skipped: {e}")
+        # 5. Skill Crystallization (manual-first: disabled by default)
+        if self.auto_skill_synthesis:
+            try:
+                await emit_trace("skill_synthesis_start", "Running skill synthesizer")
+                trajectory = Trajectory(
+                    task_id="single",
+                    prompt=prompt,
+                    steps=[{"tool": "model", "input": prompt, "output": raw_response}],
+                    final_result=raw_response,
+                    success=True,
+                )
+                skill_path = await self.synthesizer.synthesize(trajectory)
+                if skill_path:
+                    logger.info(f"Skill crystallized: {skill_path}")
+                    await emit_trace("skill_synthesis_done", "Skill synthesized", path=skill_path)
+                else:
+                    await emit_trace("skill_synthesis_done", "Skill synthesis skipped")
+            except Exception as e:
+                logger.debug(f"Skill synthesis skipped: {e}")
+                await emit_trace("skill_synthesis_error", f"Skill synthesis error: {e}")
+        else:
+            await emit_trace("skill_synthesis_done", "Skill synthesis disabled (manual mode)")
 
         return final_response
 

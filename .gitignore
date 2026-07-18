@@ -48,3 +48,9 @@ knowledge/
 
 # Test artifacts
 test_doc.md
+
+# Logs
+motion.log
+
+# Task artifacts
+tasks/
