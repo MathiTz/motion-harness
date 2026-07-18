@@ -42,5 +42,15 @@ bin/
 skills/
 !skills/.gitkeep
 
+# Knowledge base entries (user-generated)
+knowledge/
+!knowledge/.gitkeep
+
 # Test artifacts
 test_doc.md
+
+# Logs
+motion.log
+
+# Task artifacts
+tasks/
