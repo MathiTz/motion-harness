@@ -192,8 +192,8 @@ class UserMessage(Static):
     """A user message card — primary accent header, markdown body."""
     DEFAULT_CSS = """
     UserMessage {
-        background: $surface;
-        border-left: heavy $primary;
+        background: $panel;
+        border-left: thick $primary;
         border-right: blank;
         border-top: blank;
         border-bottom: blank;
@@ -208,8 +208,8 @@ class ReasoningMessage(Static):
     """Collapsible-style block used to surface model reasoning stream."""
     DEFAULT_CSS = """
     ReasoningMessage {
-        background: $panel;
-        border-left: heavy $warning;
+        background: $background;
+        border-left: thick $warning;
         border-right: blank;
         border-top: blank;
         border-bottom: blank;
@@ -225,7 +225,7 @@ class AgentMessage(Static):
     DEFAULT_CSS = """
     AgentMessage {
         background: $surface;
-        border-left: heavy $accent;
+        border-left: thick $accent;
         border-right: blank;
         border-top: blank;
         border-bottom: blank;
@@ -367,14 +367,17 @@ class ActivityRail(Vertical):
         width: 36;
         min-width: 30;
         max-width: 42;
-        border-left: heavy $border;
+        border-left: heavy $primary;
         padding: 1 1;
         background: $panel;
     }
     #activity_header {
-        color: $accent;
+        color: $primary;
         text-style: bold;
         margin-bottom: 1;
+        padding: 0 1;
+        background: $surface;
+        border: solid $border;
     }
     #activity_list {
         height: 1fr;
@@ -385,7 +388,7 @@ class ActivityRail(Vertical):
         margin: 0 0 1 0;
         color: $text;
         background: $surface;
-        border: round $border;
+        border: solid $border;
     }
     """
 
@@ -551,14 +554,15 @@ class MainScreen(Screen):
 
     CSS = """
     #main_shell { height: 1fr; background: $background; }
-    #main_body { width: 1fr; padding: 0 1 0 0; }
+    #main_body { width: 1fr; padding: 0 1 0 1; }
     #main_tabs { height: 1fr; }
     #session_metrics_footer {
         height: auto;
         color: $text-muted;
-        background: $background;
-        border-top: solid $border;
+        background: $panel;
+        border-top: heavy $primary;
         padding: 0 2;
+        text-style: bold;
     }
     TabbedContent TabPane {
         padding: 0 0;
@@ -716,31 +720,38 @@ class ChatPane(Vertical):
     DEFAULT_CSS = """
     ChatPane {
         height: 1fr;
+        background: $background;
+        padding: 0 0 0 0;
     }
     #chat_body {
         height: 1fr;
-        padding: 0 0 1 0;
+        padding: 1 0 1 0;
     }
     #chat_log {
         height: 1fr;
         width: 3fr;
-        border: round $primary;
+        border: heavy $primary;
+        border-title-color: $primary;
+        border-title-style: bold;
         padding: 1 2;
         scrollbar-size: 1 1;
         background: $surface;
     }
     #trace_panel {
-        width: 42;
+        width: 40;
         height: 1fr;
-        border: round $border;
+        border: solid $border;
         background: $panel;
         padding: 1 1;
         margin-left: 1;
     }
     #trace_header {
-        color: $text-muted;
+        color: $accent;
         text-style: bold;
-        margin-bottom: 0;
+        margin-bottom: 1;
+        padding: 0 1;
+        background: $surface;
+        border: solid $border;
     }
     #trace_log {
         height: 1fr;
@@ -754,14 +765,15 @@ class ChatPane(Vertical):
         padding: 0 2;
         margin: 0 0 1 0;
         background: $panel;
-        border: round $border;
-        color: $text-muted;
+        border: heavy $accent;
+        color: $accent;
+        text-style: bold;
     }
     #chat_input_row {
         height: auto;
         padding: 1 1 1 1;
         background: $panel;
-        border: solid $border;
+        border: heavy $primary;
     }
     #chat_controls {
         height: auto;
@@ -781,16 +793,25 @@ class ChatPane(Vertical):
         color: $text-muted;
         margin: 0 0 0 0;
         padding: 0 2;
+        text-style: dim;
     }
     #chat_input {
         height: 3;
-        border: round $primary;
-        background: $surface;
+        border: heavy $primary;
+        background: $background;
+        color: $text;
         width: 1fr;
+        padding: 0 1;
     }
     .chat_btn {
         margin-left: 1;
         min-width: 10;
+        background: $surface;
+        border: solid $border;
+    }
+    .chat_btn:hover {
+        border: solid $primary;
+        color: $primary;
     }
     """
 
@@ -892,7 +913,8 @@ class ChatPane(Vertical):
     def _render_user_markdown(timestamp: str, text: str):
         safe = text.strip() or "_Empty message._"
         return Group(
-            Text(f"{timestamp} • You", style="bold"),
+            Text(f"▸ {timestamp}  YOU", style="bold"),
+            Text(""),
             RichMarkdown(safe),
         )
 
@@ -900,7 +922,8 @@ class ChatPane(Vertical):
     def _render_agent_markdown(timestamp: str, answer: str):
         safe_answer = answer.strip() or "_No response content._"
         return Group(
-            Text(f"{timestamp} • Motion", style="dim"),
+            Text(f"◂ {timestamp}  MOTION", style="bold"),
+            Text(""),
             RichMarkdown(safe_answer),
         )
 
@@ -2249,9 +2272,46 @@ class MotionTUI(App):
 
     CSS = """
     Screen { background: $background; color: $foreground; }
-    Header { background: $surface; }
-    Footer { background: $surface; }
+    Header {
+        background: $surface;
+        border-bottom: heavy $primary;
+        color: $text;
+        text-style: bold;
+        padding: 0 1;
+    }
+    Header.-header-tall { height: 3; }
+    Footer {
+        background: $panel;
+        border-top: heavy $primary;
+        color: $text-muted;
+        padding: 0 1;
+    }
     TabbedContent { height: 1fr; }
+    Tabs {
+        background: $panel;
+        height: 3;
+        border-bottom: solid $border;
+    }
+    Tabs > Tab {
+        padding: 0 2;
+        color: $text-muted;
+        text-style: bold;
+        background: $panel;
+        border: blank;
+    }
+    Tabs > Tab:hover {
+        color: $text;
+        background: $surface;
+    }
+    Tabs > Tab.-active {
+        color: $background;
+        background: $primary;
+        text-style: bold;
+    }
+    TabPane {
+        background: $background;
+        padding: 0 0;
+    }
     .experimental-ui TaskRow {
         padding: 1 2;
         margin: 0 0 1 0;
