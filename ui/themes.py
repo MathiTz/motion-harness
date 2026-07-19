@@ -19,6 +19,23 @@ from textual.theme import Theme as TextualTheme
 
 _RAW_THEMES: List[dict] = [
     dict(
+        id="omni_dark",
+        name="Omni Dark",
+        background="#191622",
+        surface="#23212B",
+        panel="#2A2734",
+        foreground="#E1E1E6",
+        primary="#78D1E1",
+        secondary="#483C67",
+        accent="#78D1E1",
+        border="#41414D",
+        highlight="#2E2A3A",
+        error="#E96379",
+        success="#67E480",
+        warning="#E89E64",
+        dark=True,
+    ),
+    dict(
         id="one_dark",
         name="One Dark",
         background="#282c34",
@@ -119,7 +136,7 @@ for d in _RAW_THEMES:
         success=d["success"],
         warning=d["warning"],
         dark=d["dark"],
-        panel=d["border"],
+        panel=d.get("panel", d["border"]),
         boost=d["highlight"],
     )
 

@@ -14,6 +14,15 @@ Key features:
   - Ctrl+C cancels the current request; Ctrl+Q quits
   - KB tab: knowledge base for reference docs that don't become skills
 
+Visual guardrails (R3 — Ops Rounded):
+  - Maximum one permanent border per major region.
+  - No adjacent parallel separators within 1 row of each other.
+  - Spacing scale: 0, 1, 2 row gaps (2 reserved for section breaks).
+  - Persistent accent area target below ~8-10% of screen.
+  - Rounded corners on conversation bubbles and grouped setting blocks.
+  - Both User and Motion replies render as explicit rounded balloons.
+  - Accent is reserved for active tab, focused input, and high-signal state.
+
 Launch:  python main.py              → TUI (default)
          python main.py --chat       → old REPL
          python main.py --provider X → TUI with pre-selected provider
@@ -37,6 +46,8 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical, VerticalScroll
 from textual.screen import Screen
+from textual.strip import Strip
+from textual.widget import Widget
 from textual.widgets import (
     Button,
     Header,
@@ -86,7 +97,7 @@ class AppState:
         self.task_manager: Optional[TaskManager] = None
         self.config_manager: ConfigManager = ConfigManager()
         self.current_provider_id: str = ""
-        self.current_theme: str = "one_dark"
+        self.current_theme: str = "omni_dark"
         self.caveman_enabled: bool = True
         self.auto_synthesis_enabled: bool = False
         self.ui_mode: str = "conservative"
@@ -189,49 +200,39 @@ def _extract_reasoning_and_answer(text: str) -> tuple[str, str]:
 # ─── Chat message widgets ─────────────────────────────────────────────────────
 
 class UserMessage(Static):
-    """A user message card — primary accent header, markdown body."""
+    """User reply balloon — rounded panel surface, aligned right."""
     DEFAULT_CSS = """
     UserMessage {
         background: $panel;
-        border-left: thick $primary;
-        border-right: blank;
-        border-top: blank;
-        border-bottom: blank;
-        padding: 1 2;
-        margin: 1 8 0 0;
         color: $text;
+        border: round $panel;
+        padding: 1 2;
+        margin: 1 6 0 0;
     }
     """
 
-
 class ReasoningMessage(Static):
-    """Collapsible-style block used to surface model reasoning stream."""
+    """Inline reasoning hint — same structural balloon, no heavy rule."""
     DEFAULT_CSS = """
     ReasoningMessage {
         background: $background;
-        border-left: thick $warning;
-        border-right: blank;
-        border-top: blank;
-        border-bottom: blank;
-        padding: 1 2;
-        margin: 1 0 0 8;
         color: $text-muted;
         text-style: dim italic;
+        border: round $background;
+        padding: 1 2;
+        margin: 1 0 1 6;
     }
     """
 
 class AgentMessage(Static):
-    """An agent message card — accent header, markdown body."""
+    """Motion reply balloon — rounded surface, aligned left."""
     DEFAULT_CSS = """
     AgentMessage {
         background: $surface;
-        border-left: thick $accent;
-        border-right: blank;
-        border-top: blank;
-        border-bottom: blank;
-        padding: 1 2;
-        margin: 1 0 0 8;
         color: $text;
+        border: round $surface;
+        padding: 1 2;
+        margin: 1 0 1 4;
     }
     """
 
@@ -241,11 +242,74 @@ class SystemMessage(Static):
     SystemMessage {
         color: $text-muted;
         text-style: dim;
-        padding: 0 1;
-        margin: 0 0 0 0;
+        padding: 0 2;
+        margin: 0 0 1 0;
     }
     """
 
+
+class ChatInput(Input):
+    """Chat composer input with explicit visible text rendering."""
+
+    def render_line(self, y: int) -> Strip:
+        if y != 0:
+            return Strip.blank(self.size.width)
+
+        width = max(1, self.scrollable_content_region.width)
+        if self.value:
+            text = Text(self.value, style="#E1E1E6", no_wrap=True, overflow="crop", end="")
+        else:
+            text = Text(self.placeholder, style="dim #A8A4B8", no_wrap=True, overflow="crop", end="")
+
+        if self.has_focus and self._cursor_visible:
+            cursor = self.cursor_position if self.value else 0
+            if cursor >= len(text):
+                text.append(" ")
+            text.stylize("bold #191622 on #78D1E1", cursor, cursor + 1)
+
+        segments = list(self.app.console.render(text, self.app.console.options.update_width(width)))
+        strip = Strip(segments)
+        return strip.crop(0, width).extend_cell_length(width).apply_style(self.rich_style)
+class ChatInputMirror(Widget):
+    """Visible composer text surface mirrored from the real input widget."""
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._value = ""
+        self._cursor = 0
+        self._focused = False
+
+    def set_input_state(self, value: str, cursor: int, focused: bool) -> None:
+        self._value = value
+        self._cursor = max(0, min(cursor, len(value)))
+        self._focused = focused
+        self.refresh()
+
+    def render_line(self, y: int) -> Strip:
+        width = max(1, self.scrollable_content_region.width)
+        if y != 0:
+            return Strip.blank(width)
+
+        if self._value:
+            text = Text(self._value, style="#E1E1E6", no_wrap=True, overflow="crop", end="")
+            if self._focused:
+                cursor = self._cursor
+                if cursor >= len(text):
+                    text.append(" ")
+                text.stylize("bold #191622 on #78D1E1", cursor, cursor + 1)
+        else:
+            text = Text("Type a message… (Enter to send)", style="dim #A8A4B8", no_wrap=True, overflow="crop", end="")
+            if self._focused:
+                text.stylize("bold #191622 on #78D1E1", 0, 1)
+
+        segments = list(self.app.console.render(text, self.app.console.options.update_width(width)))
+        strip = Strip(segments)
+        return strip.crop(0, width).extend_cell_length(width).apply_style(self.rich_style)
+
+    def on_click(self) -> None:
+        try:
+            self.screen.query_one("#chat_input", Input).focus()
+        except Exception:
+            pass
 
 class ProviderOption(ListItem):
     """A selectable provider row on the startup screen."""
@@ -275,7 +339,7 @@ class ProviderSelectScreen(Screen):
         width: 72;
         height: auto;
         max-height: 85%;
-        border: round $primary;
+        border: round $border;
         padding: 1 3;
         background: $surface;
         overflow-y: auto;
@@ -283,7 +347,7 @@ class ProviderSelectScreen(Screen):
     #provider_title {
         text-align: center;
         text-style: bold;
-        color: $primary;
+        color: $text;
         margin-bottom: 0;
     }
     #provider_subtitle {
@@ -367,17 +431,18 @@ class ActivityRail(Vertical):
         width: 36;
         min-width: 30;
         max-width: 42;
-        border-left: heavy $primary;
+        border-left: blank;
+        margin-left: 2;
         padding: 1 1;
         background: $panel;
     }
     #activity_header {
-        color: $primary;
+        color: $text-muted;
         text-style: bold;
-        margin-bottom: 1;
+        margin-bottom: 2;
         padding: 0 1;
-        background: $surface;
-        border: solid $border;
+        background: transparent;
+        border: blank;
     }
     #activity_list {
         height: 1fr;
@@ -387,8 +452,11 @@ class ActivityRail(Vertical):
         padding: 0 1;
         margin: 0 0 1 0;
         color: $text;
-        background: $surface;
-        border: solid $border;
+        background: transparent;
+        border: blank;
+    }
+    .activity_row:first-child {
+        border-top: blank;
     }
     """
 
@@ -397,7 +465,7 @@ class ActivityRail(Vertical):
         self.state = state
 
     def compose(self) -> ComposeResult:
-        yield Label("⚡ Live Activity", id="activity_header")
+        yield Label("Live Activity", id="activity_header")
         yield VerticalScroll(id="activity_list")
 
     def on_mount(self) -> None:
@@ -413,7 +481,7 @@ class ActivityRail(Vertical):
         tasks = list(status["tasks"].values())
         tasks.sort(key=lambda t: t.start_time or datetime.min, reverse=True)
         running = sum(1 for t in tasks if t.status == "RUNNING")
-        self.query_one("#activity_header", Label).update(f"⚡ Live Activity · {running} running")
+        self.query_one("#activity_header", Label).update(f"Live Activity · {running} running")
 
         container = self.query_one("#activity_list", VerticalScroll)
         for child in list(container.children):
@@ -449,13 +517,13 @@ class ShortcutsOverlay(Screen):
     #shortcuts_box {
         width: 78;
         max-height: 80%;
-        border: round $primary;
+        border: round $border;
         background: $surface;
         padding: 1 2;
         scrollbar-size: 1 1;
     }
     #shortcuts_title {
-        color: $primary;
+        color: $text;
         text-style: bold;
         text-align: center;
         margin-bottom: 1;
@@ -466,7 +534,7 @@ class ShortcutsOverlay(Screen):
         scrollbar-size: 1 1;
     }
     .shortcut_section {
-        color: $accent;
+        color: $text-muted;
         text-style: bold;
         margin-top: 1;
         margin-bottom: 0;
@@ -559,11 +627,12 @@ class MainScreen(Screen):
     #session_metrics_footer {
         height: auto;
         color: $text-muted;
-        background: $panel;
-        border-top: heavy $primary;
+        background: $background;
+        border-top: blank;
         padding: 0 2;
-        text-style: bold;
+        text-style: dim;
     }
+    TabbedContent { height: 1fr; }
     TabbedContent TabPane {
         padding: 0 0;
     }
@@ -607,17 +676,17 @@ class MainScreen(Screen):
         with Horizontal(id="main_shell"):
             with Vertical(id="main_body"):
                 with TabbedContent(id="main_tabs"):
-                    with TabPane("💬 Chat", id="chat_tab"):
+                    with TabPane("Chat", id="chat_tab"):
                         yield ChatPane(self.state)
-                    with TabPane("⚙️ Tasks", id="tasks_tab"):
+                    with TabPane("Tasks", id="tasks_tab"):
                         yield TasksPane(self.state)
-                    with TabPane("🎓 Skills", id="skills_tab"):
+                    with TabPane("Skills", id="skills_tab"):
                         yield SkillsPane(self.state)
-                    with TabPane("📚 KB", id="kb_tab"):
+                    with TabPane("KB", id="kb_tab"):
                         yield KBPane(self.state)
-                    with TabPane("🧠 Memory", id="memory_tab"):
+                    with TabPane("Memory", id="memory_tab"):
                         yield MemoryPane(self.state)
-                    with TabPane("🔧 Settings", id="settings_tab"):
+                    with TabPane("Settings", id="settings_tab"):
                         yield SettingsPane(self.state)
             yield ActivityRail(self.state, id="activity_rail")
         yield Label("", id="session_metrics_footer")
@@ -730,9 +799,7 @@ class ChatPane(Vertical):
     #chat_log {
         height: 1fr;
         width: 3fr;
-        border: heavy $primary;
-        border-title-color: $primary;
-        border-title-style: bold;
+        border: blank;
         padding: 1 2;
         scrollbar-size: 1 1;
         background: $surface;
@@ -740,54 +807,38 @@ class ChatPane(Vertical):
     #trace_panel {
         width: 40;
         height: 1fr;
-        border: solid $border;
+        border: blank;
         background: $panel;
         padding: 1 1;
         margin-left: 1;
     }
     #trace_header {
-        color: $accent;
+        color: $text-muted;
         text-style: bold;
         margin-bottom: 1;
         padding: 0 1;
-        background: $surface;
-        border: solid $border;
+        background: transparent;
+        border: blank;
     }
     #trace_log {
         height: 1fr;
         scrollbar-size: 1 1;
-        border-top: solid $border;
         padding-top: 1;
+    }
+    #trace_log > * {
+        border-top: blank;
+        padding-top: 0;
+        margin-top: 0;
     }
     #trace_summary_chip {
         height: auto;
         width: auto;
         padding: 0 2;
         margin: 0 0 1 0;
-        background: $panel;
-        border: heavy $accent;
-        color: $accent;
-        text-style: bold;
-    }
-    #chat_input_row {
-        height: auto;
-        padding: 1 1 1 1;
-        background: $panel;
-        border: heavy $primary;
-    }
-    #chat_controls {
-        height: auto;
-        width: auto;
-        padding: 0 0 0 1;
-        border-left: solid $border;
-        margin-left: 1;
-    }
-    #chat_primary_actions, #chat_secondary_actions {
-        height: auto;
-        width: auto;
-    }
-    #chat_secondary_actions {
-        margin-left: 1;
+        background: transparent;
+        border: blank;
+        color: $text-muted;
+        text-style: dim;
     }
     #chat_metrics {
         color: $text-muted;
@@ -795,23 +846,52 @@ class ChatPane(Vertical):
         padding: 0 2;
         text-style: dim;
     }
+    #chat_composer {
+        height: 5;
+        min-height: 5;
+        max-height: 5;
+        padding: 1 1 1 1;
+        background: $panel;
+        border: round $panel;
+        margin: 1 1 0 1;
+    }
     #chat_input {
         height: 3;
-        border: heavy $primary;
-        background: $background;
-        color: $text;
+        width: 1;
+        min-width: 1;
+        max-width: 1;
+        border: tall #41414D;
+        background: #2A2734;
+        color: #2A2734;
+        padding: 0 0;
+    }
+    #chat_input_mirror {
+        height: 1fr;
         width: 1fr;
-        padding: 0 1;
+        background: #23212B;
+        color: #E1E1E6;
+        padding: 0 2;
+    }
+    #chat_input:focus {
+        border: tall #2A2734;
+        background: #2A2734;
+        color: #2A2734;
     }
     .chat_btn {
+        height: 3;
         margin-left: 1;
         min-width: 10;
-        background: $surface;
-        border: solid $border;
+        background: transparent;
+        border: blank;
+        color: $text-muted;
     }
     .chat_btn:hover {
-        border: solid $primary;
-        color: $primary;
+        background: $surface;
+        color: $text;
+    }
+    .chat_btn:focus {
+        border-bottom: solid $primary;
+        color: $text;
     }
     """
 
@@ -828,8 +908,9 @@ class ChatPane(Vertical):
                 yield VerticalScroll(id="trace_log")
         yield Label("", id="trace_summary_chip")
         yield Label("", id="chat_metrics")
-        with Horizontal(id="chat_input_row"):
-            yield Input(placeholder="Type a message… (Enter to send)", id="chat_input")
+        with Horizontal(id="chat_composer"):
+            yield ChatInputMirror(id="chat_input_mirror")
+            yield ChatInput(placeholder="Type a message… (Enter to send)", id="chat_input")
             with Horizontal(id="chat_controls"):
                 with Horizontal(id="chat_primary_actions"):
                     yield Button("Trace", id="chat_toggle_trace_btn", classes="chat_btn")
@@ -845,13 +926,37 @@ class ChatPane(Vertical):
     def on_mount(self) -> None:
         name = self.state.agent.provider.config.name if self.state.agent else "?"
         log = self.query_one("#chat_log", VerticalScroll)
-        log.border_title = " Chat "
         log.mount(SystemMessage(f"⚡ Motion Harness — connected to {name}"))
         log.mount(SystemMessage("Tip: Ctrl/Alt+1..6 or F1-F6 tabs · F8 Trace · F9 Copy · /skill save <name>"))
         self._append_trace("session_start", f"provider={name}")
         self._set_trace_panel_visible(self.state.show_trace_panel)
         self._refresh_metrics_bar()
         self.query_one("#chat_input", Input).focus()
+        self._refresh_input_mirror()
+
+    def _refresh_input_mirror(self) -> None:
+        try:
+            input_box = self.query_one("#chat_input", Input)
+            mirror = self.query_one("#chat_input_mirror", ChatInputMirror)
+        except Exception:
+            return
+        mirror.set_input_state(
+            value=input_box.value,
+            cursor=input_box.cursor_position,
+            focused=input_box.has_focus,
+        )
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "chat_input":
+            self._refresh_input_mirror()
+
+    def on_descendant_focus(self, event) -> None:
+        if getattr(getattr(event, "widget", None), "id", None) == "chat_input":
+            self._refresh_input_mirror()
+
+    def on_descendant_blur(self, event) -> None:
+        if getattr(getattr(event, "widget", None), "id", None) == "chat_input":
+            self._refresh_input_mirror()
 
     def _set_trace_panel_visible(self, visible: bool) -> None:
         self.state.show_trace_panel = visible
@@ -913,7 +1018,7 @@ class ChatPane(Vertical):
     def _render_user_markdown(timestamp: str, text: str):
         safe = text.strip() or "_Empty message._"
         return Group(
-            Text(f"▸ {timestamp}  YOU", style="bold"),
+            Text(f"{timestamp}  YOU", style="bold"),
             Text(""),
             RichMarkdown(safe),
         )
@@ -922,7 +1027,7 @@ class ChatPane(Vertical):
     def _render_agent_markdown(timestamp: str, answer: str):
         safe_answer = answer.strip() or "_No response content._"
         return Group(
-            Text(f"◂ {timestamp}  MOTION", style="bold"),
+            Text(f"{timestamp}  MOTION", style="bold"),
             Text(""),
             RichMarkdown(safe_answer),
         )
@@ -932,6 +1037,7 @@ class ChatPane(Vertical):
         if not text:
             return
         event.input.value = ""
+        self._refresh_input_mirror()
 
         log = self.query_one("#chat_log", VerticalScroll)
         if text.startswith("/skill"):
@@ -942,8 +1048,9 @@ class ChatPane(Vertical):
         user_msg = UserMessage("")
         user_msg.update(self._render_user_markdown(ts, text))
         log.mount(user_msg)
-        thinking = SystemMessage("⚙️ Thinking…")
-        live_response = AgentMessage(f"[dim]{ts} • Motion[/]\n")
+        thinking = SystemMessage("Thinking…")
+        live_response = AgentMessage("")
+        live_response.update(self._render_agent_markdown(ts, "_Waiting for response…_"))
         log.mount(thinking)
         log.mount(live_response)
         log.scroll_end(animate=False)
@@ -1004,7 +1111,6 @@ class ChatPane(Vertical):
         chunks: list[str] = []
         first_chunk = True
         header_ts = datetime.now().strftime("%H:%M:%S")
-        header = f"[dim]{header_ts} • Motion[/]\n"
         reasoning_widget: Optional[ReasoningMessage] = None
         current_raw = ""
         self._append_trace("interaction_start", prompt[:120])
@@ -1025,10 +1131,10 @@ class ChatPane(Vertical):
             reasoning, answer = _extract_reasoning_and_answer(current_raw)
             if reasoning:
                 if reasoning_widget is None:
-                    reasoning_widget = ReasoningMessage("[dim]Reasoning stream[/]\n")
+                    reasoning_widget = ReasoningMessage("")
                     log.mount(reasoning_widget, before=live_response)
-                reasoning_widget.update(f"[dim]Reasoning[/]\n{reasoning[:2500]}")
-            live_response.update(header + (answer or ""))
+                reasoning_widget.update(self._render_agent_markdown(header_ts, f"[dim]Reasoning[/]\n{reasoning[:2500]}"))
+            live_response.update(self._render_agent_markdown(header_ts, answer or ""))
         async def on_trace_event(*args) -> None:
             event_type = "trace"
             payload: Dict[str, Any] = {}
@@ -1194,7 +1300,7 @@ class TaskDetailScreen(Screen):
     #detail_box {
         width: 80;
         height: 85%;
-        border: round $primary;
+        border: round $border;
         background: $surface;
         padding: 1 2;
         overflow-y: auto;
@@ -1202,14 +1308,14 @@ class TaskDetailScreen(Screen):
     }
     #detail_header {
         text-style: bold;
-        color: $primary;
+        color: $text;
         margin-bottom: 1;
     }
     #detail_back_btn {
         margin-right: 1;
     }
     .detail_section {
-        color: $primary;
+        color: $text-muted;
         text-style: bold;
         margin-top: 1;
         margin-bottom: 0;
@@ -1351,14 +1457,14 @@ class TaskRow(Static):
 
     DEFAULT_CSS = """
     TaskRow {
-        padding: 1 1;
+        padding: 1 1 1 2;
         margin: 0 0 1 0;
-        background: $background 30%;
-        border: round $border;
+        background: $surface;
+        border: blank;
     }
     TaskRow:hover {
         background: $primary 15%;
-        border: round $primary;
+        color: $text;
     }
     """
 
@@ -1398,19 +1504,21 @@ class TasksPane(Vertical):
     DEFAULT_CSS = """
     TasksPane {
         height: 1fr;
+        padding: 1 1 0 1;
     }
     #tasks_container {
         height: 1fr;
-        border: round $border;
+        border: blank;
         padding: 1;
         background: $surface;
     }
     #tasks_header_row {
         height: auto;
         margin-bottom: 1;
+        padding: 0 1;
     }
     #tasks_header {
-        color: $primary;
+        color: $text-muted;
         text-style: bold;
         width: 1fr;
     }
@@ -1421,13 +1529,19 @@ class TasksPane(Vertical):
     #task_list {
         height: 1fr;
         scrollbar-size: 1 1;
+        padding: 0 1;
     }
     #task_input_row {
         height: auto;
-        padding: 1 0 0 0;
+        padding: 1 1 1 1;
+        background: $panel;
     }
     #task_input {
-        border: round $border;
+        border: blank;
+        background: $background;
+    }
+    #task_input:focus {
+        border-bottom: solid $primary;
     }
     """
 
@@ -1438,7 +1552,7 @@ class TasksPane(Vertical):
     def compose(self) -> ComposeResult:
         with Vertical(id="tasks_container"):
             with Horizontal(id="tasks_header_row"):
-                yield Label("⚙️ Tasks", id="tasks_header")
+                yield Label("Tasks", id="tasks_header")
                 yield Label("", id="tasks_count")
             yield VerticalScroll(id="task_list")
             with Horizontal(id="task_input_row"):
@@ -1503,7 +1617,7 @@ class TasksPane(Vertical):
         running = sum(1 for t in s["tasks"].values() if t.status == "RUNNING")
         done = sum(1 for t in s["tasks"].values() if t.status in ("COMPLETED", "FAILED"))
         try:
-            self.query_one("#tasks_header", Label).update("⚙️ Tasks")
+            self.query_one("#tasks_header", Label).update("Tasks")
             self.query_one("#tasks_count", Label).update(
                 f"{running} running · {done}/{total} done" if total else "no tasks yet"
             )
@@ -1533,40 +1647,57 @@ class SkillsPane(Container):
     CSS = """
     #skills_container {
         height: 1fr;
-        border: round $border;
+        border: blank;
         padding: 1;
         background: $surface;
     }
     #skills_header {
-        color: $primary;
+        color: $text-muted;
         text-style: bold;
-        margin-bottom: 0;
+        margin-bottom: 1;
+        padding: 0 1;
     }
     #skills_list {
         height: 1fr;
         scrollbar-size: 1 1;
+        padding: 0 1;
     }
     #skills_search {
         height: auto;
-        padding: 0 0 1 0;
+        padding: 0 1 1 1;
     }
     #skills_search_input {
-        border: round $border;
+        border: blank;
+        background: $background;
+    }
+    #skills_search_input:focus {
+        border-bottom: solid $primary;
     }
     #skills_editor_row {
         height: auto;
-        padding: 1 0 0 0;
+        padding: 1 1 0 1;
+        background: $panel;
     }
     #skills_title_input {
         margin-right: 1;
+        border: blank;
+        background: $background;
+    }
+    #skills_title_input:focus {
+        border-bottom: solid $primary;
     }
     #skills_content_input {
-        border: round $border;
+        border: blank;
+        background: $background;
         margin-top: 1;
+    }
+    #skills_content_input:focus {
+        border-bottom: solid $primary;
     }
     #skills_status {
         color: $text-muted;
         margin-top: 1;
+        padding: 0 1;
     }
     .skill_entry {
         padding: 0 1;
@@ -1580,7 +1711,7 @@ class SkillsPane(Container):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="skills_container"):
-            yield Label("🎓 Crystallized Skills", id="skills_header")
+            yield Label("Skills", id="skills_header")
             with Horizontal(id="skills_search"):
                 yield Input(placeholder="Search skills…", id="skills_search_input")
             with Horizontal(id="skills_editor_row"):
@@ -1595,7 +1726,6 @@ class SkillsPane(Container):
             yield VerticalScroll(id="skills_list")
 
     def on_mount(self) -> None:
-        self.query_one("#skills_container", Vertical).border_title = " Skills "
         self._load_skills()
 
     def _load_skills(self, query: str = "") -> None:
@@ -1733,33 +1863,45 @@ class KBPane(Container):
     CSS = """
     #kb_container {
         height: 1fr;
-        border: round $border;
+        border: blank;
         padding: 1;
         background: $surface;
     }
     #kb_header {
-        color: $primary;
+        color: $text-muted;
         text-style: bold;
-        margin-bottom: 0;
+        margin-bottom: 1;
+        padding: 0 1;
     }
     #kb_list {
         height: 1fr;
         scrollbar-size: 1 1;
+        padding: 0 1;
     }
     #kb_search {
         height: auto;
-        padding: 0 0 1 0;
+        padding: 0 1 1 1;
     }
     #kb_search_input {
-        border: round $border;
+        border: blank;
+        background: $background;
+    }
+    #kb_search_input:focus {
+        border-bottom: solid $primary;
     }
     #kb_add_row {
         height: auto;
-        padding: 0 0 0 0;
+        padding: 1 1 0 1;
+        background: $panel;
     }
     #kb_add_title {
         height: 3;
         margin-right: 1;
+        border: blank;
+        background: $background;
+    }
+    #kb_add_title:focus {
+        border-bottom: solid $primary;
     }
     #kb_add_btn {
         margin-right: 1;
@@ -1770,22 +1912,32 @@ class KBPane(Container):
     #kb_add_area {
         height: 5;
         margin-top: 1;
-        border: round $border;
+        border: blank;
+        background: $background;
+    }
+    #kb_add_area:focus {
+        border-bottom: solid $primary;
     }
     #kb_mode_select {
         margin-top: 1;
+        padding: 0 1;
     }
     #kb_memory_search_row {
         height: auto;
         margin-top: 1;
+        padding: 0 1;
     }
     #kb_memory_search_input {
-        border: round $border;
+        border: blank;
+        background: $background;
+    }
+    #kb_memory_search_input:focus {
+        border-bottom: solid $primary;
     }
     #kb_memory_results {
         height: 8;
         scrollbar-size: 1 1;
-        border: solid $border;
+        border: blank;
         background: $panel;
         padding: 0 1;
         margin-top: 1;
@@ -1793,6 +1945,7 @@ class KBPane(Container):
     #kb_status {
         color: $text-muted;
         margin-top: 1;
+        padding: 0 1;
     }
     .kb_entry {
         padding: 0 1;
@@ -1806,7 +1959,7 @@ class KBPane(Container):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="kb_container"):
-            yield Label("📚 Knowledge Base", id="kb_header")
+            yield Label("Knowledge Base", id="kb_header")
             with Horizontal(id="kb_search"):
                 yield Input(placeholder="Search knowledge base…", id="kb_search_input")
             yield VerticalScroll(id="kb_list")
@@ -1828,7 +1981,6 @@ class KBPane(Container):
             yield Label("KB indexing mode controls whether entries are annexed into memory.", id="kb_status")
 
     def on_mount(self) -> None:
-        self.query_one("#kb_container", Vertical).border_title = " Knowledge Base "
         self._load_kb()
 
     def _load_kb(self, query: str = "") -> None:
@@ -1987,30 +2139,36 @@ class MemoryPane(Container):
     CSS = """
     #memory_container {
         height: 1fr;
-        border: round $border;
+        border: blank;
         padding: 1;
         background: $surface;
     }
     #memory_results {
         height: 1fr;
         scrollbar-size: 1 1;
+        padding: 0 1;
     }
     #memory_search_row {
         height: auto;
-        padding: 0 0 1 0;
+        padding: 0 1 1 1;
     }
     #memory_search_input {
-        border: round $border;
+        border: blank;
+        background: $background;
+    }
+    #memory_search_input:focus {
+        border-bottom: solid $primary;
     }
     #memory_header {
-        color: $primary;
+        color: $text-muted;
         text-style: bold;
-        margin-bottom: 0;
+        margin-bottom: 1;
+        padding: 0 1;
     }
     .memory_entry {
         padding: 0 1;
         margin: 0 0 1 0;
-        border-top: solid $border;
+        border-top: blank;
     }
     """
 
@@ -2020,13 +2178,13 @@ class MemoryPane(Container):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="memory_container"):
-            yield Label("🧠 Memory Search", id="memory_header")
+            yield Label("Memory Search", id="memory_header")
             with Horizontal(id="memory_search_row"):
                 yield Input(placeholder="Search memories… (Enter to search)", id="memory_search_input")
             yield VerticalScroll(id="memory_results")
 
     def on_mount(self) -> None:
-        self.query_one("#memory_container", Vertical).border_title = " Memory "
+        pass
 
     async def on_input_submitted(self, event: Input.Submitted) -> None:
         query = event.value.strip()
@@ -2070,46 +2228,48 @@ class SettingsPane(Container):
     CSS = """
     #settings_container {
         height: 1fr;
-        border: round $border;
+        border: blank;
         padding: 1 2;
-        background: $surface;
+        background: $background;
         scrollbar-size: 1 1;
+    }
+    .settings_card {
+        height: auto;
+        padding: 1 2;
+        margin-top: 1;
+        background: $surface;
+        border: round $surface;
     }
     .settings_label {
         text-style: bold;
-        color: $primary;
-        margin-top: 1;
+        color: $text;
         margin-bottom: 0;
-    }
-    .settings_section {
-        margin-top: 0;
-        margin-bottom: 1;
-        padding: 0 0;
     }
     .settings_row {
         margin-top: 0;
         height: auto;
         color: $text-muted;
     }
-    #provider_select {
-        margin-top: 0;
-        margin-bottom: 0;
-    }
-    #theme_select {
-        margin-top: 0;
-        margin-bottom: 0;
-    }
     .settings_btn {
         margin-top: 0;
         margin-right: 1;
+        background: transparent;
+        border: blank;
+        color: $text-muted;
     }
-    #settings_provider {
-        color: $foreground;
+    .settings_btn:hover {
+        background: $panel;
+        color: $text;
     }
-    #settings_caveman {
-        color: $foreground;
+    .settings_btn:focus {
+        border-bottom: solid $primary;
+        color: $text;
     }
-    #settings_workers {
+    #provider_select, #theme_select, #ui_mode_select {
+        margin-top: 0;
+        margin-bottom: 0;
+    }
+    #settings_provider, #settings_caveman, #settings_synthesis, #settings_activity_rail, #settings_workers {
         color: $text-muted;
     }
     """
@@ -2120,57 +2280,55 @@ class SettingsPane(Container):
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(id="settings_container"):
-            yield Label("🔧 Settings", classes="settings_label")
+            with Container(classes="settings_card"):
+                yield Label("Provider / Model", classes="settings_label")
+                yield Label("Switch the active model at runtime", classes="settings_row")
+                options = AppState.build_provider_options()
+                valid_values = {v for _, v in options}
+                default_val = self.state.current_provider_id if self.state.current_provider_id in valid_values else (options[0][1] if options else Select.BLANK)
+                yield Select(options, value=default_val, id="provider_select")
+                active_label = default_val
+                for label, val in options:
+                    if val == default_val:
+                        active_label = label
+                        break
+                yield Label(f"Active: {active_label}", id="settings_provider")
 
-            yield Label("Provider / Model", classes="settings_label")
-            yield Label("  Switch the active model at runtime:", classes="settings_row")
-            options = AppState.build_provider_options()
-            valid_values = {v for _, v in options}
-            default_val = self.state.current_provider_id if self.state.current_provider_id in valid_values else (options[0][1] if options else Select.BLANK)
-            yield Select(options, value=default_val, id="provider_select")
-            active_label = default_val
-            for label, val in options:
-                if val == default_val:
-                    active_label = label
-                    break
-            yield Label(f"  Active: {active_label}", id="settings_provider")
+            with Container(classes="settings_card"):
+                yield Label("Theme", classes="settings_label")
+                yield Label("Select the visual theme", classes="settings_row")
+                theme_options = [(ThemeRegistry.get_theme(tid).name, tid) for tid in ThemeRegistry.theme_ids()]
+                yield Select(theme_options, value=self.state.current_theme, id="theme_select")
+                yield Button("Cycle theme", id="btn_toggle_theme", classes="settings_btn")
 
-            yield Label("Theme", classes="settings_label")
-            theme_options = [(ThemeRegistry.get_theme(tid).name, tid) for tid in ThemeRegistry.theme_ids()]
-            yield Select(theme_options, value=self.state.current_theme, id="theme_select")
-            yield Button("Toggle Theme (Ctrl+T)", id="btn_toggle_theme", classes="settings_btn")
+            with Container(classes="settings_card"):
+                yield Label("Interface Style", classes="settings_label")
+                yield Label("Toggle experimental visual mode", classes="settings_row")
+                yield Select(
+                    [("Conservative", "conservative"), ("Experimental", "experimental")],
+                    value=self.state.ui_mode,
+                    id="ui_mode_select",
+                )
 
-            yield Label("Interface Style", classes="settings_label")
-            yield Select(
-                [("Conservative", "conservative"), ("Experimental", "experimental")],
-                value=self.state.ui_mode,
-                id="ui_mode_select",
-            )
+            with Container(classes="settings_card"):
+                yield Label("Options", classes="settings_label")
+                yield Label("Workspace toggles and status", classes="settings_row")
+                rail_state = "ON" if self.state.show_activity_rail else "OFF"
+                yield Label(f"Activity rail: {rail_state} (Ctrl+B)", id="settings_activity_rail")
+                yield Button("Toggle rail", id="btn_toggle_activity_rail", classes="settings_btn")
+                cstatus = "ON" if self.state.caveman_enabled else "OFF"
+                yield Label(f"Caveman: {cstatus}", id="settings_caveman")
+                yield Button("Toggle caveman", id="btn_toggle_caveman", classes="settings_btn")
+                syn_status = "ON" if self.state.auto_synthesis_enabled else "OFF"
+                yield Label(f"Auto skill synthesis: {syn_status}", id="settings_synthesis")
+                yield Button("Toggle synthesis", id="btn_toggle_synthesis", classes="settings_btn")
 
-            yield Label("Global Activity Rail", classes="settings_label")
-            rail_state = "ON" if self.state.show_activity_rail else "OFF"
-            yield Label(f"  Status: {rail_state} (Ctrl+B)", id="settings_activity_rail")
-            yield Button("Toggle Activity Rail", id="btn_toggle_activity_rail", classes="settings_btn")
-
-            yield Label("Caveman Compression", classes="settings_label")
-            cstatus = "ON" if self.state.caveman_enabled else "OFF"
-            yield Label(f"  Status: {cstatus}", id="settings_caveman")
-            yield Button("Toggle Caveman", id="btn_toggle_caveman", classes="settings_btn")
-
-            yield Label("Auto Skill Synthesis", classes="settings_label")
-            syn_status = "ON" if self.state.auto_synthesis_enabled else "OFF"
-            yield Label(f"  Status: {syn_status} (crystallize skills from each reply)", id="settings_synthesis")
-            yield Button("Toggle Auto-Synthesis", id="btn_toggle_synthesis", classes="settings_btn")
-
-            yield Label("Workspace", classes="settings_label")
-            yield Label(f"  {WORKSPACE}", classes="settings_row")
-
-            yield Label("Dashboard", classes="settings_label")
-            yield Button("Open Dashboard ↗", id="btn_dashboard", classes="settings_btn")
-
-            yield Label("Workers", classes="settings_label")
-            w = f"  {os.cpu_count() * 2} max (CPU-aware)" if self.state.task_manager else "  Not initialized"
-            yield Label(w, id="settings_workers")
+            with Container(classes="settings_card"):
+                yield Label("Workspace", classes="settings_label")
+                yield Label(f"{WORKSPACE}", classes="settings_row")
+                yield Button("Open dashboard ↗", id="btn_dashboard", classes="settings_btn")
+                w = f"Max workers: {os.cpu_count() * 2} (CPU-aware)" if self.state.task_manager else "Task manager not initialized"
+                yield Label(w, id="settings_workers")
 
     async def on_select_changed(self, event: Select.Changed) -> None:
         """Handle dropdown changes for provider and theme selectors."""
@@ -2273,30 +2431,29 @@ class MotionTUI(App):
     CSS = """
     Screen { background: $background; color: $foreground; }
     Header {
-        background: $surface;
-        border-bottom: heavy $primary;
-        color: $text;
+        background: $background;
+        border-bottom: blank;
+        color: $text-muted;
         text-style: bold;
         padding: 0 1;
     }
     Header.-header-tall { height: 3; }
     Footer {
-        background: $panel;
-        border-top: heavy $primary;
+        background: $background;
+        border-top: blank;
         color: $text-muted;
         padding: 0 1;
     }
     TabbedContent { height: 1fr; }
     Tabs {
-        background: $panel;
+        background: $background;
         height: 3;
-        border-bottom: solid $border;
+        border-bottom: blank;
     }
     Tabs > Tab {
         padding: 0 2;
         color: $text-muted;
-        text-style: bold;
-        background: $panel;
+        background: $background;
         border: blank;
     }
     Tabs > Tab:hover {
@@ -2304,23 +2461,14 @@ class MotionTUI(App):
         background: $surface;
     }
     Tabs > Tab.-active {
-        color: $background;
-        background: $primary;
+        color: $text;
+        background: $surface;
+        border-bottom: solid $primary;
         text-style: bold;
     }
     TabPane {
         background: $background;
         padding: 0 0;
-    }
-    .experimental-ui TaskRow {
-        padding: 1 2;
-        margin: 0 0 1 0;
-    }
-    .experimental-ui #chat_log {
-        border: heavy $primary;
-    }
-    .experimental-ui #tasks_container {
-        border: heavy $primary;
     }
     """
 
