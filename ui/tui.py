@@ -850,7 +850,7 @@ class ChatPane(Vertical):
         max-height: 5;
         padding: 1 1 1 1;
         background: $background;
-        border-top: solid $border;
+        border-top: solid $surface;
         border-left: blank;
         border-right: blank;
         border-bottom: blank;
