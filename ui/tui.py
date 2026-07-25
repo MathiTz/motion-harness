@@ -263,7 +263,7 @@ class ChatInput(Input):
             cursor = self.cursor_position if self.value else 0
             if cursor >= len(text):
                 text.append(" ")
-            text.stylize("bold #191622 on #78D1E1", cursor, cursor + 1)
+            text.stylize("on #78D1E1", cursor, cursor + 1)
 
         segments = list(self.app.console.render(text, self.app.console.options.update_width(width)))
         strip = Strip(segments)
@@ -788,11 +788,11 @@ class ChatPane(Vertical):
     ChatPane {
         height: 1fr;
         background: $background;
-        padding: 0 0 0 0;
+        padding: 0;
     }
     #chat_body {
         height: 1fr;
-        padding: 1 0 1 0;
+        padding: 0;
     }
     #chat_log {
         height: 1fr;
@@ -800,7 +800,7 @@ class ChatPane(Vertical):
         border: blank;
         padding: 1 2;
         scrollbar-size: 1 1;
-        background: $surface;
+        background: $background;
     }
     #trace_panel {
         width: 40;
@@ -849,31 +849,34 @@ class ChatPane(Vertical):
         min-height: 5;
         max-height: 5;
         padding: 1 1 1 1;
-        background: $panel;
-        border: round $panel;
-        margin: 1 1 0 1;
+        background: $background;
+        border-top: solid $border;
+        border-left: blank;
+        border-right: blank;
+        border-bottom: blank;
+        margin: 0;
     }
     #chat_input {
         height: 3;
         width: 1;
         min-width: 1;
         max-width: 1;
-        border: tall #41414D;
-        background: #2A2734;
-        color: #2A2734;
+        border: blank;
+        background: $background;
+        color: $background;
         padding: 0 0;
     }
     #chat_input_mirror {
         height: 1fr;
         width: 1fr;
-        background: #23212B;
+        background: $background;
         color: #E1E1E6;
         padding: 0 2;
     }
     #chat_input:focus {
-        border: tall #2A2734;
-        background: #2A2734;
-        color: #2A2734;
+        border: blank;
+        background: $background;
+        color: $background;
     }
     .chat_btn {
         height: 3;
