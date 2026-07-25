@@ -200,50 +200,48 @@ def _extract_reasoning_and_answer(text: str) -> tuple[str, str]:
 # ─── Chat message widgets ─────────────────────────────────────────────────────
 
 class UserMessage(Static):
-    """User reply balloon — rounded panel surface, aligned right."""
+    """User message — thin primary left accent bar, no box."""
     DEFAULT_CSS = """
     UserMessage {
-        background: $panel;
+        background: transparent;
         color: $text;
-        border: round $panel;
-        padding: 1 2;
-        margin: 1 6 0 0;
+        border-left: thick $primary;
+        padding: 0 2;
+        margin: 1 0 0 1;
     }
     """
 
 class ReasoningMessage(Static):
-    """Inline reasoning hint — same structural balloon, no heavy rule."""
+    """Inline reasoning — dim italic, no box (opencode Thinking: style)."""
     DEFAULT_CSS = """
     ReasoningMessage {
-        background: $background;
+        background: transparent;
         color: $text-muted;
         text-style: dim italic;
-        border: round $background;
-        padding: 1 2;
-        margin: 1 0 1 6;
+        padding: 0 2;
+        margin: 0 0 0 1;
     }
     """
 
 class AgentMessage(Static):
-    """Motion reply balloon — rounded surface, aligned left."""
+    """Agent reply — no box, clean text flow."""
     DEFAULT_CSS = """
     AgentMessage {
-        background: $surface;
+        background: transparent;
         color: $text;
-        border: round $surface;
-        padding: 1 2;
-        margin: 1 0 1 4;
+        padding: 0 2;
+        margin: 0 0 1 1;
     }
     """
 
 class SystemMessage(Static):
-    """A system/info message — muted, single-line metadata."""
+    """System/info message — muted, single-line."""
     DEFAULT_CSS = """
     SystemMessage {
         color: $text-muted;
         text-style: dim;
         padding: 0 2;
-        margin: 0 0 1 0;
+        margin: 0 0 0 0;
     }
     """
 
@@ -1018,19 +1016,14 @@ class ChatPane(Vertical):
     def _render_user_markdown(timestamp: str, text: str):
         safe = text.strip() or "_Empty message._"
         return Group(
-            Text(f"{timestamp}  YOU", style="bold"),
-            Text(""),
+            Text(f"you  {timestamp}", style="dim"),
             RichMarkdown(safe),
         )
 
     @staticmethod
     def _render_agent_markdown(timestamp: str, answer: str):
         safe_answer = answer.strip() or "_No response content._"
-        return Group(
-            Text(f"{timestamp}  MOTION", style="bold"),
-            Text(""),
-            RichMarkdown(safe_answer),
-        )
+        return RichMarkdown(safe_answer)
 
     async def on_input_submitted(self, event: Input.Submitted) -> None:
         text = event.value.strip()
@@ -1133,7 +1126,7 @@ class ChatPane(Vertical):
                 if reasoning_widget is None:
                     reasoning_widget = ReasoningMessage("")
                     log.mount(reasoning_widget, before=live_response)
-                reasoning_widget.update(self._render_agent_markdown(header_ts, f"[dim]Reasoning[/]\n{reasoning[:2500]}"))
+                reasoning_widget.update(Text(f"Thinking: {reasoning[:2500]}", style="dim italic"))
             live_response.update(self._render_agent_markdown(header_ts, answer or ""))
         async def on_trace_event(*args) -> None:
             event_type = "trace"
@@ -1168,7 +1161,7 @@ class ChatPane(Vertical):
                 raw = response or ""
                 reasoning, answer = _extract_reasoning_and_answer(raw)
                 if reasoning:
-                    reasoning_widget = ReasoningMessage(f"[dim]Reasoning[/]\n{reasoning[:2500]}")
+                    reasoning_widget = ReasoningMessage(f"Thinking: {reasoning[:2500]}")
                     log.mount(reasoning_widget, before=live_response)
                 live_response.update(self._render_agent_markdown(header_ts, answer or ""))
                 self.state.last_agent_response = answer or ""
