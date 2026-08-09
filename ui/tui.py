@@ -33,7 +33,6 @@ from __future__ import annotations
 import asyncio
 import os
 import re
-import webbrowser
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -48,10 +47,7 @@ from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical, VerticalScroll
 from textual.message import Message
 from textual.screen import Screen
-from textual.strip import Strip
-from textual.widget import Widget
 from textual.widgets import (
-    Button,
     Footer,
     Header,
     Input,
@@ -64,15 +60,14 @@ from textual.widgets import (
 )
 
 from core.config import ConfigManager
-from core.orchestrator import TaskManager, TaskRequest, TaskStatus
+from core.orchestrator import TaskManager
 from core.providers import ModelConfig
+from core import auth
 from main import MotionAgent
 from ui.themes import ThemeRegistry
 
 WORKSPACE = os.getenv("MOTION_WORKSPACE", os.getcwd())
 KB_DIR = os.path.join(WORKSPACE, "knowledge")
-DASHBOARD_URL = "https://localhost:7860/"
-DASHBOARD_ADMIN_KEY = "ME27dXc6uoEC_dWXJCyPVDPN"
 
 
 def _suppress_logging() -> None:
@@ -889,6 +884,7 @@ class CommandPalette(Screen):
             ("Toggle trace panel", "trace"),
             ("Copy last response", "copy"),
             ("Toggle context panel", "context"),
+            ("Manage API keys (/auth)", "auth"),
         ]
         lv = self.query_one("#palette_list", ListView)
         for label, _ in self._commands:
@@ -923,14 +919,20 @@ class CommandPalette(Screen):
             return
         for lab, action in self._commands:
             if lab == label:
-                self.app.pop_screen()
                 self._run(action)
                 return
 
     def _run(self, action: str) -> None:
-        if action == "model":
-            self._main.action_open_model_dialog()
-        elif action == "agent":
+        # Actions that push their own screen keep the palette open underneath,
+        # so Esc returns to the command menu. Direct toggles close it first.
+        if action in ("model", "auth"):
+            if action == "model":
+                self._main.action_open_model_dialog()
+            elif action == "auth":
+                self._main.action_open_auth()
+            return
+        self.app.pop_screen()
+        if action == "agent":
             try:
                 self._main.query_one(ChatPane)._toggle_agent_mode()
             except Exception:
@@ -957,7 +959,11 @@ class CommandPalette(Screen):
 
 
 class ModelDialog(Screen):
-    """opencode-style model/provider switcher (Ctrl+O)."""
+    """opencode-style model/provider switcher (Ctrl+O).
+
+    Lists every model individually (all cloud models for a provider appear
+    once its API key is set) with a live search filter.
+    """
 
     CSS = """
     ModelDialog {
@@ -977,6 +983,10 @@ class ModelDialog(Screen):
         text-align: center;
         margin-bottom: 1;
     }
+    #model_input {
+        margin-bottom: 1;
+        border: solid $border;
+    }
     #model_list {
         height: auto;
         max-height: 60%;
@@ -993,37 +1003,84 @@ class ModelDialog(Screen):
 
     BINDINGS = [
         Binding("escape", "dismiss_model", "Close", priority=True),
+        Binding("ctrl+r", "refresh_models", "Refresh", priority=True),
     ]
 
     def __init__(self, state: AppState, **kwargs) -> None:
         super().__init__(**kwargs)
         self.state = state
+        self._entries: list[tuple[str, str]] = []  # (label, full_id)
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(id="model_box"):
-            yield Label("Select Provider / Model", id="model_title")
+            yield Label("Select Model", id="model_title")
+            yield Input(placeholder="Search models…", id="model_input")
             yield ListView(id="model_list")
-            yield Label("Esc to close", id="model_hint")
+            yield Label("Type to filter · Enter to select · Ctrl+R refresh · Esc to close", id="model_hint")
 
     def on_mount(self) -> None:
-        lv = self.query_one("#model_list", ListView)
+        self._entries = self._collect_entries()
+        self._render_models("")
+        self.query_one("#model_input", Input).focus()
+        # Kick off a refresh so cloud model lists stay current.
+        self.action_refresh_models()
+
+    @work
+    async def action_refresh_models(self) -> None:
+        """Scrape the latest Ollama Cloud model list and re-render."""
+        self.notify("Refreshing model list…")
+        try:
+            from core.catalog import update_ollama_cloud_models
+            added = await update_ollama_cloud_models()
+        except Exception:
+            added = 0
+        self._entries = self._collect_entries()
+        self._render_models(self.query_one("#model_input", Input).value)
+        if added:
+            self.notify(f"Found {added} new model{'s' if added != 1 else ''}")
+        else:
+            self.notify("Model list is up to date")
+
+    def _collect_entries(self) -> list[tuple[str, str]]:
+        entries: list[tuple[str, str]] = []
         for pid, name, models, is_default, has_key in AppState.build_all_provider_info():
             if not has_key:
                 continue
-            marker = " ← default" if is_default else ""
-            default_model = (models[0] if models else "")
-            label = f"⚡ {name}{marker}  [dim]{default_model}[/]"
-            lv.append(ProviderOption(pid, name, models, is_default, has_key))
-        self.query_one("#model_list", ListView).focus()
+            if models:
+                for m in models:
+                    full = f"{pid}/{m}"
+                    entries.append((f"{name} → {m}", full))
+            else:
+                entries.append((name, pid))
+        return entries
+
+    def _render_models(self, query: str) -> None:
+        q = query.strip().lower()
+        lv = self.query_one("#model_list", ListView)
+        lv.clear()
+        for label, full in self._entries:
+            if q and q not in label.lower():
+                continue
+            lv.append(ModelOption(label, full))
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        self._render_models(event.value)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        lv = self.query_one("#model_list", ListView)
+        item = lv.highlighted_child or (lv.children[0] if lv.children else None)
+        if item is not None:
+            event.stop()
+            self._select(item)
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
-        option = event.item
-        if not isinstance(option, ProviderOption):
+        if event.item is not None:
+            self._select(event.item)
+
+    def _select(self, item) -> None:
+        if not isinstance(item, ModelOption):
             return
-        provider_id = option.provider_id
-        models = option.models
-        default_model = models[0] if models else None
-        full_id = f"{provider_id}/{default_model}" if default_model else provider_id
+        full_id = item.full_id
         try:
             self.state.reconnect(full_id)
             self.notify(f"Switched to {full_id}")
@@ -1033,6 +1090,152 @@ class ModelDialog(Screen):
 
     def action_dismiss_model(self) -> None:
         self.app.pop_screen()
+
+
+class ModelOption(ListItem):
+    """A single selectable model row in the model dialog."""
+
+    def __init__(self, label: str, full_id: str, **kwargs) -> None:
+        self.full_id = full_id
+        super().__init__(Label(label), **kwargs)
+
+
+class AuthInputScreen(Screen):
+    """Prompt for an API key for a provider (opencode-style auth)."""
+
+    CSS = """
+    AuthInputScreen {
+        align: center middle;
+    }
+    #auth_box {
+        width: 72;
+        border: round $border;
+        background: $surface;
+        padding: 1 2;
+    }
+    #auth_title {
+        color: $text;
+        text-style: bold;
+        text-align: center;
+        margin-bottom: 1;
+    }
+    #auth_input {
+        margin-bottom: 1;
+        border: solid $border;
+    }
+    #auth_hint {
+        color: $text-muted;
+        text-align: center;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "dismiss_auth", "Close", priority=True),
+    ]
+
+    def __init__(self, provider: str, state: AppState, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.provider = provider
+        self.state = state
+
+    def compose(self) -> ComposeResult:
+        with Container(id="auth_box"):
+            yield Label(f"API key for {self.provider}", id="auth_title")
+            yield Input(placeholder="Paste your API key…", password=True, id="auth_input")
+            yield Label("Enter to save · Esc to cancel", id="auth_hint")
+
+    def on_mount(self) -> None:
+        self.query_one("#auth_input", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        key = event.value.strip()
+        if not key:
+            self.notify("No key entered; nothing saved.", severity="warning")
+            self.app.pop_screen()
+            return
+        auth.set_key(self.provider, key)
+        self.notify(f"Saved API key for {self.provider}")
+        self.app.pop_screen()
+
+    def action_dismiss_auth(self) -> None:
+        self.app.pop_screen()
+
+
+class AuthListScreen(Screen):
+    """List providers and their key status; pick one to log in/out."""
+
+    CSS = """
+    AuthListScreen {
+        align: center middle;
+    }
+    #authlist_box {
+        width: 72;
+        max-height: 80%;
+        border: round $border;
+        background: $surface;
+        padding: 1 2;
+        scrollbar-size: 1 1;
+    }
+    #authlist_title {
+        color: $text;
+        text-style: bold;
+        text-align: center;
+        margin-bottom: 1;
+    }
+    #authlist_list {
+        height: auto;
+        max-height: 60%;
+        scrollbar-size: 1 1;
+        padding: 0 1;
+        border: blank;
+    }
+    #authlist_hint {
+        color: $text-muted;
+        text-align: center;
+        margin-top: 1;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "dismiss_authlist", "Close", priority=True),
+    ]
+
+    def __init__(self, state: AppState, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.state = state
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll(id="authlist_box"):
+            yield Label("Manage API Keys", id="authlist_title")
+            yield ListView(id="authlist_list")
+            yield Label("Enter to set a key · Esc to close", id="authlist_hint")
+
+    def on_mount(self) -> None:
+        self.query_one("#authlist_box", VerticalScroll).border_title = " Auth "
+        lv = self.query_one("#authlist_list", ListView)
+        for pid, name, models, is_default, has_key in self.state.config_manager.list_providers():
+            status = "🔑" if has_key else "🔒"
+            lv.append(AuthOption(pid, name, has_key, status))
+        self.query_one("#authlist_list", ListView).focus()
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        option = event.item
+        if not isinstance(option, AuthOption):
+            return
+        self.app.pop_screen()
+        self.app.push_screen(AuthInputScreen(option.provider_id, self.state))
+
+    def action_dismiss_authlist(self) -> None:
+        self.app.pop_screen()
+
+
+class AuthOption(ListItem):
+    """A provider row in the auth list."""
+
+    def __init__(self, provider_id: str, name: str, has_key: bool, status: str, **kwargs) -> None:
+        self.provider_id = provider_id
+        label = f"{status} {name}  [dim]({provider_id})[/]"
+        super().__init__(Label(label), **kwargs)
 
 
 class MainScreen(Screen):
@@ -1089,6 +1292,9 @@ class MainScreen(Screen):
 
     def action_open_model_dialog(self) -> None:
         self.app.push_screen(ModelDialog(self.state))
+
+    def action_open_auth(self) -> None:
+        self.app.push_screen(AuthListScreen(self.state))
 
     def refresh_session_footer(self) -> None:
         s = self.state.session_metrics or {}
@@ -1476,6 +1682,10 @@ class ChatPane(Vertical):
             await self._handle_skill_command(text, log)
             log.scroll_end(animate=False)
             return
+        if text.startswith("/auth"):
+            await self._handle_auth_command(text, log)
+            log.scroll_end(animate=False)
+            return
         ts = datetime.now().strftime("%H:%M:%S")
         user_msg = UserMessage("")
         user_msg.update(self._render_user_markdown(ts, text))
@@ -1665,1135 +1875,44 @@ class ChatPane(Vertical):
             f.write(f"# {parts[2].strip()}\n\n{content}\n")
         log.mount(SystemMessage(f"✅ Saved skill from last reply: {skill_name}"))
 
-
-# ─── Task detail screen ──────────────────────────────────────────────────────
-
-class TaskDetailScreen(Screen):
-    """Push-screen overlay showing full task detail."""
-
-    DEFAULT_CSS = """
-    TaskDetailScreen {
-        align: center middle;
-    }
-    #detail_box {
-        width: 80;
-        height: 85%;
-        border: round $border;
-        background: $surface;
-        padding: 1 2;
-        overflow-y: auto;
-        scrollbar-size: 1 1;
-    }
-    #detail_header {
-        text-style: bold;
-        color: $text;
-        margin-bottom: 1;
-    }
-    #detail_back_btn {
-        margin-right: 1;
-    }
-    .detail_section {
-        color: $text-muted;
-        text-style: bold;
-        margin-top: 1;
-        margin-bottom: 0;
-    }
-    .detail_prompt {
-        color: $foreground;
-        background: $surface;
-        padding: 0 1;
-        margin: 0 0;
-    }
-    .detail_result {
-        color: $foreground;
-        padding: 0 1;
-        margin: 0 0;
-    }
-    .detail_error {
-        color: red;
-        text-style: bold;
-        padding: 0 1;
-        margin: 0 0;
-    }
-    .detail_meta {
-        color: $text-muted;
-        padding: 0 1;
-        margin: 0 0;
-    }
-    .detail_log_line {
-        color: $text-muted;
-        padding: 0 1;
-        margin: 0 0;
-    }
-    """
-
-    BINDINGS = [
-        Binding("escape", "pop_screen", "Back"),
-    ]
-
-    def __init__(self, task_id: str, **kwargs) -> None:
-        super().__init__(**kwargs)
-        self._task_id = task_id
-        self._task_manager: Optional[TaskManager] = None
-
-    def compose(self) -> ComposeResult:
-        with Vertical(id="detail_box"):
-            yield Button("← Back", id="detail_back_btn", classes="settings_btn")
-            yield Static("", id="detail_header")
-            yield Static("", classes="detail_meta")
-
-    def _render_task(self, task: TaskStatus) -> None:
-        status_icon = TaskRow.ICON.get(task.status, "?")
-        status_color = TaskRow.COLOR.get(task.status, "")
-        header = f"{status_icon} [{status_color}]{task.status}[/] — {self._task_id}"
-        self.query_one("#detail_header", Static).update(header)
-
-        meta = ""
-        if task.start_time:
-            meta += f"Started {task.start_time.strftime('%H:%M:%S')}"
-        if task.duration:
-            meta += f"  ·  Duration: {task.duration}"
-        if task.artifact_path:
-            safe_path = task.artifact_path.replace("[", "\\[").replace("]", "\\]")
-            meta += f"\n📄 {safe_path}"
-        self.query_one(".detail_meta", Static).update(meta)
-
-        box = self.query_one("#detail_box", Vertical)
-        fixed_ids = {"detail_back_btn", "detail_header"}
-        for child in list(box.children):
-            if child.id in fixed_ids or "detail_meta" in child.classes:
-                continue
-            child.remove()
-
-        box.mount(Label("Prompt", classes="detail_section"))
-        safe_prompt = task.prompt.replace("[", "\\[").replace("]", "\\]")
-        box.mount(Static(safe_prompt, classes="detail_prompt"))
-
-        if task.result:
-            box.mount(Label("Result", classes="detail_section"))
-            safe_result = task.result.replace("[", "\\[").replace("]", "\\]")
-            if len(safe_result) > 3000:
-                safe_result = safe_result[:3000] + "…"
-            box.mount(Static(safe_result, classes="detail_result"))
-
-        if task.error:
-            box.mount(Label("Error", classes="detail_section"))
-            safe_error = task.error.replace("[", "\\[").replace("]", "\\]")
-            box.mount(Static(safe_error, classes="detail_error"))
-
-        if task.conversation:
-            box.mount(Label("Conversation", classes="detail_section"))
-            for turn in task.conversation:
-                role = turn.get("role", "?")
-                content = turn.get("content", "").replace("[", "\\[").replace("]", "\\]")
-                role_icon = {"user": "👤", "agent": "🤖", "system": "⚡"}.get(role, "•")
-                box.mount(Static(f"{role_icon} [{status_color if role == 'agent' else 'cyan'}]{role.title()}[/]: {content[:2000]}", classes="detail_result"))
-
-        if task.logs:
-            box.mount(Label("Log", classes="detail_section"))
-            for line in task.logs:
-                safe_line = line.replace("[", "\\[").replace("]", "\\]")
-                box.mount(Static(safe_line, classes="detail_log_line"))
-
-    async def _on_task_progress(self, status: TaskStatus) -> None:
-        if status.task_id != self._task_id:
-            return
-        self._render_task(status)
-
-    def on_mount(self) -> None:
-        self.query_one("#detail_box", Vertical).border_title = " Task Detail "
-        state = None
-        app = self.app
-        if isinstance(app, MotionTUI) and hasattr(app, "state"):
-            state = app.state
-        if not state or not state.task_manager:
-            self.query_one("#detail_header", Static).update(f"Task {self._task_id}")
-            return
-
-        self._task_manager = state.task_manager
-        self._task_manager.subscribe(self._task_id, self._on_task_progress)
-        task = self._task_manager.get_task(self._task_id)
-        if not task:
-            self.query_one("#detail_header", Static).update(f"Task {self._task_id} — not found")
-            return
-        self._render_task(task)
-
-    def on_unmount(self) -> None:
-        if self._task_manager:
-            self._task_manager.unsubscribe(self._task_id, self._on_task_progress)
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "detail_back_btn":
-            self.app.pop_screen()
-
-    def action_pop_screen(self) -> None:
-        self.app.pop_screen()
-
-
-class TaskRow(Static):
-    """A clickable task row in the task list."""
-
-    DEFAULT_CSS = """
-    TaskRow {
-        padding: 1 1 1 2;
-        margin: 0 0 1 0;
-        background: $surface;
-        border: blank;
-    }
-    TaskRow:hover {
-        background: $primary 15%;
-        color: $text;
-    }
-    """
-
-    ICON = {"PENDING": "⏳", "RUNNING": "⚙️", "COMPLETED": "✅", "FAILED": "❌"}
-    COLOR = {"PENDING": "dim", "RUNNING": "bold yellow", "COMPLETED": "bold green", "FAILED": "bold red"}
-
-    def __init__(self, task_id: str, prompt: str, status: str, **kwargs) -> None:
-        self._task_id = task_id
-        self._prompt = prompt
-        self._status = status
-        icon = self.ICON.get(status, "?")
-        color = self.COLOR.get(status, "")
-        display = f"{icon} [{color}]{status}[/] [dim]{task_id}[/]\n  {self._truncate(prompt, 80)}"
-        super().__init__(display, id=f"task-{task_id}", **kwargs)
-
-    @staticmethod
-    def _truncate(text: str, max_len: int) -> str:
-        safe = text.replace("[", "\\[").replace("]", "\\]")
-        return safe[:max_len] + "…" if len(safe) > max_len else safe
-
-    def update_status(self, status: str, prompt: str | None = None) -> None:
-        if prompt:
-            self._prompt = prompt
-        self._status = status
-        icon = self.ICON.get(status, "?")
-        color = self.COLOR.get(status, "")
-        display = f"{icon} [{color}]{status}[/] [dim]{self._task_id}[/]\n  {self._truncate(self._prompt, 80)}"
-        self.update(display)
-
-    def on_click(self) -> None:
-        self.app.push_screen(TaskDetailScreen(self._task_id))
-
-
-class TasksPane(Vertical):
-    """Live task orchestration dashboard."""
-
-    DEFAULT_CSS = """
-    TasksPane {
-        height: 1fr;
-        padding: 1 1 0 1;
-    }
-    #tasks_container {
-        height: 1fr;
-        border: blank;
-        padding: 1;
-        background: $surface;
-    }
-    #tasks_header_row {
-        height: auto;
-        margin-bottom: 1;
-        padding: 0 1;
-    }
-    #tasks_header {
-        color: $text-muted;
-        text-style: bold;
-        width: 1fr;
-    }
-    #tasks_count {
-        color: $text-muted;
-        width: auto;
-    }
-    #task_list {
-        height: 1fr;
-        scrollbar-size: 1 1;
-        padding: 0 1;
-    }
-    #task_input_row {
-        height: auto;
-        padding: 1 1 1 1;
-        background: $panel;
-    }
-    #task_input {
-        border: blank;
-        background: $background;
-    }
-    #task_input:focus {
-        border-bottom: solid $primary;
-    }
-    """
-
-    def __init__(self, state: AppState, **kwargs) -> None:
-        super().__init__(**kwargs)
-        self.state = state
-
-    def compose(self) -> ComposeResult:
-        with Vertical(id="tasks_container"):
-            with Horizontal(id="tasks_header_row"):
-                yield Label("Tasks", id="tasks_header")
-                yield Label("", id="tasks_count")
-            yield VerticalScroll(id="task_list")
-            with Horizontal(id="task_input_row"):
-                yield Input(placeholder="Spawn a new task… (Enter to submit)", id="task_input")
-
-    def on_mount(self) -> None:
-        self._update_header()
-
-    async def on_input_submitted(self, event: Input.Submitted) -> None:
-        prompt = event.value.strip()
-        if not prompt:
-            return
-        event.input.value = ""
-
-        tm = self.state.task_manager
-        if not tm:
-            self.notify("No task manager", severity="error")
-            return
-
-        request = TaskRequest(prompt=prompt)
-        task_id = await tm.spawn_task(request, progress_callback=self._on_task_progress)
-        tl = self.query_one("#task_list", VerticalScroll)
-        tl.mount(TaskRow(task_id, prompt, "PENDING"))
-        self.notify(f"Task {task_id} spawned")
-        self._update_header()
-        self._wait_for_task(task_id, prompt)
-
-    def _on_task_progress(self, status: 'TaskStatus') -> None:
-        """Called by TaskManager on status transitions."""
-        try:
-            row = self.query_one(f"#task-{status.task_id}", TaskRow)
-            row.update_status(status.status)
-        except Exception:
-            pass
-        self._update_header()
-
-    @work(exclusive=False, name="task_wait")
-    async def _wait_for_task(self, task_id: str, prompt: str) -> None:
-        tm = self.state.task_manager
-        if not tm:
-            return
-        status = await tm.wait_for_task(task_id)
-        # Update the TaskRow with final status (pane may not be mounted if user switched tabs)
-        try:
-            existing = self.query_one(f"#task-{task_id}", TaskRow)
-            existing.update_status(status.status, prompt)
-        except Exception:
-            try:
-                self.query_one("#task_list", VerticalScroll).mount(
-                    TaskRow(task_id, prompt, status.status)
-                )
-            except Exception:
-                pass
-        self._update_header()
-
-    def _update_header(self) -> None:
-        tm = self.state.task_manager
-        if not tm:
-            return
-        s = tm.get_status()
-        total = len(s["tasks"])
-        running = sum(1 for t in s["tasks"].values() if t.status == "RUNNING")
-        done = sum(1 for t in s["tasks"].values() if t.status in ("COMPLETED", "FAILED"))
-        try:
-            self.query_one("#tasks_header", Label).update("Tasks")
-            self.query_one("#tasks_count", Label).update(
-                f"{running} running · {done}/{total} done" if total else "no tasks yet"
-            )
-        except Exception:
-            pass
-
-
-# ─── Skills pane ──────────────────────────────────────────────────────────────
-
-class SkillFileRow(Static):
-    """Clickable skill row that loads content into the editor form."""
-
-    def __init__(self, skill_path: Path, label: str, **kwargs) -> None:
-        super().__init__(label, classes="skill_entry", **kwargs)
-        self.skill_path = skill_path
-
-    def on_click(self) -> None:
-        try:
-            pane = self.app.screen.query_one(SkillsPane)
-            pane._load_skill_file(self.skill_path)
-        except Exception:
-            pass
-
-class SkillsPane(Container):
-    """Browse crystallized skills from the skills/ directory."""
-
-    CSS = """
-    #skills_container {
-        height: 1fr;
-        border: blank;
-        padding: 1;
-        background: $surface;
-    }
-    #skills_header {
-        color: $text-muted;
-        text-style: bold;
-        margin-bottom: 1;
-        padding: 0 1;
-    }
-    #skills_list {
-        height: 1fr;
-        scrollbar-size: 1 1;
-        padding: 0 1;
-    }
-    #skills_search {
-        height: auto;
-        padding: 0 1 1 1;
-    }
-    #skills_search_input {
-        border: blank;
-        background: $background;
-    }
-    #skills_search_input:focus {
-        border-bottom: solid $primary;
-    }
-    #skills_editor_row {
-        height: auto;
-        padding: 1 1 0 1;
-        background: $panel;
-    }
-    #skills_title_input {
-        margin-right: 1;
-        border: blank;
-        background: $background;
-    }
-    #skills_title_input:focus {
-        border-bottom: solid $primary;
-    }
-    #skills_content_input {
-        border: blank;
-        background: $background;
-        margin-top: 1;
-    }
-    #skills_content_input:focus {
-        border-bottom: solid $primary;
-    }
-    #skills_status {
-        color: $text-muted;
-        margin-top: 1;
-        padding: 0 1;
-    }
-    .skill_entry {
-        padding: 0 1;
-        margin: 0 0 1 0;
-    }
-    """
-
-    def __init__(self, state: AppState, **kwargs) -> None:
-        super().__init__(**kwargs)
-        self.state = state
-
-    def compose(self) -> ComposeResult:
-        with Vertical(id="skills_container"):
-            yield Label("Skills", id="skills_header")
-            with Horizontal(id="skills_search"):
-                yield Input(placeholder="Search skills…", id="skills_search_input")
-            with Horizontal(id="skills_editor_row"):
-                yield Input(placeholder="Skill name…", id="skills_title_input")
-                yield Button("Use Last Reply", id="skills_use_last_reply_btn", classes="settings_btn")
-                yield Button("Refine Draft", id="skills_refine_btn", classes="settings_btn")
-                yield Button("Save/Update", id="skills_save_btn", classes="settings_btn")
-                yield Button("Delete", id="skills_delete_btn", classes="settings_btn")
-                yield Button("Clear", id="skills_clear_btn", classes="settings_btn")
-            yield Input(placeholder="Skill content…", id="skills_content_input")
-            yield Label("Tip: In chat, use /skill save <name> to save the last reply as a skill.", id="skills_status")
-            yield VerticalScroll(id="skills_list")
-
-    def on_mount(self) -> None:
-        self._load_skills()
-
-    def _load_skills(self, query: str = "") -> None:
-        skills_dir = _skills_dir()
-        sl = self.query_one("#skills_list", VerticalScroll)
-        for child in list(sl.children):
-            child.remove()
-
-        if not skills_dir.exists():
-            sl.mount(Static("[dim]No skills yet. Skills crystallize automatically after successful tasks.[/]", classes="skill_entry"))
-            return
-
-        md_files = sorted(skills_dir.glob("*.md"))
-        if query:
-            md_files = [f for f in md_files if query in f.stem.lower() or query in f.read_text(errors="replace").lower()]
-
-        if not md_files:
-            sl.mount(Static(f"[dim]No skills matching '{query}'.[/]", classes="skill_entry"))
-            return
-
-        for f in md_files:
-            name = f.stem.replace("_", " ").title()
-            sz = f.stat().st_size
-            mtime = datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
-            sl.mount(SkillFileRow(f, f"[bold]{name}[/]  [dim]{sz}B · {mtime}[/]"))
-
-    def _load_skill_file(self, skill_path: Path) -> None:
-        try:
-            raw = skill_path.read_text(encoding="utf-8", errors="replace")
-        except Exception as e:
-            self.notify(f"Could not read skill: {e}", severity="error")
-            return
-        self.query_one("#skills_title_input", Input).value = skill_path.stem
-        self.query_one("#skills_content_input", Input).value = raw.replace("\n", " ")[:8000]
-        self.query_one("#skills_status", Label).update(f"Selected: {skill_path.name}")
-
-    async def on_button_pressed(self, event: Button.Pressed) -> None:
-        bid = event.button.id
-        if bid not in {"skills_save_btn", "skills_delete_btn", "skills_refine_btn", "skills_use_last_reply_btn", "skills_clear_btn"}:
-            return
-        if bid == "skills_clear_btn":
-            self.query_one("#skills_title_input", Input).value = ""
-            self.query_one("#skills_content_input", Input).value = ""
-            self.query_one("#skills_status", Label).update("Draft cleared.")
-            return
-        if bid == "skills_use_last_reply_btn":
-            content = (self.state.last_agent_response or "").strip()
-            if not content:
-                self.notify("No recent reply yet. Ask something in Chat first.", severity="warning")
+    async def _handle_auth_command(self, text: str, log: VerticalScroll) -> None:
+        parts = text.split(maxsplit=2)
+        action = parts[1].strip().lower() if len(parts) > 1 else ""
+        if action == "list":
+            keys = auth.list_keys()
+            if not keys:
+                log.mount(SystemMessage("No API keys stored. Use /auth login <provider>."))
                 return
-            self.query_one("#skills_content_input", Input).value = content.replace("\n", " ")[:8000]
-            self.query_one("#skills_status", Label).update("Loaded last assistant reply into draft.")
+            lines = ["Stored API keys:"]
+            for provider, key in sorted(keys.items()):
+                masked = f"{key[:4]}…{key[-4:]}" if len(key) > 8 else "…"
+                lines.append(f"  {provider}: {masked}")
+            log.mount(SystemMessage("\n".join(lines)))
             return
-        title = self.query_one("#skills_title_input", Input).value.strip()
-        if not title:
-            self.notify("Enter a skill name first", severity="warning")
-            return
-        slug = _slugify_name(title)
-        if not slug:
-            self.notify("Invalid skill name", severity="warning")
-            return
-        skills_dir = _skills_dir()
-        skills_dir.mkdir(parents=True, exist_ok=True)
-        skill_path = skills_dir / f"{slug}.md"
-
-        content = self.query_one("#skills_content_input", Input).value.strip()
-        if bid == "skills_refine_btn":
-            if not content:
-                self.notify("Add draft content first, then refine.", severity="warning")
+        if action == "logout":
+            provider = parts[2].strip() if len(parts) > 2 else ""
+            if not provider:
+                log.mount(SystemMessage("Usage: /auth logout <provider>"))
                 return
-            if not self.state.agent:
-                self.notify("No active agent to refine draft.", severity="error")
-                return
-            prompt = (
-                "Refine the following draft into a concise, reusable skill with clear steps and constraints. "
-                "Return plain markdown only.\n\n"
-                f"Skill name: {title}\n\nDraft:\n{content}"
-            )
-            self.query_one("#skills_status", Label).update("Refining draft…")
-            try:
-                refined = await self.state.agent.run(prompt, target="user")
-                self.query_one("#skills_content_input", Input).value = (refined or "").replace("\n", " ")[:8000]
-                self.query_one("#skills_status", Label).update("Draft refined. Review, edit, then Save/Update.")
-                self.notify("Skill draft refined")
-            except Exception as e:
-                self.query_one("#skills_status", Label).update(f"Refine failed: {e}")
-                self.notify(f"Refine failed: {e}", severity="error")
+            if auth.remove_key(provider):
+                log.mount(SystemMessage(f"🗑 Removed API key for {provider}."))
+            else:
+                log.mount(SystemMessage(f"No stored key for {provider}."))
             return
-
-        if bid == "skills_delete_btn":
-            if not skill_path.exists():
-                self.notify(f"Skill not found: {slug}", severity="warning")
-                return
-            skill_path.unlink()
-            self.query_one("#skills_status", Label).update(f"Deleted: {skill_path.name}")
-            self.notify(f"Deleted skill: {slug}")
-            self._load_skills()
-            return
-
-        content = self.query_one("#skills_content_input", Input).value.strip()
-        if not content:
-            self.notify("Enter skill content first", severity="warning")
-            return
-        if not content.startswith("# "):
-            content = f"# {title}\n\n{content}"
-        with open(skill_path, "w", encoding="utf-8") as f:
-            f.write(content.strip() + "\n")
-        self.query_one("#skills_status", Label).update(f"Saved: {skill_path.name}")
-        self.notify(f"Saved skill: {slug}")
-        self._load_skills()
-
-    async def on_input_submitted(self, event: Input.Submitted) -> None:
-        if event.input.id == "skills_search_input":
-            self._load_skills(query=event.value.strip().lower())
-
-
-# ─── Knowledge Base pane ──────────────────────────────────────────────────────
-class KBEntryRow(Static):
-    """Clickable KB row that loads entry content into editor fields."""
-
-    def __init__(self, kb_path: Path, label: str, **kwargs) -> None:
-        super().__init__(label, classes="kb_entry", **kwargs)
-        self.kb_path = kb_path
-
-    def on_click(self) -> None:
-        try:
-            pane = self.app.screen.query_one(KBPane)
-            pane._load_kb_file(self.kb_path)
-        except Exception:
-            pass
-
-class KBPane(Container):
-    """Browse and search the knowledge base (reference docs that aren't skills)."""
-
-    CSS = """
-    #kb_container {
-        height: 1fr;
-        border: blank;
-        padding: 1;
-        background: $surface;
-    }
-    #kb_header {
-        color: $text-muted;
-        text-style: bold;
-        margin-bottom: 1;
-        padding: 0 1;
-    }
-    #kb_list {
-        height: 1fr;
-        scrollbar-size: 1 1;
-        padding: 0 1;
-    }
-    #kb_search {
-        height: auto;
-        padding: 0 1 1 1;
-    }
-    #kb_search_input {
-        border: blank;
-        background: $background;
-    }
-    #kb_search_input:focus {
-        border-bottom: solid $primary;
-    }
-    #kb_add_row {
-        height: auto;
-        padding: 1 1 0 1;
-        background: $panel;
-    }
-    #kb_add_title {
-        height: 3;
-        margin-right: 1;
-        border: blank;
-        background: $background;
-    }
-    #kb_add_title:focus {
-        border-bottom: solid $primary;
-    }
-    #kb_add_btn {
-        margin-right: 1;
-    }
-    #kb_delete_btn {
-        margin-right: 1;
-    }
-    #kb_add_area {
-        height: 5;
-        margin-top: 1;
-        border: blank;
-        background: $background;
-    }
-    #kb_add_area:focus {
-        border-bottom: solid $primary;
-    }
-    #kb_mode_select {
-        margin-top: 1;
-        padding: 0 1;
-    }
-    #kb_memory_search_row {
-        height: auto;
-        margin-top: 1;
-        padding: 0 1;
-    }
-    #kb_memory_search_input {
-        border: blank;
-        background: $background;
-    }
-    #kb_memory_search_input:focus {
-        border-bottom: solid $primary;
-    }
-    #kb_memory_results {
-        height: 8;
-        scrollbar-size: 1 1;
-        border: blank;
-        background: $panel;
-        padding: 0 1;
-        margin-top: 1;
-    }
-    #kb_status {
-        color: $text-muted;
-        margin-top: 1;
-        padding: 0 1;
-    }
-    .kb_entry {
-        padding: 0 1;
-        margin: 0 0 1 0;
-    }
-    """
-
-    def __init__(self, state: AppState, **kwargs) -> None:
-        super().__init__(**kwargs)
-        self.state = state
-
-    def compose(self) -> ComposeResult:
-        with Vertical(id="kb_container"):
-            yield Label("Knowledge Base", id="kb_header")
-            with Horizontal(id="kb_search"):
-                yield Input(placeholder="Search knowledge base…", id="kb_search_input")
-            yield VerticalScroll(id="kb_list")
-            with Horizontal(id="kb_add_row"):
-                yield Input(placeholder="Title for new entry…", id="kb_add_title")
-                yield Button("Use Last Reply", id="kb_use_last_reply_btn", classes="settings_btn")
-                yield Button("Save/Update", id="kb_add_btn", classes="settings_btn")
-                yield Button("Delete", id="kb_delete_btn", classes="settings_btn")
-                yield Button("Clear", id="kb_clear_btn", classes="settings_btn")
-            yield Input(placeholder="Content or paste text…", id="kb_add_area")
-            yield Select(
-                [("Save + index to memory", "index"), ("Save only (no indexing)", "save")],
-                value="index",
-                id="kb_mode_select",
-            )
-            with Horizontal(id="kb_memory_search_row"):
-                yield Input(placeholder="Search indexed memory from this tab…", id="kb_memory_search_input")
-            yield VerticalScroll(id="kb_memory_results")
-            yield Label("KB indexing mode controls whether entries are annexed into memory.", id="kb_status")
-
-    def on_mount(self) -> None:
-        self._load_kb()
-
-    def _load_kb(self, query: str = "") -> None:
-        kb_dir = Path(KB_DIR)
-        kl = self.query_one("#kb_list", VerticalScroll)
-        for child in list(kl.children):
-            child.remove()
-
-        if not kb_dir.exists():
-            kl.mount(Static("[dim]No knowledge base entries yet. Use the form below to add one.[/]", classes="kb_entry"))
-            return
-
-        md_files = sorted(kb_dir.glob("*.md"))
-        if query:
-            md_files = [f for f in md_files if query in f.stem.lower() or query in f.read_text(errors="replace").lower()]
-
-        if not md_files:
-            kl.mount(Static(f"[dim]No entries matching '{query}'.[/]", classes="kb_entry"))
-            return
-
-        for f in md_files:
-            name = f.stem.replace("_", " ").title()
-            sz = f.stat().st_size
-            mtime = datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
-            entry_type = "note"
-            first_line = f.read_text(errors="replace").split("\n", 1)[0].lower()
-            if first_line.startswith("http"):
-                entry_type = "url"
-            elif first_line.startswith("#"):
-                entry_type = "doc"
-            icon = {"doc": "📄", "url": "🔗", "snippet": "✂️", "note": "📝"}.get(entry_type, "📄")
-            kl.mount(KBEntryRow(f, f"{icon} [bold]{name}[/]  [dim]{sz}B · {mtime}[/]"))
-
-    def _load_kb_file(self, kb_path: Path) -> None:
-        try:
-            raw = kb_path.read_text(encoding="utf-8", errors="replace")
-        except Exception as e:
-            self.notify(f"Could not read KB entry: {e}", severity="error")
-            return
-        title = kb_path.stem.replace("_", " ")
-        body = raw
-        if raw.startswith("# "):
-            lines = raw.splitlines()
-            title = lines[0][2:].strip() or title
-            body = "\n".join(lines[2:]).strip()
-        self.query_one("#kb_add_title", Input).value = title
-        self.query_one("#kb_add_area", Input).value = body.replace("\n", " ")[:8000]
-        self.query_one("#kb_status", Label).update(f"Selected: {kb_path.name}")
-
-    async def on_input_submitted(self, event: Input.Submitted) -> None:
-        if event.input.id == "kb_search_input":
-            self._load_kb(query=event.value.strip().lower())
-        elif event.input.id == "kb_memory_search_input":
-            await self._run_memory_search(event.value.strip())
-
-    async def on_button_pressed(self, event: Button.Pressed) -> None:
-        bid = event.button.id
-        if bid not in {"kb_add_btn", "kb_delete_btn", "kb_use_last_reply_btn", "kb_clear_btn"}:
-            return
-        if bid == "kb_clear_btn":
-            self.query_one("#kb_add_title", Input).value = ""
-            self.query_one("#kb_add_area", Input).value = ""
-            self.query_one("#kb_status", Label).update("Draft cleared.")
-            return
-        if bid == "kb_use_last_reply_btn":
-            content = (self.state.last_agent_response or "").strip()
-            if not content:
-                self.notify("No recent reply yet. Ask something in Chat first.", severity="warning")
-                return
-            self.query_one("#kb_add_area", Input).value = content.replace("\n", " ")[:8000]
-            self.query_one("#kb_status", Label).update("Loaded last assistant reply into KB draft.")
-            return
-        title_input = self.query_one("#kb_add_title", Input)
-        content_input = self.query_one("#kb_add_area", Input)
-        title = title_input.value.strip()
-        if not title:
-            self.notify("Enter a title for the KB entry", severity="warning")
-            return
-
-        kb_dir = Path(KB_DIR)
-        kb_dir.mkdir(parents=True, exist_ok=True)
-        safe_name = _slugify_name(title)
-        if not safe_name:
-            self.notify("Invalid KB title", severity="warning")
-            return
-        file_path = kb_dir / f"{safe_name}.md"
-
-        if bid == "kb_delete_btn":
-            if not file_path.exists():
-                self.notify(f"KB entry not found: {safe_name}", severity="warning")
-                return
-            file_path.unlink()
-            self.query_one("#kb_status", Label).update(f"Deleted: {file_path.name}")
-            self.notify(f"Deleted KB entry: {title}")
-            self._load_kb()
-            return
-
-        content = content_input.value.strip()
-        if not content:
-            self.notify("Enter content for the KB entry", severity="warning")
-            return
-        with open(file_path, "w", encoding="utf-8") as f:
-            f.write(f"# {title}\n\n{content}\n")
-
-        mode = self.query_one("#kb_mode_select", Select).value
-        indexed = False
-        if mode == "index" and self.state.agent:
-            from memory.db import MemoryChunk
-            try:
-                embedding = await self.state.agent.get_embedding(content)
-                self.state.agent.memory.add_memory(MemoryChunk(
-                    content=content,
-                    embedding=embedding,
-                    metadata={"file": str(file_path), "type": "KB"},
-                    mem_type="DOC",
-                ))
-                indexed = True
-            except Exception:
-                indexed = False
-
-        title_input.value = ""
-        content_input.value = ""
-        annexed = "indexed to memory" if indexed else ("saved only" if mode == "save" else "saved (index failed)")
-        self.query_one("#kb_status", Label).update(f"Saved: {file_path.name} · {annexed}")
-        self.notify(f"Saved KB entry: {title} ({annexed})")
-        self._load_kb()
-
-    async def _run_memory_search(self, query: str) -> None:
-        results = self.query_one("#kb_memory_results", VerticalScroll)
-        for child in list(results.children):
-            child.remove()
-        if not query:
-            results.mount(Static("[dim]Type a query and press Enter to search indexed memory.[/]", classes="kb_entry"))
-            return
-        if not self.state.agent:
-            results.mount(Static("[red]No agent available[/]", classes="kb_entry"))
-            return
-        try:
-            chunks = await self.state.agent.retriever.retrieve(query, top_k=6)
-            if not chunks:
-                results.mount(Static("[dim]No indexed memory results.[/]", classes="kb_entry"))
-                return
-            for i, chunk in enumerate(chunks):
-                content = (chunk.get("content", "") or "").replace("[", "\\[").replace("]", "\\]")
-                score = chunk.get("score", 0)
-                results.mount(Static(f"[bold]#{i+1}[/] [dim]score={score:.3f}[/]\n{content[:240]}", classes="kb_entry"))
-        except Exception as e:
-            results.mount(Static(f"[red]Memory search failed: {e}[/]", classes="kb_entry"))
-
-
-# ─── Memory pane ──────────────────────────────────────────────────────────────
-
-class MemoryPane(Container):
-    """Search the hybrid memory store (semantic + keyword)."""
-
-    CSS = """
-    #memory_container {
-        height: 1fr;
-        border: blank;
-        padding: 1;
-        background: $surface;
-    }
-    #memory_results {
-        height: 1fr;
-        scrollbar-size: 1 1;
-        padding: 0 1;
-    }
-    #memory_search_row {
-        height: auto;
-        padding: 0 1 1 1;
-    }
-    #memory_search_input {
-        border: blank;
-        background: $background;
-    }
-    #memory_search_input:focus {
-        border-bottom: solid $primary;
-    }
-    #memory_header {
-        color: $text-muted;
-        text-style: bold;
-        margin-bottom: 1;
-        padding: 0 1;
-    }
-    .memory_entry {
-        padding: 0 1;
-        margin: 0 0 1 0;
-        border-top: blank;
-    }
-    """
-
-    def __init__(self, state: AppState, **kwargs) -> None:
-        super().__init__(**kwargs)
-        self.state = state
-
-    def compose(self) -> ComposeResult:
-        with Vertical(id="memory_container"):
-            yield Label("Memory Search", id="memory_header")
-            with Horizontal(id="memory_search_row"):
-                yield Input(placeholder="Search memories… (Enter to search)", id="memory_search_input")
-            yield VerticalScroll(id="memory_results")
-
-    def on_mount(self) -> None:
-        pass
-
-    async def on_input_submitted(self, event: Input.Submitted) -> None:
-        query = event.value.strip()
-        if not query:
-            return
-
-        rp = self.query_one("#memory_results", VerticalScroll)
-        for child in list(rp.children):
-            child.remove()
-        rp.mount(Static("[dim]Searching…[/]", classes="memory_entry"))
-
-        if not self.state.agent:
-            for child in list(rp.children):
-                child.remove()
-            rp.mount(Static("[red]No agent available[/]", classes="memory_entry"))
-            return
-
-        try:
-            chunks = await self.state.agent.retriever.retrieve(query, top_k=10)
-            for child in list(rp.children):
-                child.remove()
-            if not chunks:
-                rp.mount(Static("[dim]No memories found.[/]", classes="memory_entry"))
-                return
-            for i, chunk in enumerate(chunks):
-                content = chunk.get("content", "")[:300]
-                score = chunk.get("score", 0)
-                mtype = chunk.get("type", "?")
-                rp.mount(Static(f"[bold]#{i+1}[/] [dim]{mtype} · score={score:.3f}[/]\n{content}", classes="memory_entry"))
-        except Exception as e:
-            for child in list(rp.children):
-                child.remove()
-            rp.mount(Static(f"[red]Error: {e}[/]", classes="memory_entry"))
-
-
-# ─── Settings pane ────────────────────────────────────────────────────────────
-
-class SettingsPane(Container):
-    """Provider/model selector (dropdown), theme selector, Caveman toggle, etc."""
-
-    CSS = """
-    #settings_container {
-        height: 1fr;
-        border: blank;
-        padding: 1 2;
-        background: $background;
-        scrollbar-size: 1 1;
-    }
-    .settings_card {
-        height: auto;
-        padding: 1 2;
-        margin-top: 1;
-        background: $surface;
-        border: round $surface;
-    }
-    .settings_label {
-        text-style: bold;
-        color: $text;
-        margin-bottom: 0;
-    }
-    .settings_row {
-        margin-top: 0;
-        height: auto;
-        color: $text-muted;
-    }
-    .settings_btn {
-        margin-top: 0;
-        margin-right: 1;
-        background: transparent;
-        border: blank;
-        color: $text-muted;
-    }
-    .settings_btn:hover {
-        background: $panel;
-        color: $text;
-    }
-    .settings_btn:focus {
-        border-bottom: solid $primary;
-        color: $text;
-    }
-    #provider_select, #theme_select, #ui_mode_select {
-        margin-top: 0;
-        margin-bottom: 0;
-    }
-    #settings_provider, #settings_caveman, #settings_synthesis, #settings_activity_rail, #settings_workers {
-        color: $text-muted;
-    }
-    """
-
-    def __init__(self, state: AppState, **kwargs) -> None:
-        super().__init__(**kwargs)
-        self.state = state
-
-    def compose(self) -> ComposeResult:
-        with VerticalScroll(id="settings_container"):
-            with Container(classes="settings_card"):
-                yield Label("Provider / Model", classes="settings_label")
-                yield Label("Switch the active model at runtime", classes="settings_row")
-                options = AppState.build_provider_options()
-                valid_values = {v for _, v in options}
-                default_val = self.state.current_provider_id if self.state.current_provider_id in valid_values else (options[0][1] if options else Select.BLANK)
-                yield Select(options, value=default_val, id="provider_select")
-                active_label = default_val
-                for label, val in options:
-                    if val == default_val:
-                        active_label = label
-                        break
-                yield Label(f"Active: {active_label}", id="settings_provider")
-
-            with Container(classes="settings_card"):
-                yield Label("Theme", classes="settings_label")
-                yield Label("Select the visual theme", classes="settings_row")
-                theme_options = [(ThemeRegistry.get_theme(tid).name, tid) for tid in ThemeRegistry.theme_ids()]
-                yield Select(theme_options, value=self.state.current_theme, id="theme_select")
-                yield Button("Cycle theme", id="btn_toggle_theme", classes="settings_btn")
-
-            with Container(classes="settings_card"):
-                yield Label("Interface Style", classes="settings_label")
-                yield Label("Toggle experimental visual mode", classes="settings_row")
-                yield Select(
-                    [("Conservative", "conservative"), ("Experimental", "experimental")],
-                    value=self.state.ui_mode,
-                    id="ui_mode_select",
-                )
-
-            with Container(classes="settings_card"):
-                yield Label("Options", classes="settings_label")
-                yield Label("Workspace toggles and status", classes="settings_row")
-                rail_state = "ON" if self.state.show_activity_rail else "OFF"
-                yield Label(f"Activity rail: {rail_state} (Ctrl+B)", id="settings_activity_rail")
-                yield Button("Toggle rail", id="btn_toggle_activity_rail", classes="settings_btn")
-                cstatus = "ON" if self.state.caveman_enabled else "OFF"
-                yield Label(f"Caveman: {cstatus}", id="settings_caveman")
-                yield Button("Toggle caveman", id="btn_toggle_caveman", classes="settings_btn")
-                syn_status = "ON" if self.state.auto_synthesis_enabled else "OFF"
-                yield Label(f"Auto skill synthesis: {syn_status}", id="settings_synthesis")
-                yield Button("Toggle synthesis", id="btn_toggle_synthesis", classes="settings_btn")
-
-            with Container(classes="settings_card"):
-                yield Label("Workspace", classes="settings_label")
-                yield Label(f"{WORKSPACE}", classes="settings_row")
-                yield Button("Open dashboard ↗", id="btn_dashboard", classes="settings_btn")
-                w = f"Max workers: {os.cpu_count() * 2} (CPU-aware)" if self.state.task_manager else "Task manager not initialized"
-                yield Label(w, id="settings_workers")
-
-    async def on_select_changed(self, event: Select.Changed) -> None:
-        """Handle dropdown changes for provider and theme selectors."""
-        if event.select.id == "provider_select":
-            new_provider_id = event.value
-            if new_provider_id == Select.BLANK:
-                return
-            if not self.state.config_manager.has_api_key(new_provider_id):
-                self.notify("🔒 No API key configured for this provider", severity="warning")
-                valid_values = {v for _, v in AppState.build_provider_options()}
-                current = self.state.current_provider_id if self.state.current_provider_id in valid_values else (list(valid_values)[0] if valid_values else "")
-                self.query_one("#provider_select", Select).value = current
+        if action == "login":
+            provider = parts[2].strip() if len(parts) > 2 else ""
+            if not provider:
+                log.mount(SystemMessage("Usage: /auth login <provider>"))
                 return
             try:
-                self.state.reconnect(new_provider_id)
-                new_label = new_provider_id
-                for label, val in AppState.build_provider_options():
-                    if val == new_provider_id:
-                        new_label = label
-                        break
-                self.query_one("#settings_provider", Label).update(f"  Active: {new_label}")
-                self.notify(f"Switched to {new_label}")
-                try:
-                    chat_pane = self.app.screen.query_one(ChatPane)
-                    log = chat_pane.query_one("#chat_log", VerticalScroll)
-                    log.mount(SystemMessage(f"⚡ Switched to {new_label}"))
-                    log.scroll_end(animate=False)
-                except Exception:
-                    pass
-            except Exception as e:
-                self.notify(f"Failed to switch: {e}", severity="error")
-
-        elif event.select.id == "theme_select":
-            new_theme = event.value
-            if new_theme == Select.BLANK:
+                self.state.config_manager.get_provider_config(provider)
+            except ValueError:
+                log.mount(SystemMessage(f"Unknown provider: {provider}"))
                 return
-            self.state.current_theme = new_theme
-            self.app.theme = new_theme
-            self.notify(f"Theme → {ThemeRegistry.get_theme(new_theme).name}")
-        elif event.select.id == "ui_mode_select":
-            mode = event.value
-            if mode == Select.BLANK:
-                return
-            self.state.ui_mode = mode
-            self.app.set_class(mode == "experimental", "experimental-ui")
-            self.notify(f"UI mode → {mode}")
+            self.app.push_screen(AuthInputScreen(provider, self.state))
+            return
+        log.mount(SystemMessage("Usage: /auth list | /auth login <provider> | /auth logout <provider>"))
 
-    async def on_button_pressed(self, event: Button.Pressed) -> None:
-        bid = event.button.id
-
-        if bid == "btn_toggle_theme":
-            themes = ThemeRegistry.theme_ids()
-            idx = themes.index(self.state.current_theme)
-            self.state.current_theme = themes[(idx + 1) % len(themes)]
-            self.app.theme = self.state.current_theme
-            self.query_one("#theme_select", Select).value = self.state.current_theme
-            self.notify(f"Theme → {ThemeRegistry.get_theme(self.state.current_theme).name}")
-
-        elif bid == "btn_toggle_caveman":
-            self.state.caveman_enabled = not self.state.caveman_enabled
-            if self.state.agent:
-                self.state.agent.caveman.enabled = self.state.caveman_enabled
-            s = "ON" if self.state.caveman_enabled else "OFF"
-            self.query_one("#settings_caveman", Label).update(f"  Status: {s}")
-            self.notify(f"Caveman: {s}")
-
-        elif bid == "btn_toggle_synthesis":
-            self.state.auto_synthesis_enabled = not self.state.auto_synthesis_enabled
-            if self.state.agent:
-                self.state.agent.auto_skill_synthesis = self.state.auto_synthesis_enabled
-            s = "ON" if self.state.auto_synthesis_enabled else "OFF"
-            self.query_one("#settings_synthesis", Label).update(
-                f"  Status: {s} (crystallize skills from each reply)"
-            )
-            self.notify(f"Auto Skill Synthesis: {s}")
-
-        elif bid == "btn_dashboard":
-            webbrowser.open(f"{DASHBOARD_URL}?key={DASHBOARD_ADMIN_KEY}")
-            self.notify("Opening dashboard in browser…")
-        elif bid == "btn_toggle_activity_rail":
-            try:
-                if isinstance(self.app.screen, MainScreen):
-                    self.app.screen.action_toggle_context_panel()
-                rail_state = "ON" if self.state.show_activity_rail else "OFF"
-                self.query_one("#settings_activity_rail", Label).update(f"  Status: {rail_state} (Ctrl+B)")
-            except Exception:
-                pass
 
 
 # ─── The App ──────────────────────────────────────────────────────────────────
