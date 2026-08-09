@@ -9,6 +9,7 @@ import inspect
 import hashlib
 import logging
 import os
+from typing import Optional
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -41,7 +42,7 @@ class MotionAgent:
         norm = sum(v * v for v in vec) ** 0.5 or 1.0
         return [v / norm for v in vec]
 
-    async def run(self, prompt: str, target: str = "user", on_stream_chunk=None, on_trace_event=None):
+    async def run(self, prompt: str, target: str = "user", on_stream_chunk=None, on_trace_event=None, history: Optional[list] = None, context_query: Optional[str] = None):
         async def emit_trace(stage: str, message: str, **extra):
             if not on_trace_event:
                 return
@@ -58,6 +59,18 @@ class MotionAgent:
         # 1. Memory Recall
         await emit_trace("memory_recall_start", "Running retriever.retrieve")
         context_chunks = await self.retriever.retrieve(prompt)
+        # Augment recall with the session context query so we don't repeat ourselves.
+        if context_query:
+            context_chunks += await self.retriever.retrieve(context_query)
+            # De-duplicate by content, keep order.
+            seen = set()
+            deduped = []
+            for c in context_chunks:
+                key = c["content"]
+                if key not in seen:
+                    seen.add(key)
+                    deduped.append(c)
+            context_chunks = deduped[:5]
         await emit_trace("memory_recall_done", "Memory recall complete", chunks=len(context_chunks))
         context_text = "\n".join([c["content"] for c in context_chunks])
 
@@ -75,7 +88,7 @@ class MotionAgent:
         )
         if on_stream_chunk:
             raw_chunks = []
-            async for chunk in self.provider.stream_complete(prompt, system_prompt=system_prompt):
+            async for chunk in self.provider.stream_complete(prompt, system_prompt=system_prompt, history=history):
                 stream_chunk_count += 1
                 raw_chunks.append(chunk)
                 await emit_trace("stream_chunk", "Received stream chunk", chunk_index=stream_chunk_count, chars=len(chunk or ""))
@@ -88,7 +101,7 @@ class MotionAgent:
             raw_response = "".join(raw_chunks)
             await emit_trace("model_done", "Streaming completion finished", stream_chunks=stream_chunk_count, chars=len(raw_response))
         else:
-            raw_response = await self.provider.complete(prompt, system_prompt=system_prompt)
+            raw_response = await self.provider.complete(prompt, system_prompt=system_prompt, history=history)
             await emit_trace("model_done", "One-shot completion finished", chars=len(raw_response or ""))
 
         # 4. Caveman Compression
@@ -115,9 +128,6 @@ class MotionAgent:
             except Exception as e:
                 logger.debug(f"Skill synthesis skipped: {e}")
                 await emit_trace("skill_synthesis_error", f"Skill synthesis error: {e}")
-        else:
-            await emit_trace("skill_synthesis_done", "Skill synthesis disabled (manual mode)")
-
         return final_response
 
 def load_agent_from_config(config_path: str = "", provider_id: str | None = None) -> MotionAgent:
@@ -250,6 +260,11 @@ if __name__ == "__main__":
         config = ConfigManager()
         provider_id = args.provider or config.get_default_provider()
         provider_cfg = config.get_provider_config(provider_id)
+        # Normalize to full provider/model id so the TUI dropdown matches.
+        if "/" not in provider_id:
+            model = provider_cfg.get("options", {}).get("model")
+            if model:
+                provider_id = f"{provider_id}/{model}"
         model_config = ModelConfig(
             name=provider_cfg.get("name", provider_id),
             endpoint=provider_cfg["endpoint"],

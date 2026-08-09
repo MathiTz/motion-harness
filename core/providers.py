@@ -26,13 +26,17 @@ class BaseProvider(ABC):
         self._client = httpx.AsyncClient(timeout=120.0)
 
     @abstractmethod
-    async def complete(self, prompt: str, system_prompt: str = "", **kwargs) -> str:
-        """Generate a completion from the model."""
+    async def complete(self, prompt: str, system_prompt: str = "", history: Optional[List[Dict[str, str]]] = None, **kwargs) -> str:
+        """Generate a completion from the model.
+
+        ``history`` is an optional list of prior turns as
+        ``[{"role": "user"|"assistant", "content": "..."}, ...]``.
+        """
         pass
 
-    async def stream_complete(self, prompt: str, system_prompt: str = "", **kwargs) -> AsyncIterator[str]:
+    async def stream_complete(self, prompt: str, system_prompt: str = "", history: Optional[List[Dict[str, str]]] = None, **kwargs) -> AsyncIterator[str]:
         """Optional streaming completion. Defaults to one-shot completion."""
-        result = await self.complete(prompt, system_prompt=system_prompt, **kwargs)
+        result = await self.complete(prompt, system_prompt=system_prompt, history=history, **kwargs)
         if result:
             yield result
 
@@ -43,7 +47,7 @@ class BaseProvider(ABC):
 class LocalProvider(BaseProvider):
     """Provider for local LLMs via Ollama-compatible /api/chat endpoint."""
 
-    async def complete(self, prompt: str, system_prompt: str = "", **kwargs) -> str:
+    async def complete(self, prompt: str, system_prompt: str = "", history: Optional[List[Dict[str, str]]] = None, **kwargs) -> str:
         url = f"{self.config.endpoint.rstrip('/')}/api/chat"
         model = self.config.options.get("model", self.config.name.lower())
         payload = {
@@ -54,6 +58,8 @@ class LocalProvider(BaseProvider):
         }
         if system_prompt:
             payload["messages"].append({"role": "system", "content": system_prompt})
+        if history:
+            payload["messages"].extend(history)
         payload["messages"].append({"role": "user", "content": prompt})
 
         if "temperature" in self.config.options:
@@ -66,7 +72,7 @@ class LocalProvider(BaseProvider):
         data = resp.json()
         return data.get("message", {}).get("content", "")
 
-    async def stream_complete(self, prompt: str, system_prompt: str = "", **kwargs) -> AsyncIterator[str]:
+    async def stream_complete(self, prompt: str, system_prompt: str = "", history: Optional[List[Dict[str, str]]] = None, **kwargs) -> AsyncIterator[str]:
         url = f"{self.config.endpoint.rstrip('/')}/api/chat"
         model = self.config.options.get("model", self.config.name.lower())
         payload = {
@@ -77,6 +83,8 @@ class LocalProvider(BaseProvider):
         }
         if system_prompt:
             payload["messages"].append({"role": "system", "content": system_prompt})
+        if history:
+            payload["messages"].extend(history)
         payload["messages"].append({"role": "user", "content": prompt})
 
         if "temperature" in self.config.options:
@@ -105,27 +113,47 @@ class LocalProvider(BaseProvider):
         resp.raise_for_status()
         return resp.json().get("embedding", [])
 
+    async def list_models(self) -> List[str]:
+        """Discover installed models via Ollama /api/tags.
+
+        Returns a list of model names (e.g. ``llama3:latest``). Falls back to
+        the configured model if the endpoint is unreachable or not Ollama.
+        """
+        url = f"{self.config.endpoint.rstrip('/')}/api/tags"
+        try:
+            resp = await self._client.get(url)
+            resp.raise_for_status()
+            data = resp.json()
+            models = [m.get("name", "") for m in data.get("models", [])]
+            models = [m for m in models if m]
+            if models:
+                return models
+        except Exception:
+            pass
+        configured = self.config.options.get("model")
+        return [configured] if configured else []
+
 
 class CloudProvider(BaseProvider):
     """Provider for cloud LLMs (Anthropic, OpenAI) using their native chat APIs."""
 
-    async def complete(self, prompt: str, system_prompt: str = "", **kwargs) -> str:
+    async def complete(self, prompt: str, system_prompt: str = "", history: Optional[List[Dict[str, str]]] = None, **kwargs) -> str:
         endpoint = self.config.endpoint
         api_key = self.config.api_key or os.environ.get("OLLAMA_API_KEY") or os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
 
         if "anthropic" in endpoint:
-            return await self._anthropic_complete(prompt, system_prompt, api_key)
+            return await self._anthropic_complete(prompt, system_prompt, api_key, history)
         elif "openai" in endpoint:
-            return await self._openai_complete(prompt, system_prompt, api_key)
+            return await self._openai_complete(prompt, system_prompt, api_key, history)
         else:
-            return await self._openai_complete(prompt, system_prompt, api_key)
+            return await self._openai_complete(prompt, system_prompt, api_key, history)
 
-    async def stream_complete(self, prompt: str, system_prompt: str = "", **kwargs) -> AsyncIterator[str]:
+    async def stream_complete(self, prompt: str, system_prompt: str = "", history: Optional[List[Dict[str, str]]] = None, **kwargs) -> AsyncIterator[str]:
         endpoint = self.config.endpoint
         api_key = self.config.api_key or os.environ.get("OLLAMA_API_KEY") or os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
 
         if "anthropic" in endpoint:
-            async for chunk in super().stream_complete(prompt, system_prompt=system_prompt, **kwargs):
+            async for chunk in super().stream_complete(prompt, system_prompt=system_prompt, history=history, **kwargs):
                 yield chunk
             return
 
@@ -140,6 +168,8 @@ class CloudProvider(BaseProvider):
         messages = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
+        if history:
+            messages.extend(history)
         messages.append({"role": "user", "content": prompt})
         payload = {
             "model": model,
@@ -166,7 +196,7 @@ class CloudProvider(BaseProvider):
                 if chunk:
                     yield chunk
 
-    async def _anthropic_complete(self, prompt: str, system_prompt: str, api_key: str) -> str:
+    async def _anthropic_complete(self, prompt: str, system_prompt: str, api_key: str, history: Optional[List[Dict[str, str]]] = None) -> str:
         url = "https://api.anthropic.com/v1/messages"
         model = self.config.options.get("model", "claude-3-5-sonnet-20241022")
         max_tokens = self.config.options.get("max_tokens", 4096)
@@ -176,11 +206,13 @@ class CloudProvider(BaseProvider):
             "anthropic-version": "2023-06-01",
             "content-type": "application/json",
         }
+        messages = list(history) if history else []
+        messages.append({"role": "user", "content": prompt})
         payload = {
             "model": model,
             "max_tokens": max_tokens,
             "temperature": temperature,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": messages,
         }
         if system_prompt:
             payload["system"] = system_prompt
@@ -190,7 +222,7 @@ class CloudProvider(BaseProvider):
         data = resp.json()
         return data.get("content", [{}])[0].get("text", "")
 
-    async def _openai_complete(self, prompt: str, system_prompt: str, api_key: str) -> str:
+    async def _openai_complete(self, prompt: str, system_prompt: str, api_key: str, history: Optional[List[Dict[str, str]]] = None) -> str:
         url = f"{self.config.endpoint.rstrip('/')}/chat/completions"
         model = self.config.options.get("model", "gpt-4o")
         max_tokens = self.config.options.get("max_tokens", 4096)
@@ -202,6 +234,8 @@ class CloudProvider(BaseProvider):
         messages = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
+        if history:
+            messages.extend(history)
         messages.append({"role": "user", "content": prompt})
         payload = {
             "model": model,
@@ -218,7 +252,7 @@ class CloudProvider(BaseProvider):
 class ProxyProvider(BaseProvider):
     """Provider for custom proxy/gateway endpoints (OpenAI-compatible)."""
 
-    async def complete(self, prompt: str, system_prompt: str = "", **kwargs) -> str:
+    async def complete(self, prompt: str, system_prompt: str = "", history: Optional[List[Dict[str, str]]] = None, **kwargs) -> str:
         url = f"{self.config.endpoint.rstrip('/')}/chat/completions"
         api_key = self.config.api_key or os.environ.get("PROXY_API_KEY", "")
         headers = {
@@ -228,6 +262,8 @@ class ProxyProvider(BaseProvider):
         messages = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
+        if history:
+            messages.extend(history)
         messages.append({"role": "user", "content": prompt})
         payload = {
             "model": self.config.options.get("model", "default"),
@@ -239,7 +275,7 @@ class ProxyProvider(BaseProvider):
         data = resp.json()
         return data.get("choices", [{}])[0].get("message", {}).get("content", "")
 
-    async def stream_complete(self, prompt: str, system_prompt: str = "", **kwargs) -> AsyncIterator[str]:
+    async def stream_complete(self, prompt: str, system_prompt: str = "", history: Optional[List[Dict[str, str]]] = None, **kwargs) -> AsyncIterator[str]:
         url = f"{self.config.endpoint.rstrip('/')}/chat/completions"
         api_key = self.config.api_key or os.environ.get("PROXY_API_KEY", "")
         headers = {
@@ -249,6 +285,8 @@ class ProxyProvider(BaseProvider):
         messages = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
+        if history:
+            messages.extend(history)
         messages.append({"role": "user", "content": prompt})
         payload = {
             "model": self.config.options.get("model", "default"),

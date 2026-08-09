@@ -227,6 +227,17 @@ class TaskManager:
             finally:
                 task.end_time = datetime.now()
                 self.active_count -= 1
+                # Clean up the per-task memory DB file (created above).
+                try:
+                    agent.memory.close()
+                except Exception:
+                    pass
+                try:
+                    db_path = f"memory_{request.task_id}.db"
+                    if os.path.exists(db_path):
+                        os.remove(db_path)
+                except Exception:
+                    pass
                 # Save artifact
                 try:
                     task.artifact_path = self._save_artifact(task)

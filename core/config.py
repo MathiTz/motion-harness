@@ -3,6 +3,8 @@ import os
 from typing import Any, Dict, Optional
 from dataclasses import dataclass
 
+from core.catalog import merge_catalog
+
 @dataclass
 class AppConfig:
     workspace_path: str
@@ -26,7 +28,13 @@ class ConfigManager:
         if not os.path.exists(self.config_path):
             return {}
         with open(self.config_path, 'r') as f:
-            return yaml.safe_load(f) or {}
+            data = yaml.safe_load(f) or {}
+        # Merge the built-in catalog so pre-configured providers/models are
+        # always available, with user config taking precedence.
+        providers = data.get("providers", {})
+        merged_providers = merge_catalog(providers)
+        data["providers"] = merged_providers
+        return data
 
     def _env(self, key: str, default: Any = None) -> Any:
         """Resolve a value from environment variables first, then config."""
