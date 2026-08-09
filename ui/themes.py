@@ -99,6 +99,24 @@ _RAW_THEMES: List[dict] = [
         warning="#ebcb8b",
         dark=True,
     ),
+    # opencode native theme — matches the terminal UI from github.com/anomalyco/opencode
+    dict(
+        id="opencode",
+        name="OpenCode",
+        background="#0a0a0a",
+        surface="#1e1e1e",
+        panel="#141414",
+        foreground="#eeeeee",
+        primary="#fab283",
+        secondary="#5c9cf5",
+        accent="#9d7cd8",
+        border="#484848",
+        highlight="#282828",
+        error="#e06c75",
+        success="#7fd88f",
+        warning="#f5a742",
+        dark=True,
+    ),
 ]
 
 

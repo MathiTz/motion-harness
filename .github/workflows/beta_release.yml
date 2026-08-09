@@ -40,7 +40,7 @@ jobs:
           body: |
             ## 🧪 Beta Release v${{ env.VERSION }}
             Automated release from the beta branch.
-            
+
             ### Changes
             ${{ github.event.head_commit.message }}
           draft: false
