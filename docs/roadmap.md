@@ -20,6 +20,14 @@ operate.
       (`context_query`) to the model on every turn to reduce hallucination
 - [x] Remove "Thinking…" placeholder from the response area
 - [x] Full theme-aware response rendering (code syntax colors follow theme)
+- [x] **Auth store (opencode-style)** — `motion auth login/logout/list` + `/auth`
+      commands; keys stored in `~/.config/motion-harness/auth.json` (0600), never
+      in `config.yml`. Lookup order: auth store → env var → config.yml.
+- [x] **Model dialog (Ctrl+O)** — lists every model individually (all cloud
+      models appear once a key is set) with live search + `Ctrl+R` refresh
+      (scrapes the latest Ollama Cloud model list).
+- [x] Remove dead code — unused Tasks/Skills/KB/Memory/Settings panes and the
+      hardcoded dashboard admin key.
 
 ## Phase 2 — Document & File Ingestion (next)
 

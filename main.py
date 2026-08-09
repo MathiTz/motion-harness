@@ -2,6 +2,7 @@ from core.providers import ModelConfig, ProviderFactory, LocalProvider
 from core.config import ConfigManager
 from core.caveman import CavemanProtocol
 from core.learning import SkillSynthesizer, Trajectory
+from core import auth
 from memory.db import MemoryDB, EMBEDDING_DIM
 from memory.retriever import HybridRetriever
 import asyncio
@@ -237,6 +238,54 @@ async def interactive_chat(provider_id: str | None = None):
         agent.memory.close()
 
 
+def cmd_auth(args) -> None:
+    """Handle `motion auth login|logout|list`."""
+    action = args.auth_action
+    if action == "list":
+        keys = auth.list_keys()
+        if not keys:
+            print("No API keys stored.")
+            return
+        print("Stored API keys:")
+        for provider, key in sorted(keys.items()):
+            masked = f"{key[:4]}…{key[-4:]}" if len(key) > 8 else "…"
+            print(f"  {provider:20s} {masked}")
+        return
+
+    if action == "login":
+        provider = args.auth_provider
+        if not provider:
+            print("Usage: motion auth login <provider>")
+            return
+        cm = ConfigManager()
+        try:
+            cm.get_provider_config(provider)
+        except ValueError as e:
+            print(f"Unknown provider: {provider}")
+            print("Available providers:")
+            for pid, name, models, is_default, has_key in cm.list_providers():
+                print(f"  {pid:20s} {name}")
+            return
+        import getpass
+        key = getpass.getpass(f"API key for {provider}: ").strip()
+        if not key:
+            print("No key entered; aborting.")
+            return
+        auth.set_key(provider, key)
+        print(f"Saved API key for {provider} → {auth.AUTH_FILE}")
+        return
+
+    if action == "logout":
+        provider = args.auth_provider
+        if not provider:
+            print("Usage: motion auth logout <provider>")
+            return
+        if auth.remove_key(provider):
+            print(f"Removed API key for {provider}.")
+        else:
+            print(f"No stored key for {provider}.")
+
+
 if __name__ == "__main__":
     import sys
     import argparse
@@ -246,9 +295,19 @@ if __name__ == "__main__":
     parser.add_argument("--list", action="store_true", help="List available providers")
     parser.add_argument("--provider", type=str, default=None, help="Provider to use (e.g. ollama-cloud, ollama-cloud/gemma4:31b, claude-3-5)")
     parser.add_argument("--chat", action="store_true", help="Launch in chat REPL mode instead of TUI")
+    sub = parser.add_subparsers(dest="command")
+    auth_parser = sub.add_parser("auth", help="Manage provider API keys")
+    auth_sub = auth_parser.add_subparsers(dest="auth_action", required=True)
+    auth_sub.add_parser("list", help="List stored API keys")
+    login_p = auth_sub.add_parser("login", help="Store an API key for a provider")
+    login_p.add_argument("auth_provider", nargs="?", help="Provider id (e.g. ollama-cloud)")
+    logout_p = auth_sub.add_parser("logout", help="Remove a stored API key")
+    logout_p.add_argument("auth_provider", nargs="?", help="Provider id (e.g. ollama-cloud)")
     args = parser.parse_args()
 
-    if args.list:
+    if args.command == "auth":
+        cmd_auth(args)
+    elif args.list:
         list_providers()
     elif args.test:
         asyncio.run(test_compression())

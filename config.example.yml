@@ -48,16 +48,6 @@ providers:
         temperature: 0.7
         max_tokens: 4096
 
-  claude-3-5:
-    name: "Claude 3.5 Sonnet"
-    endpoint: "https://api.anthropic.com"
-    api_key: null  # Set via ANTHROPIC_API_KEY env var
-    provider_type: "cloud"
-    options:
-      model: "claude-3-5-sonnet-20241022"
-      temperature: 0.7
-      max_tokens: 4096
-
   local-llama:
     name: "Llama 3 (Local)"
     endpoint: "http://localhost:11434"
@@ -67,16 +57,6 @@ providers:
       model: "llama3"
       temperature: 0.6
       embed_model: "nomic-embed-text"
-
-  gpt-4o:
-    name: "GPT-4o"
-    endpoint: "https://api.openai.com/v1"
-    api_key: null  # Set via OPENAI_API_KEY env var
-    provider_type: "cloud"
-    options:
-      model: "gpt-4o"
-      temperature: 0.8
-      max_tokens: 4096
 
 # Embedding configuration
 # Local providers use Ollama /api/embeddings; cloud-only setups

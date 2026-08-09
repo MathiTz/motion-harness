@@ -59,11 +59,16 @@ source ~/.bashrc                    # if you use bash
 ```bash
 cp config.example.yml config.yml
 ```
-Then open `config.yml` and set your API key. The easiest way is to create a `.env` file:
+Then add your API key with the `auth` command (opencode-style):
 ```bash
-echo "OLLAMA_API_KEY=your-key-here" > .env
+motion auth login ollama-cloud   # prompts for your key, stored locally
+motion auth login openai
+motion auth login claude
+motion auth list                 # see which providers have keys
+motion auth logout ollama-cloud # remove a key
 ```
-> **No need to add models one by one.** The harness ships with a built-in catalog of Anthropic, OpenAI, and Ollama Cloud models. Just add the API key and they're all available.
+Keys are stored in `~/.config/motion-harness/auth.json` (0600 perms) — never in `config.yml`. You can also use env vars (`OLLAMA_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`). Lookup order: **auth store → env var → config.yml**.
+> **No need to add models one by one.** The harness ships with a built-in catalog of Anthropic, OpenAI, and Ollama Cloud models. Just add the API key and they're all available — press `Ctrl+O` to browse/search them.
 
 **5. Launch:**
 ```bash
@@ -121,7 +126,8 @@ A high-performance terminal interface built with `Textual`, designed for daily-d
 | :-- | :-- |
 | `Ctrl+T` | Cycle theme |
 | `Ctrl+B` | Toggle context panel |
-| `Ctrl+O` | Switch model (provider → model) |
+| `Ctrl+O` | Switch model (browse/search all models) |
+| `Ctrl+R` (in model dialog) | Refresh the model list (scrapes latest Ollama Cloud models) |
 | `Ctrl+K` | Command palette (all commands) |
 | `Ctrl+E` | Open external editor for the message |
 | `F8` / `Ctrl+Shift+T` | Toggle interaction trace panel |
@@ -132,15 +138,26 @@ A high-performance terminal interface built with `Textual`, designed for daily-d
 | `Shift+Enter` (chat input) | New line |
 | `↑` / `↓` (chat input) | Prompt history |
 | `/skill save <name>` | Save last reply as a skill |
+| `/auth list` | List stored API keys |
+| `/auth login <provider>` | Store an API key for a provider |
+| `/auth logout <provider>` | Remove a stored API key |
 | `Ctrl+C` / `Ctrl+X` | Cancel current request (does not quit) |
 | `Ctrl+Q` | Quit (kills the process) |
 
-**Dashboard integration**: one-click open to the admin dashboard at `https://localhost:7860/`.
+**CLI commands**:
+| Command | Action |
+| :-- | :-- |
+| `motion` | Launch the TUI |
+| `motion --chat` | Launch the REPL chat |
+| `motion --list` | List providers/models |
+| `motion --provider <id>` | Launch with a specific provider/model |
+| `motion auth login <provider>` | Store an API key (prompts, hidden input) |
+| `motion auth logout <provider>` | Remove a stored API key |
+| `motion auth list` | List which providers have keys |
 
 ### ⚠️ Known Limitations (v2 TUI)
 - Trace persistence is per-session (not yet written to disk).
 - Theme contrast validation is manual; the bundled themes are tuned for readability but very-low-contrast combinations are not auto-corrected.
-- Shortcut help overlay (`?`) reflects MainScreen + ChatPane bindings; the Tasks/Skills/KB/Memory/Settings panes are defined but not mounted in the current focused-chat layout.
 - Clipboard copy falls back to inserting the response into the input box when the terminal lacks clipboard support.
 - File/document ingestion (image / PDF / DOCX / XLSX) is on the roadmap — see [Roadmap](docs/roadmap.md).
 

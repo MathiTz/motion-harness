@@ -4,6 +4,7 @@ from typing import Any, Dict, Optional
 from dataclasses import dataclass
 
 from core.catalog import merge_catalog
+from core import auth
 
 @dataclass
 class AppConfig:
@@ -66,14 +67,17 @@ class ConfigManager:
         if not config:
             raise ValueError(f"Unknown provider: {base_id}")
 
-        # Resolve api_key from environment
+        # Resolve api_key: auth store → env var → config.yml
         env_key = f"{base_id.replace('-', '_').upper()}_API_KEY"
         env_val = os.environ.get(env_key)
         if not env_val:
             prefix = base_id.split('-')[0].upper()
             generic_key = f"{prefix}_API_KEY"
             env_val = os.environ.get(generic_key)
-        if env_val:
+        stored = auth.get_key(base_id)
+        if stored:
+            config = {**config, "api_key": stored}
+        elif env_val:
             config = {**config, "api_key": env_val}
 
         # Resolve model: explicit model_name > default_model > options.model
@@ -111,7 +115,11 @@ class ConfigManager:
         providers = self.data.get("providers", {})
         cfg = providers.get(base_id, {})
 
-        # Check config file first
+        # Check auth store first
+        if auth.get_key(base_id):
+            return True
+
+        # Check config file
         config_key = cfg.get("api_key")
         if config_key:
             return True
