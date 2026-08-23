@@ -7,6 +7,7 @@ Covers:
 """
 import pytest
 from rich.style import Style
+from textual import events
 
 from textual.app import App, ComposeResult
 from textual.message import Message
@@ -72,6 +73,20 @@ async def test_up_down_navigates_history():
         assert composer.value == ""
         await pilot.press("down")
         assert composer.value == ""
+
+@pytest.mark.asyncio
+async def test_paste_inserts_multiline_text_at_cursor():
+    app = _ComposerHarness()
+    async with app.run_test() as pilot:
+        composer = app.query_one("#composer", ChatComposer)
+        composer.focus()
+        composer.value = "before  after"
+        composer.cursor_position = len("before ")
+        composer.post_message(events.Paste("line 1\r\nline 2"))
+        await pilot.pause()
+
+        assert composer.value == "before line 1\nline 2 after"
+        assert composer.cursor_position == len("before line 1\nline 2")
 
 
 def test_prompt_history_records_and_navigates():

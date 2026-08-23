@@ -55,10 +55,15 @@ mkdir -p "$REPO_DIR/bin"
 cat > "$WRAPPER" << WRAPPER_EOF
 #!/bin/bash
 # Motion Harness launcher — created by install.sh
+#
+# Intentionally does NOT cd into the repo: the harness's own state
+# (config.yml, .env, memory DB, synthesized skills) is resolved relative to
+# REPO_DIR by the Python code itself, while the *workspace* the agent reads
+# and writes files in is whatever directory you run \`motion\` from. Point
+# it at any project by cd-ing there first, just like any other CLI tool.
 REPO_DIR="$REPO_DIR"
 VENV_DIR="$REPO_DIR/.venv"
 export PYTHONPATH="\$REPO_DIR"
-cd "\$REPO_DIR"
 exec "\$VENV_DIR/bin/python" "\$REPO_DIR/main.py" "\$@"
 WRAPPER_EOF
 

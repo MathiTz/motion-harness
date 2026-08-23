@@ -41,7 +41,7 @@ from rich.markdown import Markdown as RichMarkdown
 from rich.style import Style
 from rich.text import Text
 
-from textual import work
+from textual import events, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical, VerticalScroll
@@ -99,8 +99,20 @@ class AppState:
         self.ui_mode: str = "conservative"
         self.show_activity_rail: bool = True
         self.show_trace_panel: bool = False
-        self.agent_mode: str = "build"  # "build" (full access) or "plan" (read-only)
+        # When enabled, the agent's intermediate tool-loop responses (its
+        # visible "thinking" between tool calls) are shown inline in the chat
+        # log, not just summarized in the trace panel. Off by default since
+        # it can be noisy; toggle with F7 or the command palette.
+        self.show_thinking: bool = False
+        # New asks start in "plan" (read-only, discuss-first). The agent only
+        # gains write access ("build") once the user explicitly confirms via
+        # a build-trigger phrase (see _is_build_trigger) or the Tab toggle.
+        self.agent_mode: str = "plan"
         self.busy: bool = False  # True while an agent response is streaming
+        # Prompts submitted while busy are queued here instead of cancelling
+        # the in-flight agent worker (which @work(exclusive=True) would
+        # otherwise do). _run_agent drains this after each turn completes.
+        self.message_queue: list[str] = []
         self.last_agent_response: str = ""
         self.prompt_history: list[str] = []  # submitted prompts for up/down recall
         self._history_index: int = -1
@@ -263,6 +275,35 @@ def _skills_dir() -> Path:
     return Path(WORKSPACE) / "skills"
 
 
+# Phrases that count as an explicit go-ahead to start creating/editing files.
+# Kept intentionally narrow (word-boundary anchored) to avoid false positives
+# on messages that merely *describe* a build without asking for one yet.
+_BUILD_TRIGGER_PATTERNS = [
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"\blet'?s build\b",
+        r"\blet'?s do (it|this)\b",
+        r"\blet'?s ship (it|this)\b",
+        r"\bgo ahead\b",
+        r"\bbuild it\b",
+        r"\bbuild this\b",
+        r"\bbuild that\b",
+        r"\bship it\b",
+        r"\bimplement it\b",
+        r"\bimplement this\b",
+        r"\bstart building\b",
+        r"\byou can build\b",
+        r"\byes,? build\b",
+        r"\bmake it happen\b",
+    )
+]
+
+
+def _is_build_trigger(text: str) -> bool:
+    """Return True if the message is an explicit confirmation to start building."""
+    return any(pattern.search(text) for pattern in _BUILD_TRIGGER_PATTERNS)
+
+
 def _extract_reasoning_and_answer(text: str) -> tuple[str, str]:
     """Extract <think>...</think> blocks if present; return (reasoning, answer)."""
     if "<think>" not in text:
@@ -302,6 +343,42 @@ class ReasoningMessage(Static):
         background: $panel;
         color: $text-muted;
         border-left: solid $warning;
+        padding: 0 2;
+        margin: 0 0 1 1;
+    }
+    """
+
+class ThinkingMessage(Static):
+    """Opt-in live view of the agent's intermediate tool-loop responses.
+
+    Distinct from ReasoningMessage (which renders <think> blocks from the
+    final answer): this shows the model's visible text between tool calls
+    as it works, when available and when the user has enabled it (F7 /
+    command palette "Toggle agent thinking").
+    """
+    DEFAULT_CSS = """
+    ThinkingMessage {
+        background: $panel;
+        color: $text-muted;
+        border-left: solid $secondary;
+        padding: 0 2;
+        margin: 0 0 1 1;
+    }
+    """
+
+class StepsMessage(Static):
+    """Always-visible live view of tool activity (list/read/write/replace).
+
+    Unlike ThinkingMessage (the model's free-form intermediate text, opt-in
+    via show_thinking), this shows concrete tool operations - "wrote x.py",
+    "read y.py" - so long-running tasks always show visible progress instead
+    of a blank chat while many tool calls run in the background.
+    """
+    DEFAULT_CSS = """
+    StepsMessage {
+        background: $panel;
+        color: $text-muted;
+        border-left: solid $success;
         padding: 0 2;
         margin: 0 0 1 1;
     }
@@ -457,8 +534,16 @@ class ChatComposer(Static, can_focus=True):
     def _insert(self, char: str) -> None:
         pos = self.cursor_position
         self.value = self.value[:pos] + char + self.value[pos:]
-        self.cursor_position = min(len(self.value), pos + 1)
+        self.cursor_position = min(len(self.value), pos + len(char))
         self._invalidate_layout()
+
+    def on_paste(self, event: events.Paste) -> None:
+        """Insert terminal bracketed-paste text at the current cursor."""
+        event.stop()
+        event.prevent_default()
+        if event.text:
+            # Preserve multiline prompts while normalizing terminal line endings.
+            self._insert(event.text.replace("\r\n", "\n").replace("\r", "\n"))
 
     def _delete(self) -> None:
         pos = self.cursor_position
@@ -882,6 +967,7 @@ class CommandPalette(Screen):
             ("Toggle theme", "theme"),
             ("Show shortcuts", "shortcuts"),
             ("Toggle trace panel", "trace"),
+            ("Toggle agent thinking", "thinking"),
             ("Copy last response", "copy"),
             ("Toggle context panel", "context"),
             ("Manage API keys (/auth)", "auth"),
@@ -944,6 +1030,11 @@ class CommandPalette(Screen):
         elif action == "trace":
             try:
                 self._main.query_one(ChatPane).action_toggle_trace_panel()
+            except Exception:
+                pass
+        elif action == "thinking":
+            try:
+                self._main.query_one(ChatPane).action_toggle_thinking()
             except Exception:
                 pass
         elif action == "copy":
@@ -1335,6 +1426,7 @@ class ChatPane(Vertical):
     BINDINGS = [
         Binding("ctrl+shift+t", "toggle_trace_panel", "Trace", priority=True),
         Binding("ctrl+shift+c", "copy_last_response", "Copy", priority=True),
+        Binding("f7", "toggle_thinking", "Thinking", priority=True),
         Binding("f8", "toggle_trace_panel", "Trace", priority=True),
         Binding("f9", "copy_last_response", "Copy", priority=True),
         Binding("tab", "toggle_agent_mode", "Agent", priority=True),
@@ -1451,7 +1543,7 @@ class ChatPane(Vertical):
         name = self.state.agent.provider.config.name if self.state.agent else "?"
         log = self.query_one("#chat_log", VerticalScroll)
         log.mount(SystemMessage(f"⚡ Motion Harness — connected to {name}"))
-        log.mount(SystemMessage("Tip: Ctrl+K commands · Ctrl+O model · Tab agent · F8 trace · F9 copy · /skill save <name>"))
+        log.mount(SystemMessage("Tip: Ctrl+K commands · Ctrl+O model · Tab agent · F7 thinking · F8 trace · F9 copy · /skill save <name>"))
         self._append_trace("session_start", f"provider={name}")
         self._set_trace_panel_visible(self.state.show_trace_panel)
         self._refresh_meta()
@@ -1484,6 +1576,17 @@ class ChatPane(Vertical):
 
     def action_toggle_trace_panel(self) -> None:
         self._set_trace_panel_visible(not self.state.show_trace_panel)
+
+    def action_toggle_thinking(self) -> None:
+        """Toggle inline display of the agent's intermediate tool-loop text.
+
+        This is opt-in and separate from the trace panel: when enabled, the
+        model's visible responses between tool calls (if any - some
+        providers/tasks never produce intermediate text) are rendered as a
+        live "thinking" bubble in the chat log, not just summarized in trace.
+        """
+        self.state.show_thinking = not self.state.show_thinking
+        self.notify(f"Agent thinking {'shown' if self.state.show_thinking else 'hidden'}")
 
     def _toggle_agent_mode(self) -> None:
         """Switch between build (full access) and plan (read-only) agents."""
@@ -1686,10 +1789,26 @@ class ChatPane(Vertical):
             await self._handle_auth_command(text, log)
             log.scroll_end(animate=False)
             return
+        if self.state.agent_mode == "plan" and _is_build_trigger(text):
+            self.state.agent_mode = "build"
+            self._refresh_meta()
+            log.mount(SystemMessage("🔧 Build confirmed — switching to Build mode, I'll create/edit files now."))
         ts = datetime.now().strftime("%H:%M:%S")
         user_msg = UserMessage("")
         user_msg.update(self._render_user_markdown(ts, text))
         log.mount(user_msg)
+        if self.state.busy:
+            # Don't call _run_agent here: it's @work(exclusive=True), so a
+            # second call would cancel the in-flight turn instead of running
+            # alongside it. Queue instead - the running worker drains this
+            # queue itself once its current turn finishes.
+            self.state.message_queue.append(text)
+            log.mount(SystemMessage(
+                f"📥 Queued (#{len(self.state.message_queue)}) — will run once the "
+                "current task finishes."
+            ))
+            log.scroll_end(animate=False)
+            return
         live_response = AgentMessage("")
         log.mount(live_response)
         log.scroll_end(animate=False)
@@ -1728,18 +1847,89 @@ class ChatPane(Vertical):
 
     @work(exclusive=True, name="agent_chat")
     async def _run_agent(self, prompt: str, live_response: AgentMessage) -> None:
+        """Run one turn, then drain any prompts queued while it was busy.
+
+        Looping here (rather than re-invoking this @work(exclusive=True)
+        method) means a queued follow-up runs in the SAME worker instead of
+        starting a second worker that would cancel this one.
+        """
         log = self.query_one("#chat_log", VerticalScroll)
         self.state.busy = True
         self._refresh_status()
+        try:
+            while True:
+                cancelled = await self._run_agent_turn(prompt, live_response, log)
+                if cancelled:
+                    if self.state.message_queue:
+                        dropped = len(self.state.message_queue)
+                        self.state.message_queue.clear()
+                        log.mount(SystemMessage(
+                            f"⏹ Discarded {dropped} queued message(s) due to cancellation."
+                        ))
+                    break
+                if not self.state.message_queue:
+                    break
+                prompt = self.state.message_queue.pop(0)
+                live_response = AgentMessage("")
+                log.mount(live_response)
+                log.scroll_end(animate=False)
+        finally:
+            self.state.busy = False
+            self._refresh_status()
+            log.scroll_end(animate=False)
+
+    async def _run_agent_turn(
+        self, prompt: str, live_response: AgentMessage, log: VerticalScroll
+    ) -> bool:
+        """Run a single agent turn. Returns True if it was cancelled."""
         chunks: list[str] = []
         header_ts = datetime.now().strftime("%H:%M:%S")
         reasoning_widget: Optional[ReasoningMessage] = None
+        thinking_widget: Optional[ThinkingMessage] = None
+        thinking_steps: list[str] = []
+        steps_widget: Optional[StepsMessage] = None
+        step_lines: list[str] = []
         current_raw = ""
         self._append_trace("interaction_start", prompt[:120])
 
         async def on_stream_chunk(chunk: str) -> None:
             if not chunk:
                 return
+
+            # Internal progress markers come from the tool loop (e.g. "_step_",
+            # "_tool_"). "_tool_" (concrete tool operations like "wrote x.py")
+            # is always shown inline so long tasks show live progress instead
+            # of a blank chat. "_step_" (the model's free-form intermediate
+            # text) stays opt-in (F7 / "Toggle agent thinking") since it can
+            # be noisy/repetitive.
+            if chunk.startswith("_step_ "):
+                nonlocal thinking_widget
+                step_text = chunk[len("_step_ "):].strip()
+                self._append_trace("tool_progress", step_text[:220])
+                if self.state.show_thinking and step_text:
+                    thinking_steps.append(step_text)
+                    if thinking_widget is None:
+                        thinking_widget = ThinkingMessage("")
+                        log.mount(thinking_widget, before=live_response)
+                    preview = "\n\n".join(f"› {s}" for s in thinking_steps[-6:])
+                    thinking_widget.update(Text(preview[:3000], style="dim italic"))
+                    log.scroll_end(animate=False)
+                return
+            if chunk.startswith("_tool_ "):
+                nonlocal steps_widget
+                tool_text = chunk[len("_tool_ "):].strip()
+                self._append_trace("tool_progress", tool_text[:220])
+                self._refresh_status()
+                if tool_text:
+                    step_lines.append(tool_text)
+                    if steps_widget is None:
+                        steps_widget = StepsMessage("")
+                        log.mount(steps_widget, before=live_response)
+                    preview = "\n".join(f"• {s}" for s in step_lines[-8:])
+                    steps_widget.update(Text(preview[:3000], style="dim"))
+                    log.scroll_end(animate=False)
+                return
+
             nonlocal reasoning_widget, current_raw
             chunks.append(chunk)
             current_raw = "".join(chunks)
@@ -1785,6 +1975,8 @@ class ChatPane(Vertical):
                 on_trace_event=on_trace_event,
                 history=history or None,
                 context_query=context_query or None,
+                workspace=WORKSPACE,
+                agent_mode=self.state.agent_mode,
             )
             if not chunks:
                 raw = response or ""
@@ -1825,18 +2017,17 @@ class ChatPane(Vertical):
             if isinstance(main_screen, MainScreen):
                 main_screen.refresh_session_footer()
                 main_screen.refresh_context_panel()
+            return False
         except asyncio.CancelledError:
             live_response.remove()
             log.mount(SystemMessage("⏹ Cancelled."))
             self._append_trace("interaction_cancelled")
+            return True
         except Exception as e:
             live_response.remove()
             log.mount(SystemMessage(f"❌ {e}"))
             self._append_trace("interaction_error", str(e))
-        finally:
-            self.state.busy = False
-            self._refresh_status()
-            log.scroll_end(animate=False)
+            return False
 
     async def _handle_skill_command(self, text: str, log: VerticalScroll) -> None:
         parts = text.split(maxsplit=2)

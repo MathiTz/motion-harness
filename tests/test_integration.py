@@ -38,25 +38,32 @@ async def test_golden_path():
     User Prompt -> Hybrid Recall -> Model completion -> Caveman Compression
     """
     model_config = ModelConfig(name="test-model", endpoint="http://localhost", provider_type="local")
-    agent = MotionAgent(model_config)
+    # IMPORTANT: use an isolated in-memory DB. Omitting memory_path defaults to
+    # the real "motion_memory.db" used by the TUI, which previously caused this
+    # test to inject a fake "null pointer" memory into production data on every
+    # test run (found repeated 134x, polluting unrelated conversations).
+    agent = MotionAgent(model_config, memory_path=":memory:")
     agent.provider = MockProvider()
 
-    # Add a memory to test recall
-    agent.memory.add_memory(MemoryChunk(
-        content="The bug in line 42 is caused by a null pointer in the handler.",
-        embedding=[0.1] * EMBEDDING_DIM,
-        metadata={"source": "test.md"},
-        mem_type="DOC"
-    ))
+    try:
+        # Add a memory to test recall
+        agent.memory.add_memory(MemoryChunk(
+            content="The bug in line 42 is caused by a null pointer in the handler.",
+            embedding=[0.1] * EMBEDDING_DIM,
+            metadata={"source": "test.md"},
+            mem_type="DOC"
+        ))
 
-    # 2. Execution
-    prompt = "Where is the bug?"
-    response = await agent.run(prompt, target="agent")
+        # 2. Execution
+        prompt = "Where is the bug?"
+        response = await agent.run(prompt, target="agent")
 
-    # 3. Assertions
-    # Caveman should strip fluff from the MockProvider's response
-    assert "Certainly!" not in response
-    assert "bug is in line 42" in response
+        # 3. Assertions
+        # Caveman should strip fluff from the MockProvider's response
+        assert "Certainly!" not in response
+        assert "bug is in line 42" in response
+    finally:
+        agent.memory.close()
 
     print("✅ Golden Path integration test passed!")
 

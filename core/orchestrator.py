@@ -10,7 +10,7 @@ from pathlib import Path
 import logging
 
 from core.providers import ModelConfig, ProviderFactory
-from main import MotionAgent
+from main import MotionAgent, REPO_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -189,7 +189,7 @@ class TaskManager:
             
             try:
                 config = model_override or self.default_config
-                agent = MotionAgent(config, memory_path=f"memory_{request.task_id}.db")
+                agent = MotionAgent(config, memory_path=os.path.join(REPO_DIR, f"memory_{request.task_id}.db"))
 
                 # Record user turn
                 task.conversation.append({"role": "user", "content": request.prompt})
@@ -208,6 +208,8 @@ class TaskManager:
                     request.prompt,
                     target="user",
                     on_stream_chunk=on_stream_chunk,
+                    workspace=self.workspace_path,
+                    agent_mode="build",
                 )
                 
                 # Fallback for non-streaming providers
@@ -233,7 +235,7 @@ class TaskManager:
                 except Exception:
                     pass
                 try:
-                    db_path = f"memory_{request.task_id}.db"
+                    db_path = os.path.join(REPO_DIR, f"memory_{request.task_id}.db")
                     if os.path.exists(db_path):
                         os.remove(db_path)
                 except Exception:

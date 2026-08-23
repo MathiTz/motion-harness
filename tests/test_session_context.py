@@ -205,15 +205,35 @@ def test_compact_preserves_context_in_build_prompt():
 
 # ─── Agent mode (build/plan) ──────────────────────────────────────────────────
 
-def test_agent_mode_defaults_to_build():
+def test_agent_mode_defaults_to_plan():
+    # New asks start read-only/discuss-first; the user must explicitly
+    # confirm (Tab toggle or a build-trigger phrase) before file writes.
     state = AppState()
-    assert state.agent_mode == "build"
+    assert state.agent_mode == "plan"
 
 
 def test_agent_mode_toggle_cycles():
     state = AppState()
-    assert state.agent_mode == "build"
-    state.agent_mode = "plan" if state.agent_mode == "build" else "build"
     assert state.agent_mode == "plan"
     state.agent_mode = "plan" if state.agent_mode == "build" else "build"
     assert state.agent_mode == "build"
+    state.agent_mode = "plan" if state.agent_mode == "build" else "build"
+    assert state.agent_mode == "plan"
+
+
+def test_build_trigger_phrases_detected():
+    from ui.tui import _is_build_trigger
+
+    assert _is_build_trigger("Let's build it")
+    assert _is_build_trigger("ok go ahead")
+    assert _is_build_trigger("Great, build it.")
+    assert _is_build_trigger("ship it!")
+
+
+def test_build_trigger_ignores_plain_descriptions():
+    from ui.tui import _is_build_trigger
+
+    assert not _is_build_trigger(
+        "We'll create a market scraper that grabs prices and descriptions."
+    )
+    assert not _is_build_trigger("Can you explain how the scraper would work?")
