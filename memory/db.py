@@ -41,9 +41,28 @@ class MemoryDB:
         )""")
         if self._vec_available:
             dim = EMBEDDING_DIM
+            # Use cosine distance explicitly (vec0 defaults to L2, which is
+            # magnitude-sensitive and was previously being misread as a
+            # higher-is-better similarity score by HybridRetriever, silently
+            # ranking the LEAST similar memories first). Cosine distance
+            # matches the brute-force fallback's cosine similarity exactly.
+            existing_sql = self.conn.execute(
+                "SELECT sql FROM sqlite_master WHERE name = 'memories_vec'"
+            ).fetchone()
+            needs_migration = existing_sql is not None and "distance_metric=cosine" not in (existing_sql[0] or "")
+            if needs_migration:
+                self.conn.execute("DROP TABLE memories_vec")
             self.conn.execute(
-                f"CREATE VIRTUAL TABLE IF NOT EXISTS memories_vec USING vec0(embedding float[{dim}])"
+                f"CREATE VIRTUAL TABLE IF NOT EXISTS memories_vec USING vec0(embedding float[{dim}] distance_metric=cosine)"
             )
+            if needs_migration:
+                # Re-populate the rebuilt index from the durable `memories`
+                # table so existing data survives the metric migration.
+                for mem_id, emb_blob in self.conn.execute("SELECT id, embedding FROM memories").fetchall():
+                    self.conn.execute(
+                        "INSERT INTO memories_vec (rowid, embedding) VALUES (?, ?)",
+                        (mem_id, emb_blob),
+                    )
         self.conn.commit()
 
     def _serialize_embedding(self, embedding: List[float]) -> bytes:
@@ -88,7 +107,19 @@ class MemoryDB:
                    ORDER BY v.distance""",
                 (query_blob, limit),
             ).fetchall()
-            return [(row[1], row[0]) for row in rows]
+            # The vec0 table is created with distance_metric=cosine (see
+            # _init_db), so distance == 1 - cosine_similarity. Convert back
+            # to cosine similarity so callers (HybridRetriever) can treat
+            # "score" as higher-is-better identically across this path and
+            # the brute-force cosine-similarity fallback below. Without this,
+            # callers that sort descending by score would rank the LEAST
+            # similar memories first whenever this vector-index path is used.
+            #
+            # Cosine distance is undefined (NULL) for zero-norm embeddings
+            # (e.g. a stored placeholder embedding). Skip those rather than
+            # crashing on `1.0 - None` - they simply can't participate in
+            # semantic search, but remain findable via keyword search.
+            return [(1.0 - row[1], row[0]) for row in rows if row[1] is not None]
 
         # Fallback: brute-force cosine similarity using numpy
         cursor = self.conn.execute("SELECT content, embedding FROM memories")
@@ -101,7 +132,13 @@ class MemoryDB:
             emb = np.frombuffer(emb_blob, dtype="<f")
             if len(emb) != len(query_arr):
                 continue
-            score = float(np.dot(query_arr, emb) / (query_norm * np.linalg.norm(emb)))
+            emb_norm = np.linalg.norm(emb)
+            if emb_norm == 0:
+                # Cosine similarity is undefined for a zero-norm embedding
+                # (e.g. a stored placeholder embedding); skip it rather than
+                # dividing by zero and injecting a NaN-scored "match".
+                continue
+            score = float(np.dot(query_arr, emb) / (query_norm * emb_norm))
             results.append((score, content))
         results.sort(key=lambda x: x[0], reverse=True)
         return results[:limit]

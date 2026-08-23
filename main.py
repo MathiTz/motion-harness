@@ -5,23 +5,46 @@ from core.learning import SkillSynthesizer, Trajectory
 from core import auth
 from memory.db import MemoryDB, EMBEDDING_DIM
 from memory.retriever import HybridRetriever
+from core.workspace_tools import (
+    WorkspaceTools,
+    format_tool_result,
+    parse_tool_call,
+)
 import asyncio
 import inspect
 import hashlib
 import logging
 import os
+import re
 from typing import Optional
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
 
+# The installed location of the harness itself. Persistent harness state
+# (memory DB, config.yml, .env, auto-synthesized skills) lives here so it
+# stays put no matter which directory `motion` is invoked/pointed at - only
+# the *workspace* (files the agent reads/writes) should follow the caller's
+# current directory. See core/config.py and core/learning.py for the same
+# pattern applied to config and skill-synthesis paths.
+REPO_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Per-turn cap on the tool-call agent loop (list/read/write/replace calls).
+# This is a last-resort safety valve against a truly stuck/looping model, not
+# a task-size limit - large multi-file builds are expected to run for many
+# steps. Users can watch progress live (each tool op is streamed) and cancel
+# at any time, or queue a follow-up message, so this is set high rather than
+# tight. If it's ever hit, whatever progress was made is still reported (see
+# the tool loop's `else` branch below) instead of being silently discarded.
+MAX_TOOL_STEPS = 150
+
 class MotionAgent:
-    def __init__(self, model_config: ModelConfig, memory_path: str = "motion_memory.db", auto_skill_synthesis: bool = False):
+    def __init__(self, model_config: ModelConfig, memory_path: Optional[str] = None, auto_skill_synthesis: bool = False):
         self.provider = ProviderFactory.get_provider(model_config)
-        self.memory = MemoryDB(memory_path)
+        self.memory = MemoryDB(memory_path or os.path.join(REPO_DIR, "motion_memory.db"))
         self.retriever = HybridRetriever(self.memory, self)
         self.caveman = CavemanProtocol(enabled=True)
-        self.synthesizer = SkillSynthesizer(model_config, self.memory)
+        self.synthesizer = SkillSynthesizer(model_config, self.memory, embedding_provider=self)
         self.auto_skill_synthesis = auto_skill_synthesis
 
     async def get_embedding(self, text: str):
@@ -43,7 +66,17 @@ class MotionAgent:
         norm = sum(v * v for v in vec) ** 0.5 or 1.0
         return [v / norm for v in vec]
 
-    async def run(self, prompt: str, target: str = "user", on_stream_chunk=None, on_trace_event=None, history: Optional[list] = None, context_query: Optional[str] = None):
+    async def run(
+        self,
+        prompt: str,
+        target: str = "user",
+        on_stream_chunk=None,
+        on_trace_event=None,
+        history: Optional[list] = None,
+        context_query: Optional[str] = None,
+        workspace: Optional[str] = None,
+        agent_mode: str = "build",
+    ):
         async def emit_trace(stage: str, message: str, **extra):
             if not on_trace_event:
                 return
@@ -63,22 +96,233 @@ class MotionAgent:
         # Augment recall with the session context query so we don't repeat ourselves.
         if context_query:
             context_chunks += await self.retriever.retrieve(context_query)
-            # De-duplicate by content, keep order.
-            seen = set()
-            deduped = []
-            for c in context_chunks:
-                key = c["content"]
-                if key not in seen:
-                    seen.add(key)
-                    deduped.append(c)
-            context_chunks = deduped[:5]
+        # De-duplicate by content, keep order. Applied unconditionally (not just
+        # when context_query is set) since a single retrieve() call can itself
+        # surface duplicate content if the DB has duplicate rows.
+        seen = set()
+        deduped = []
+        for c in context_chunks:
+            key = c["content"]
+            if key not in seen:
+                seen.add(key)
+                deduped.append(c)
+        context_chunks = deduped[:5]
         await emit_trace("memory_recall_done", "Memory recall complete", chunks=len(context_chunks))
         context_text = "\n".join([c["content"] for c in context_chunks])
 
         # 2. Construct System Prompt
-        system_prompt = f"You are Motion Agent. Memory Context:\n{context_text}"
+        tools = WorkspaceTools(
+            workspace or os.getcwd(),
+            read_only=agent_mode == "plan",
+        )
+        system_prompt = (
+            f"You are Motion Agent.\n\n{tools.instructions}\n\n"
+            f"Memory Context:\n{context_text}"
+        )
+
+        # Tool calls require a short agent loop. The XML envelope works across
+        # Ollama, OpenAI-compatible, Anthropic, and proxy providers without
+        # requiring each provider to implement a different native tool API.
+        tool_history = list(history or [])
+        tool_response = None
+        used_tool = False
+        empty_retries = 0
+        inspection_only_loops = 0
+        tool_operations: list[str] = []
+        for tool_step in range(MAX_TOOL_STEPS):
+            step_prompt = prompt if tool_step == 0 else "Continue the task using the tool result above."
+            candidate = await self.provider.complete(
+                step_prompt,
+                system_prompt=system_prompt,
+                history=tool_history or None,
+            )
+
+            # Stream visible progress for the current step so the UI doesn't stay
+            # blank while tools are running. Strip any tool markup from previews.
+            visible = re.sub(r"<[^>]+>", "", candidate or "").strip()
+            if on_stream_chunk and visible:
+                maybe = on_stream_chunk(f"_step_ {visible[:500]}")
+                if inspect.isawaitable(maybe):
+                    await maybe
+
+            try:
+                tool_call = parse_tool_call(candidate)
+            except Exception as exc:
+                await emit_trace("tool_error", "Invalid tool call", error=str(exc))
+                tool_response = (
+                    "Your tool call was invalid. Correct it and call one tool using "
+                    "the exact <motion_tool> JSON format."
+                )
+                tool_history.extend([
+                    {"role": "assistant", "content": candidate},
+                    {"role": "user", "content": format_tool_result("invalid", error=str(exc))},
+                ])
+                continue
+
+            if tool_call is None and not (candidate or "").strip() and used_tool:
+                empty_retries += 1
+                if empty_retries <= 2:
+                    tool_history.append({
+                        "role": "user",
+                        "content": (
+                            "Your previous response was empty. Continue the task: use another "
+                            "tool if work remains, otherwise provide a concise completion summary."
+                        ),
+                    })
+                    continue
+                break
+
+            if tool_call is None:
+                tool_response = candidate
+                break
+
+            name, arguments = tool_call
+            used_tool = True
+
+            # Track loops that only inspect. If the model keeps listing/reading
+            # without writing on a build-mode task, nudge it to create files.
+            if name in {"list_files", "read_file"}:
+                inspection_only_loops += 1
+            else:
+                inspection_only_loops = 0
+
+            await emit_trace(
+                "tool_start",
+                f"Running {name}",
+                tool=name,
+                path=str(arguments.get("path", "")),
+            )
+            try:
+                result = tools.execute(name, arguments)
+                result_message = format_tool_result(name, result=result)
+                path = str(result.get("path") or arguments.get("path") or "").strip()
+                if name == "write_file":
+                    operation = f"wrote `{path}`"
+                    stream_text = f"wrote `{path}` ({result.get('bytes_written', 0)} bytes)"
+                elif name == "replace_in_file":
+                    operation = f"updated `{path}`"
+                    stream_text = operation
+                elif name == "read_file":
+                    operation = f"read `{path}`"
+                    stream_text = operation
+                elif name == "list_files":
+                    operation = f"listed `{path or '.'}`"
+                    stream_text = operation
+                else:
+                    operation = f"ran `{name}`"
+                    stream_text = operation
+                tool_operations.append(operation)
+                # Stream every tool op (not just writes) so the UI can show
+                # live step-by-step progress for the whole loop, however long
+                # it runs.
+                if on_stream_chunk:
+                    maybe = on_stream_chunk(f"_tool_ {stream_text}")
+                    if inspect.isawaitable(maybe):
+                        await maybe
+                await emit_trace("tool_done", f"Completed {name}", tool=name)
+            except Exception as exc:
+                operation = f"`{name}` failed: {exc}"
+                result_message = format_tool_result(name, error=str(exc))
+                tool_operations.append(operation)
+                if on_stream_chunk:
+                    maybe = on_stream_chunk(f"_tool_ {operation}")
+                    if inspect.isawaitable(maybe):
+                        await maybe
+                await emit_trace("tool_error", f"{name} failed", tool=name, error=str(exc))
+            tool_history.extend([
+                {"role": "assistant", "content": candidate},
+                {"role": "user", "content": result_message},
+            ])
+
+            if agent_mode == "plan" and name in {"write_file", "replace_in_file"}:
+                # Plan mode always rejects writes (see WorkspaceTools._require_write_access).
+                # Steer the model away from retrying the same blocked call and toward
+                # actually answering with a concrete plan.
+                tool_history.append({
+                    "role": "user",
+                    "content": (
+                        "You are in read-only Plan mode - file writes are disabled here. "
+                        "Do not retry write_file/replace_in_file. Respond now with a concrete "
+                        "written plan: proposed files/directories, the approach for each major "
+                        "piece, and any libraries you'd use. The user will review this and switch "
+                        "you to Build mode to implement it."
+                    ),
+                })
+
+            if (
+                agent_mode == "build"
+                and inspection_only_loops >= 2
+                and not any(op.startswith(("wrote ", "updated ")) for op in tool_operations)
+            ):
+                tool_history.append({
+                    "role": "user",
+                    "content": (
+                        "You have inspected the workspace enough. The user asked you to create "
+                        "something. Now use write_file to create the requested files with concrete, "
+                        "complete content. Do not ask for clarification and do not return a script."
+                    ),
+                })
+        else:
+            # Never discard real progress: if tools actually ran before the cap
+            # was hit, tell the user what was done and how to resume, instead
+            # of a bare "narrow the task" message that hides completed writes.
+            # Hitting this at all is unusual given how high the ceiling is -
+            # it almost always means the model is stuck looping rather than
+            # that the task was too big.
+            if tool_operations:
+                completed = "\n".join(f"- {operation}" for operation in tool_operations)
+                tool_response = (
+                    f"Hit the internal safety limit ({MAX_TOOL_STEPS} tool calls) before "
+                    f"finishing - this usually means something got stuck. Progress so far:\n"
+                    f"{completed}\n\nSay \"continue\" and I'll pick up from here."
+                )
+            else:
+                tool_response = (
+                    f"Hit the internal safety limit ({MAX_TOOL_STEPS} tool calls) without "
+                    "making any progress. Please narrow the task and try again."
+                )
+
+        # The final non-tool response is already complete. Tool markup is never
+        # streamed into the chat UI.
+        raw_response = (tool_response or "").strip()
+        if not raw_response and used_tool:
+            write_operations = [
+                operation
+                for operation in tool_operations
+                if operation.startswith(("wrote ", "updated "))
+            ]
+            if write_operations:
+                raw_response = "Completed filesystem changes:\n" + "\n".join(
+                    f"- {operation}" for operation in write_operations
+                )
+            elif agent_mode == "plan":
+                raw_response = (
+                    "I inspected the workspace but couldn't finish a plan in the space "
+                    "available. Ask me again, or narrow the scope, and I'll lay out the "
+                    "file/directory approach here in Plan mode before you switch to Build."
+                )
+            else:
+                raw_response = (
+                    "I inspected the workspace but did not make any filesystem changes. "
+                    "If you want me to create files, say exactly what to build and I will "
+                    "use write_file to create it."
+                )
+
+        # Ensure the user always sees the final text, whether streaming or not.
+        if on_stream_chunk:
+            if raw_response:
+                maybe = on_stream_chunk(raw_response)
+                if inspect.isawaitable(maybe):
+                    await maybe
+        await emit_trace(
+            "model_done",
+            "Agent tool loop finished" if used_tool else "Completion finished",
+            chars=len(raw_response),
+        )
 
         # 3. Model Completion (streaming if callback is provided)
+        # If the model already returned a natural-language answer in the tool
+        # loop, use that. Otherwise fall back to a streaming/oneshot completion.
         stream_chunk_count = 0
         provider_type = getattr(getattr(self.provider, "config", None), "provider_type", "unknown")
         await emit_trace(
@@ -87,23 +331,24 @@ class MotionAgent:
             mode="stream" if on_stream_chunk else "oneshot",
             provider=provider_type,
         )
-        if on_stream_chunk:
-            raw_chunks = []
-            async for chunk in self.provider.stream_complete(prompt, system_prompt=system_prompt, history=history):
-                stream_chunk_count += 1
-                raw_chunks.append(chunk)
-                await emit_trace("stream_chunk", "Received stream chunk", chunk_index=stream_chunk_count, chars=len(chunk or ""))
-                try:
-                    maybe = on_stream_chunk(chunk)
-                    if inspect.isawaitable(maybe):
-                        await maybe
-                except Exception:
-                    pass
-            raw_response = "".join(raw_chunks)
-            await emit_trace("model_done", "Streaming completion finished", stream_chunks=stream_chunk_count, chars=len(raw_response))
-        else:
-            raw_response = await self.provider.complete(prompt, system_prompt=system_prompt, history=history)
-            await emit_trace("model_done", "One-shot completion finished", chars=len(raw_response or ""))
+        if not raw_response:
+            if on_stream_chunk:
+                raw_chunks = []
+                async for chunk in self.provider.stream_complete(prompt, system_prompt=system_prompt, history=history):
+                    stream_chunk_count += 1
+                    raw_chunks.append(chunk)
+                    await emit_trace("stream_chunk", "Received stream chunk", chunk_index=stream_chunk_count, chars=len(chunk or ""))
+                    try:
+                        maybe = on_stream_chunk(chunk)
+                        if inspect.isawaitable(maybe):
+                            await maybe
+                    except Exception:
+                        pass
+                raw_response = "".join(raw_chunks)
+                await emit_trace("model_done", "Streaming completion finished", stream_chunks=stream_chunk_count, chars=len(raw_response))
+            else:
+                raw_response = await self.provider.complete(prompt, system_prompt=system_prompt, history=history)
+                await emit_trace("model_done", "One-shot completion finished", chars=len(raw_response or ""))
 
         # 4. Caveman Compression
         final_response = self.caveman.process_outgoing(raw_response, target=target)
@@ -133,8 +378,9 @@ class MotionAgent:
 
 def load_agent_from_config(config_path: str = "", provider_id: str | None = None) -> MotionAgent:
     """Load a MotionAgent using settings from config.yml (or config.example.yml) and .env."""
-    # Load .env file if present
-    config_dir = os.path.dirname(os.path.abspath(config_path)) if config_path else "."
+    # Load .env file if present. Anchored to REPO_DIR (not CWD) so `motion`
+    # finds its own .env regardless of which directory it's invoked from.
+    config_dir = os.path.dirname(os.path.abspath(config_path)) if config_path else REPO_DIR
     env_path = os.path.join(config_dir, ".env")
     if os.path.exists(env_path):
         with open(env_path) as f:
@@ -293,7 +539,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Motion Agent")
     parser.add_argument("--test", action="store_true", help="Run Caveman compression test (no model needed)")
     parser.add_argument("--list", action="store_true", help="List available providers")
-    parser.add_argument("--provider", type=str, default=None, help="Provider to use (e.g. ollama-cloud, ollama-cloud/gemma4:31b, claude-3-5)")
+    parser.add_argument("--provider", type=str, default=None, help="Provider to use (e.g. ollama-cloud, ollama-cloud/gemma4:31b, claude, openai)")
     parser.add_argument("--chat", action="store_true", help="Launch in chat REPL mode instead of TUI")
     sub = parser.add_subparsers(dest="command")
     auth_parser = sub.add_parser("auth", help="Manage provider API keys")

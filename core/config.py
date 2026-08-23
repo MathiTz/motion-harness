@@ -14,8 +14,17 @@ class AppConfig:
     providers: Dict[str, Any]
     default_provider: str
 
+# The installed location of the harness (parent of core/), not the caller's
+# CWD. `motion` can be pointed at any workspace directory, so config lookup
+# must not depend on where it happens to be invoked from.
+_REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
 class ConfigManager:
-    CONFIG_PATHS = ["config.yml", "config.example.yml"]
+    CONFIG_PATHS = [
+        os.path.join(_REPO_DIR, "config.yml"),
+        os.path.join(_REPO_DIR, "config.example.yml"),
+    ]
 
     def __init__(self, config_path: str = ""):
         if config_path:

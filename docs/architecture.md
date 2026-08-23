@@ -28,4 +28,6 @@ To combat token bloat in long agent-to-agent trajectories, the harness applies a
 - **Symmetry**: The compression is reversible, meaning the TUI can "decompress" the output back into natural language for the user, while the internal agents communicate in a dense, token-efficient format.
 
 ### 4. Parallel Orchestration
-The orchestrator manages task concurrency using an `asyncio` semaphore gated by the system's CPU core count. This prevents system lockup during massive parallel research tasks while maximizing throughput.
+The orchestrator (`core/orchestrator.py`) manages task concurrency using an `asyncio` semaphore gated by the system's CPU core count. This prevents system lockup during massive parallel research tasks while maximizing throughput.
+
+> **Status:** the `TaskManager` is instantiated at startup but not yet exposed through the TUI — there is no UI to spawn parallel tasks yet. This is on the [Roadmap](roadmap.md).

@@ -29,6 +29,11 @@ operate.
 - [x] Remove dead code — unused Tasks/Skills/KB/Memory/Settings panes and the
       hardcoded dashboard admin key.
 
+> **Note:** `TaskManager` (parallel orchestration) and `SkillSynthesizer`
+> (auto-crystallization) exist in `core/` but are **not yet exposed in the TUI** —
+> there's no UI to spawn parallel tasks or toggle auto-synthesis. Manual skills
+> work via `/skill save <name>`. Parallel orchestration is tracked in Phase 4.
+
 ## Phase 2 — Document & File Ingestion (next)
 
 Adopts the opencode model of **base64 data-URL content parts** with **capability
