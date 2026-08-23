@@ -446,6 +446,10 @@ class ChatComposer(Static, can_focus=True):
     }
     """
 
+    # Pastes longer than this are collapsed to a "[LINES N]" placeholder
+    # instead of dumping the raw text into the composer.
+    PASTE_COLLAPSE_THRESHOLD = 100
+
     def __init__(self, state: AppState, placeholder: str = "Ask anything…", **kwargs) -> None:
         super().__init__(**kwargs)
         self._state = state
@@ -453,6 +457,9 @@ class ChatComposer(Static, can_focus=True):
         self.value: str = ""
         self.cursor_position: int = 0
         self.meta_markup: str = ""
+        # Maps a "[LINES N]" placeholder literally embedded in self.value to
+        # the real pasted text it stands in for. Expanded back on submit.
+        self._pasted_blocks: dict[str, str] = {}
 
     def set_meta(self, markup: str) -> None:
         """Update the second (meta) row."""
@@ -538,12 +545,32 @@ class ChatComposer(Static, can_focus=True):
         self._invalidate_layout()
 
     def on_paste(self, event: events.Paste) -> None:
-        """Insert terminal bracketed-paste text at the current cursor."""
+        """Insert terminal bracketed-paste text at the current cursor.
+
+        Pastes over PASTE_COLLAPSE_THRESHOLD chars are collapsed to a
+        "[LINES N]" placeholder so a large paste doesn't blow up the
+        composer's display; the real text is substituted back in on submit.
+        """
         event.stop()
         event.prevent_default()
-        if event.text:
-            # Preserve multiline prompts while normalizing terminal line endings.
-            self._insert(event.text.replace("\r\n", "\n").replace("\r", "\n"))
+        if not event.text:
+            return
+        # Preserve multiline prompts while normalizing terminal line endings.
+        text = event.text.replace("\r\n", "\n").replace("\r", "\n")
+        if len(text) <= self.PASTE_COLLAPSE_THRESHOLD:
+            self._insert(text)
+            return
+        line_count = text.count("\n") + 1
+        placeholder = f"[LINES {line_count}]"
+        # Disambiguate same-line-count pastes within one draft so expansion
+        # on submit maps each placeholder back to its own original text.
+        suffix = 1
+        unique = placeholder
+        while unique in self._pasted_blocks:
+            suffix += 1
+            unique = f"[LINES {line_count}#{suffix}]"
+        self._pasted_blocks[unique] = text
+        self._insert(unique)
 
     def _delete(self) -> None:
         pos = self.cursor_position
@@ -558,10 +585,20 @@ class ChatComposer(Static, can_focus=True):
             self.cursor_position = pos - 1
             self._invalidate_layout()
 
+    def _expand_pasted_placeholders(self, text: str) -> str:
+        """Substitute "[LINES N]" placeholders back to their real pasted text."""
+        if not self._pasted_blocks:
+            return text
+        for placeholder, original in self._pasted_blocks.items():
+            text = text.replace(placeholder, original)
+        return text
+
     def on_key(self, event) -> None:
         if event.key == "enter" or event.key == "ctrl+s":
             event.prevent_default()
-            self.post_message(ComposerSubmitted(self.value))
+            expanded = self._expand_pasted_placeholders(self.value)
+            self._pasted_blocks.clear()
+            self.post_message(ComposerSubmitted(expanded))
         elif event.key == "up":
             event.prevent_default()
             self.value = self._state.history_previous(self.value)
