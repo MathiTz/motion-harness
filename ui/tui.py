@@ -1555,6 +1555,10 @@ class ChatPane(Vertical):
         super().__init__(**kwargs)
         self.state = state
         self._last_trace_stage: str = ""
+        # Parallel to self.state.message_queue: the "📥 Queued" notice widget
+        # mounted for each queued prompt, so it can be removed once that
+        # prompt is dequeued and starts running (or discarded on cancel).
+        self._queued_notices: list[SystemMessage] = []
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="chat_body"):
@@ -1840,10 +1844,12 @@ class ChatPane(Vertical):
             # alongside it. Queue instead - the running worker drains this
             # queue itself once its current turn finishes.
             self.state.message_queue.append(text)
-            log.mount(SystemMessage(
+            notice = SystemMessage(
                 f"📥 Queued (#{len(self.state.message_queue)}) — will run once the "
                 "current task finishes."
-            ))
+            )
+            self._queued_notices.append(notice)
+            log.mount(notice)
             log.scroll_end(animate=False)
             return
         live_response = AgentMessage("")
@@ -1900,6 +1906,9 @@ class ChatPane(Vertical):
                     if self.state.message_queue:
                         dropped = len(self.state.message_queue)
                         self.state.message_queue.clear()
+                        for notice in self._queued_notices:
+                            notice.remove()
+                        self._queued_notices.clear()
                         log.mount(SystemMessage(
                             f"⏹ Discarded {dropped} queued message(s) due to cancellation."
                         ))
@@ -1907,6 +1916,8 @@ class ChatPane(Vertical):
                 if not self.state.message_queue:
                     break
                 prompt = self.state.message_queue.pop(0)
+                if self._queued_notices:
+                    self._queued_notices.pop(0).remove()
                 live_response = AgentMessage("")
                 log.mount(live_response)
                 log.scroll_end(animate=False)
