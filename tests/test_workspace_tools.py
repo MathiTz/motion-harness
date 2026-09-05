@@ -345,3 +345,93 @@ async def test_agent_reports_progress_when_tool_call_cap_is_hit(tmp_path: Path) 
     # The files were actually written to disk despite the loop not finishing.
     assert (tmp_path / "file1.txt").read_text() == "content 1\n"
     assert (tmp_path / f"file{MAX_TOOL_STEPS}.txt").exists()
+
+
+class _FailsOnceThenPlansProvider:
+    """Simulates a model that emits a malformed tool call once, then recovers."""
+
+    class _Config:
+        provider_type = "local"
+
+    def __init__(self) -> None:
+        self.config = self._Config()
+        self.calls = 0
+
+    async def complete(self, prompt, system_prompt="", history=None, **kwargs):
+        self.calls += 1
+        if self.calls == 1:
+            return "<motion_tool>not valid json</motion_tool>"
+        return "Plan: fix the scraper and run it."
+
+    async def close(self):
+        pass
+
+
+async def test_agent_continues_after_malformed_tool_call(tmp_path: Path) -> None:
+    # Regression: tool errors should enrich context and let the loop continue,
+    # not hard-stop the interaction.
+    agent = MotionAgent(
+        ModelConfig(name="test", endpoint="http://localhost", provider_type="local"),
+        memory_path=":memory:",
+    )
+    agent.provider = _FailsOnceThenPlansProvider()
+    agent.retriever = _EmptyRetriever()
+
+    response = await agent.run(
+        "Review the scraper",
+        workspace=str(tmp_path),
+        agent_mode="plan",
+    )
+
+    assert response == "Plan: fix the scraper and run it."
+    assert agent.provider.calls == 2
+
+
+class _ToolFailsOnceThenWritesProvider:
+    """Simulates write_file failing once, then succeeding."""
+
+    class _Config:
+        provider_type = "local"
+
+    def __init__(self) -> None:
+        self.config = self._Config()
+        self.calls = 0
+
+    async def complete(self, prompt, system_prompt="", history=None, **kwargs):
+        self.calls += 1
+        if self.calls == 1:
+            return (
+                '<motion_tool>{"name":"write_file","arguments":'
+                '{"path":"../out.txt","content":"first\\n"}}</motion_tool>'
+            )
+        if self.calls == 2:
+            return (
+                '<motion_tool>{"name":"write_file","arguments":'
+                '{"path":"out.txt","content":"second\\n"}}</motion_tool>'
+            )
+        return "Created out.txt after retrying."
+
+    async def close(self):
+        pass
+
+
+async def test_agent_continues_after_tool_execution_error(tmp_path: Path) -> None:
+    # Regression: a tool execution error should be fed back as context so the
+    # model can recover, not stop the loop immediately.
+    agent = MotionAgent(
+        ModelConfig(name="test", endpoint="http://localhost", provider_type="local"),
+        memory_path=":memory:",
+    )
+    agent.provider = _ToolFailsOnceThenWritesProvider()
+    agent.retriever = _EmptyRetriever()
+
+    # First write fails because the path escapes the workspace.
+    response = await agent.run(
+        "Create out.txt",
+        workspace=str(tmp_path),
+        agent_mode="build",
+    )
+
+    assert "Created out.txt after retrying." in response
+    assert (tmp_path / "out.txt").read_text() == "second\n"
+    assert agent.provider.calls == 3

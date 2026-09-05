@@ -148,20 +148,15 @@ class MotionAgent:
             try:
                 tool_call = parse_tool_call(candidate)
             except Exception as exc:
-                # Stop immediately rather than letting the model retry blindly -
-                # a malformed tool call rarely self-corrects and previously
-                # could spiral into repeated failed attempts.
+                # Treat a malformed tool call as context, not a fatal stop.
+                # The model sees the error and can self-correct on the next turn,
+                # while the user stays in control via Esc.
                 await emit_trace("tool_error", "Invalid tool call", error=str(exc))
                 tool_history.extend([
                     {"role": "assistant", "content": candidate},
                     {"role": "user", "content": format_tool_result("invalid", error=str(exc))},
                 ])
-                completed = "\n".join(f"- {op}" for op in tool_operations)
-                tool_response = (
-                    f"Stopped: the model's tool call was invalid ({exc})."
-                    + (f"\n\nProgress before the error:\n{completed}" if completed else "")
-                )
-                break
+                continue
 
             if tool_call is None and not (candidate or "").strip() and used_tool:
                 empty_retries += 1
@@ -257,16 +252,10 @@ class MotionAgent:
                     {"role": "assistant", "content": candidate},
                     {"role": "user", "content": result_message},
                 ])
-                # Stop immediately on a tool execution error instead of letting
-                # the model retry blindly (previously it could spiral into
-                # repeated failed calls, e.g. re-reading the same file after a
-                # rejected list_files).
-                completed = "\n".join(f"- {op}" for op in tool_operations)
-                tool_response = (
-                    f"Stopped: `{name}` failed - {exc}"
-                    + (f"\n\nProgress before the error:\n{completed}" if completed else "")
-                )
-                break
+                # Treat tool execution errors as context rather than a hard stop.
+                # The model can see the failure and decide how to proceed; only
+                # the user (via Esc) interrupts the interaction.
+                continue
             tool_history.extend([
                 {"role": "assistant", "content": candidate},
                 {"role": "user", "content": result_message},
