@@ -124,6 +124,10 @@ After each call you will receive a <motion_tool_result> message. Continue callin
 until the requested work is complete, then give a concise final summary. Use relative
 paths. Do not invent tool results. Do not place tool calls in Markdown fences.
 
+CRITICAL: Always respond to the most recent user message above, not to earlier
+messages in the conversation. If the user changes topic or asks a follow-up,
+answer that follow-up directly.
+
 {goal_block}
 """.strip()
 

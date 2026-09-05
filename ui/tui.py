@@ -2041,9 +2041,12 @@ class ChatPane(Vertical):
         try:
             # Reference prior conversation so the model isn't left to guess:
             # the context query pulls related memory AND the last turns keep
-            # the model grounded in what was already said.
-            history = []
-            for p, r in (getattr(self.state, "conversation_turns", None) or []):
+            # the model grounded in what was already said. Cap history at the
+            # most recent 8 turns so a long session cannot drown out the latest
+            # user message.
+            history: list[dict[str, str]] = []
+            turns = (getattr(self.state, "conversation_turns", None) or [])[-8:]
+            for p, r in turns:
                 history.append({"role": "user", "content": p})
                 if r:
                     history.append({"role": "assistant", "content": r})
