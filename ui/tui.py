@@ -2001,15 +2001,43 @@ class ChatPane(Vertical):
             elif len(args) == 1 and isinstance(args[0], dict):
                 payload = args[0]
                 event_type = str(payload.get("stage") or payload.get("event") or "trace")
-            detail_parts: list[str] = []
+
+            def _tool_detail(prefix: str, tool: str, path: str, error: str = "") -> str:
+                subject = tool if tool else "tool"
+                detail = f"{subject} {prefix}"
+                if path:
+                    detail += f" on `{path}`"
+                if error:
+                    detail += f": {error}"
+                return detail
+
+            detail = ""
             if isinstance(payload, dict):
-                for key in ("query", "target", "provider", "model", "task_id", "status"):
-                    value = payload.get(key)
-                    if value is not None and value != "":
-                        detail_parts.append(f"{key}={value}")
-                        if len(detail_parts) >= 2:
-                            break
-            self._append_trace(event_type, ", ".join(detail_parts))
+                # Tool events: build a short, human-readable sentence.
+                if event_type in {"tool_start", "tool_done", "tool_error"}:
+                    tool = payload.get("tool", "")
+                    path = payload.get("path", "")
+                    error = payload.get("error", "")
+                    if event_type == "tool_start":
+                        detail = _tool_detail("about to run", tool, path)
+                    elif event_type == "tool_done":
+                        detail = _tool_detail("finished", tool, path)
+                    elif event_type == "tool_error":
+                        detail = _tool_detail("failed", tool, path, error)
+                elif event_type == "tool_progress":
+                    detail = payload.get("message", "")
+                else:
+                    detail = payload.get("message", "")
+                    if not detail:
+                        parts: list[str] = []
+                        for key in ("query", "target", "provider", "model", "task_id", "status"):
+                            value = payload.get(key)
+                            if value is not None and value != "":
+                                parts.append(f"{key}={value}")
+                                if len(parts) >= 2:
+                                    break
+                        detail = ", ".join(parts)
+            self._append_trace(event_type, detail[:220])
         try:
             # Reference prior conversation so the model isn't left to guess:
             # the context query pulls related memory AND the last turns keep

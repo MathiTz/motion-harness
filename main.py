@@ -212,10 +212,11 @@ class MotionAgent:
                 })
                 await emit_trace("tool_done", f"{name} blocked in plan mode", tool=name)
                 continue
+            path = str(arguments.get("path", "") or "").strip()
             try:
                 result = tools.execute(name, arguments)
                 result_message = format_tool_result(name, result=result)
-                path = str(result.get("path") or arguments.get("path") or "").strip()
+                path = str(result.get("path") or path or "").strip()
                 if name == "write_file":
                     operation = f"wrote `{path}`"
                     stream_text = f"wrote `{path}` ({result.get('bytes_written', 0)} bytes)"
@@ -239,7 +240,7 @@ class MotionAgent:
                     maybe = on_stream_chunk(f"_tool_ {stream_text}")
                     if inspect.isawaitable(maybe):
                         await maybe
-                await emit_trace("tool_done", f"Completed {name}", tool=name)
+                await emit_trace("tool_done", f"Completed {name}", tool=name, path=path)
             except Exception as exc:
                 operation = f"`{name}` failed: {exc}"
                 result_message = format_tool_result(name, error=str(exc))
@@ -247,7 +248,7 @@ class MotionAgent:
                     maybe = on_stream_chunk(f"_tool_ {operation}")
                     if inspect.isawaitable(maybe):
                         await maybe
-                await emit_trace("tool_error", f"{name} failed", tool=name, error=str(exc))
+                await emit_trace("tool_error", f"{name} failed", tool=name, path=path, error=str(exc))
                 tool_history.extend([
                     {"role": "assistant", "content": candidate},
                     {"role": "user", "content": result_message},
