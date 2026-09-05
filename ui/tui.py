@@ -446,6 +446,10 @@ class ChatComposer(Static, can_focus=True):
     }
     """
 
+    # Pastes longer than this are collapsed to a "[LINES N]" placeholder
+    # instead of dumping the raw text into the composer.
+    PASTE_COLLAPSE_THRESHOLD = 100
+
     def __init__(self, state: AppState, placeholder: str = "Ask anything…", **kwargs) -> None:
         super().__init__(**kwargs)
         self._state = state
@@ -453,6 +457,9 @@ class ChatComposer(Static, can_focus=True):
         self.value: str = ""
         self.cursor_position: int = 0
         self.meta_markup: str = ""
+        # Maps a "[LINES N]" placeholder literally embedded in self.value to
+        # the real pasted text it stands in for. Expanded back on submit.
+        self._pasted_blocks: dict[str, str] = {}
 
     def set_meta(self, markup: str) -> None:
         """Update the second (meta) row."""
@@ -538,12 +545,32 @@ class ChatComposer(Static, can_focus=True):
         self._invalidate_layout()
 
     def on_paste(self, event: events.Paste) -> None:
-        """Insert terminal bracketed-paste text at the current cursor."""
+        """Insert terminal bracketed-paste text at the current cursor.
+
+        Pastes over PASTE_COLLAPSE_THRESHOLD chars are collapsed to a
+        "[LINES N]" placeholder so a large paste doesn't blow up the
+        composer's display; the real text is substituted back in on submit.
+        """
         event.stop()
         event.prevent_default()
-        if event.text:
-            # Preserve multiline prompts while normalizing terminal line endings.
-            self._insert(event.text.replace("\r\n", "\n").replace("\r", "\n"))
+        if not event.text:
+            return
+        # Preserve multiline prompts while normalizing terminal line endings.
+        text = event.text.replace("\r\n", "\n").replace("\r", "\n")
+        if len(text) <= self.PASTE_COLLAPSE_THRESHOLD:
+            self._insert(text)
+            return
+        line_count = text.count("\n") + 1
+        placeholder = f"[LINES {line_count}]"
+        # Disambiguate same-line-count pastes within one draft so expansion
+        # on submit maps each placeholder back to its own original text.
+        suffix = 1
+        unique = placeholder
+        while unique in self._pasted_blocks:
+            suffix += 1
+            unique = f"[LINES {line_count}#{suffix}]"
+        self._pasted_blocks[unique] = text
+        self._insert(unique)
 
     def _delete(self) -> None:
         pos = self.cursor_position
@@ -558,10 +585,20 @@ class ChatComposer(Static, can_focus=True):
             self.cursor_position = pos - 1
             self._invalidate_layout()
 
+    def _expand_pasted_placeholders(self, text: str) -> str:
+        """Substitute "[LINES N]" placeholders back to their real pasted text."""
+        if not self._pasted_blocks:
+            return text
+        for placeholder, original in self._pasted_blocks.items():
+            text = text.replace(placeholder, original)
+        return text
+
     def on_key(self, event) -> None:
         if event.key == "enter" or event.key == "ctrl+s":
             event.prevent_default()
-            self.post_message(ComposerSubmitted(self.value))
+            expanded = self._expand_pasted_placeholders(self.value)
+            self._pasted_blocks.clear()
+            self.post_message(ComposerSubmitted(expanded))
         elif event.key == "up":
             event.prevent_default()
             self.value = self._state.history_previous(self.value)
@@ -1518,6 +1555,10 @@ class ChatPane(Vertical):
         super().__init__(**kwargs)
         self.state = state
         self._last_trace_stage: str = ""
+        # Parallel to self.state.message_queue: the "📥 Queued" notice widget
+        # mounted for each queued prompt, so it can be removed once that
+        # prompt is dequeued and starts running (or discarded on cancel).
+        self._queued_notices: list[SystemMessage] = []
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="chat_body"):
@@ -1803,10 +1844,12 @@ class ChatPane(Vertical):
             # alongside it. Queue instead - the running worker drains this
             # queue itself once its current turn finishes.
             self.state.message_queue.append(text)
-            log.mount(SystemMessage(
+            notice = SystemMessage(
                 f"📥 Queued (#{len(self.state.message_queue)}) — will run once the "
                 "current task finishes."
-            ))
+            )
+            self._queued_notices.append(notice)
+            log.mount(notice)
             log.scroll_end(animate=False)
             return
         live_response = AgentMessage("")
@@ -1831,6 +1874,10 @@ class ChatPane(Vertical):
             "interaction_start": "▶ interaction.start",
             "interaction_error": "❌ interaction.error",
             "interaction_cancelled": "⏹ interaction.cancelled",
+            "tool_start": "🔧 tool.start",
+            "tool_done": "✅ tool.done",
+            "tool_error": "❌ tool.error",
+            "tool_progress": "📶 tool.progress",
         }
         label = label_map.get(event_type, event_type)
         safe_detail = (detail or "").replace("[", "\\[").replace("]", "\\]")
@@ -1863,6 +1910,9 @@ class ChatPane(Vertical):
                     if self.state.message_queue:
                         dropped = len(self.state.message_queue)
                         self.state.message_queue.clear()
+                        for notice in self._queued_notices:
+                            notice.remove()
+                        self._queued_notices.clear()
                         log.mount(SystemMessage(
                             f"⏹ Discarded {dropped} queued message(s) due to cancellation."
                         ))
@@ -1870,6 +1920,8 @@ class ChatPane(Vertical):
                 if not self.state.message_queue:
                     break
                 prompt = self.state.message_queue.pop(0)
+                if self._queued_notices:
+                    self._queued_notices.pop(0).remove()
                 live_response = AgentMessage("")
                 log.mount(live_response)
                 log.scroll_end(animate=False)
@@ -1949,21 +2001,52 @@ class ChatPane(Vertical):
             elif len(args) == 1 and isinstance(args[0], dict):
                 payload = args[0]
                 event_type = str(payload.get("stage") or payload.get("event") or "trace")
-            detail_parts: list[str] = []
+
+            def _tool_detail(prefix: str, tool: str, path: str, error: str = "") -> str:
+                subject = tool if tool else "tool"
+                detail = f"{subject} {prefix}"
+                if path:
+                    detail += f" on `{path}`"
+                if error:
+                    detail += f": {error}"
+                return detail
+
+            detail = ""
             if isinstance(payload, dict):
-                for key in ("query", "target", "provider", "model", "task_id", "status"):
-                    value = payload.get(key)
-                    if value is not None and value != "":
-                        detail_parts.append(f"{key}={value}")
-                        if len(detail_parts) >= 2:
-                            break
-            self._append_trace(event_type, ", ".join(detail_parts))
+                # Tool events: build a short, human-readable sentence.
+                if event_type in {"tool_start", "tool_done", "tool_error"}:
+                    tool = payload.get("tool", "")
+                    path = payload.get("path", "")
+                    error = payload.get("error", "")
+                    if event_type == "tool_start":
+                        detail = _tool_detail("about to run", tool, path)
+                    elif event_type == "tool_done":
+                        detail = _tool_detail("finished", tool, path)
+                    elif event_type == "tool_error":
+                        detail = _tool_detail("failed", tool, path, error)
+                elif event_type == "tool_progress":
+                    detail = payload.get("message", "")
+                else:
+                    detail = payload.get("message", "")
+                    if not detail:
+                        parts: list[str] = []
+                        for key in ("query", "target", "provider", "model", "task_id", "status"):
+                            value = payload.get(key)
+                            if value is not None and value != "":
+                                parts.append(f"{key}={value}")
+                                if len(parts) >= 2:
+                                    break
+                        detail = ", ".join(parts)
+            self._append_trace(event_type, detail[:220])
         try:
             # Reference prior conversation so the model isn't left to guess:
             # the context query pulls related memory AND the last turns keep
-            # the model grounded in what was already said.
-            history = []
-            for p, r in (getattr(self.state, "conversation_turns", None) or []):
+            # the model grounded in what was already said. Cap history at the
+            # most recent 8 turns so a long session cannot drown out the latest
+            # user message.
+            history: list[dict[str, str]] = []
+            turns = (getattr(self.state, "conversation_turns", None) or [])[-8:]
+            for p, r in turns:
                 history.append({"role": "user", "content": p})
                 if r:
                     history.append({"role": "assistant", "content": r})
@@ -2137,6 +2220,7 @@ class MotionTUI(App):
     BINDINGS = [
         Binding("ctrl+q", "quit", "Quit"),
         Binding("ctrl+c", "request_cancel", "Cancel"),
+        Binding("escape", "request_cancel", "Cancel"),
     ]
 
     def __init__(self, model_config: Optional[ModelConfig] = None, provider_id: str = "", workspace: str = WORKSPACE, **kwargs) -> None:

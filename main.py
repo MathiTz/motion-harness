@@ -148,11 +148,10 @@ class MotionAgent:
             try:
                 tool_call = parse_tool_call(candidate)
             except Exception as exc:
+                # Treat a malformed tool call as context, not a fatal stop.
+                # The model sees the error and can self-correct on the next turn,
+                # while the user stays in control via Esc.
                 await emit_trace("tool_error", "Invalid tool call", error=str(exc))
-                tool_response = (
-                    "Your tool call was invalid. Correct it and call one tool using "
-                    "the exact <motion_tool> JSON format."
-                )
                 tool_history.extend([
                     {"role": "assistant", "content": candidate},
                     {"role": "user", "content": format_tool_result("invalid", error=str(exc))},
@@ -192,10 +191,32 @@ class MotionAgent:
                 tool=name,
                 path=str(arguments.get("path", "")),
             )
+            # Plan mode rejects writes by design. Treat this as a soft policy
+            # nudge rather than a tool_error, so the model can recover with a
+            # real plan instead of the loop stopping on the first write attempt.
+            if agent_mode == "plan" and name in {"write_file", "replace_in_file"}:
+                result_message = format_tool_result(name, error="write tools are disabled in plan mode")
+                tool_history.extend([
+                    {"role": "assistant", "content": candidate},
+                    {"role": "user", "content": result_message},
+                ])
+                tool_history.append({
+                    "role": "user",
+                    "content": (
+                        "You are in read-only Plan mode - file writes are disabled here. "
+                        "Do not retry write_file/replace_in_file. Respond now with a concrete "
+                        "written plan: proposed files/directories, the approach for each major "
+                        "piece, and any libraries you'd use. The user will review this and switch "
+                        "you to Build mode to implement it."
+                    ),
+                })
+                await emit_trace("tool_done", f"{name} blocked in plan mode", tool=name)
+                continue
+            path = str(arguments.get("path", "") or "").strip()
             try:
                 result = tools.execute(name, arguments)
                 result_message = format_tool_result(name, result=result)
-                path = str(result.get("path") or arguments.get("path") or "").strip()
+                path = str(result.get("path") or path or "").strip()
                 if name == "write_file":
                     operation = f"wrote `{path}`"
                     stream_text = f"wrote `{path}` ({result.get('bytes_written', 0)} bytes)"
@@ -219,35 +240,27 @@ class MotionAgent:
                     maybe = on_stream_chunk(f"_tool_ {stream_text}")
                     if inspect.isawaitable(maybe):
                         await maybe
-                await emit_trace("tool_done", f"Completed {name}", tool=name)
+                await emit_trace("tool_done", f"Completed {name}", tool=name, path=path)
             except Exception as exc:
                 operation = f"`{name}` failed: {exc}"
                 result_message = format_tool_result(name, error=str(exc))
-                tool_operations.append(operation)
                 if on_stream_chunk:
                     maybe = on_stream_chunk(f"_tool_ {operation}")
                     if inspect.isawaitable(maybe):
                         await maybe
-                await emit_trace("tool_error", f"{name} failed", tool=name, error=str(exc))
+                await emit_trace("tool_error", f"{name} failed", tool=name, path=path, error=str(exc))
+                tool_history.extend([
+                    {"role": "assistant", "content": candidate},
+                    {"role": "user", "content": result_message},
+                ])
+                # Treat tool execution errors as context rather than a hard stop.
+                # The model can see the failure and decide how to proceed; only
+                # the user (via Esc) interrupts the interaction.
+                continue
             tool_history.extend([
                 {"role": "assistant", "content": candidate},
                 {"role": "user", "content": result_message},
             ])
-
-            if agent_mode == "plan" and name in {"write_file", "replace_in_file"}:
-                # Plan mode always rejects writes (see WorkspaceTools._require_write_access).
-                # Steer the model away from retrying the same blocked call and toward
-                # actually answering with a concrete plan.
-                tool_history.append({
-                    "role": "user",
-                    "content": (
-                        "You are in read-only Plan mode - file writes are disabled here. "
-                        "Do not retry write_file/replace_in_file. Respond now with a concrete "
-                        "written plan: proposed files/directories, the approach for each major "
-                        "piece, and any libraries you'd use. The user will review this and switch "
-                        "you to Build mode to implement it."
-                    ),
-                })
 
             if (
                 agent_mode == "build"
