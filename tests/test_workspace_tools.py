@@ -158,6 +158,20 @@ def test_parse_tool_call_generic_guard_catches_unknown_envelope_names() -> None:
         )
 
 
+def test_parse_tool_call_does_not_flag_prose_with_html_and_json_keys() -> None:
+    # Regression: after inspecting files, a model naturally summarizes using
+    # words like "arguments", "path", and "content" alongside HTML-like "<".
+    # The old broad leak guard ("<" anywhere + JSON keys anywhere) treated this
+    # as a malformed tool call and aborted the turn. It must return None so the
+    # prose is displayed as the final answer.
+    response = (
+        "I inspected the project. web/app.py has a route that takes "
+        '`path` and `content` as arguments, and arguments={"x": 1}. '
+        "The HTML uses `<form>` tags. Let me know what you'd like to change."
+    )
+    assert parse_tool_call(response) is None
+
+
 class _ToolCallingProvider:
     class _Config:
         provider_type = "local"

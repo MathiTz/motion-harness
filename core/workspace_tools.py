@@ -44,6 +44,27 @@ TOOL_MARKERS = (
 )
 
 
+def _has_unknown_tool_envelope(raw: str) -> bool:
+    """Catch unknown XML-like envelopes wrapping tool-shaped JSON.
+
+    The old heuristic ("<" anywhere plus JSON-looking keys anywhere) falsely
+    flagged natural-language responses that mentioned "arguments", "path", or
+    "content" near an HTML tag. Only fire when there is a real <tag>...</tag>
+    pair around a JSON object with tool-shaped keys.
+    """
+    for match in re.finditer(
+        r"<([a-zA-Z_][\w:-]*)[^>]*>\s*(\{.*?\})\s*</\1\s*>",
+        raw,
+        re.DOTALL,
+    ):
+        payload = match.group(2)
+        if ('"name"' in payload and '"arguments"' in payload) or (
+            '"path"' in payload and '"content"' in payload
+        ):
+            return True
+    return False
+
+
 class WorkspaceToolError(ValueError):
     """Raised when a tool request is invalid or escapes the workspace."""
 
@@ -234,13 +255,7 @@ def parse_tool_call(text: str) -> tuple[str, dict[str, Any]] | None:
             # invents next, a tag wrapping something shaped like our tool
             # JSON (write_file's path+content, or a name/arguments envelope)
             # is never a legitimate final answer.
-            or (
-                "<" in raw
-                and (
-                    '"arguments"' in raw
-                    or ('"path"' in raw and '"content"' in raw)
-                )
-            )
+            or _has_unknown_tool_envelope(raw)
         )
         if looks_like_leaked_tool_call:
             raise WorkspaceToolError("malformed filesystem tool envelope")

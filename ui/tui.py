@@ -1874,6 +1874,10 @@ class ChatPane(Vertical):
             "interaction_start": "▶ interaction.start",
             "interaction_error": "❌ interaction.error",
             "interaction_cancelled": "⏹ interaction.cancelled",
+            "tool_start": "🔧 tool.start",
+            "tool_done": "✅ tool.done",
+            "tool_error": "❌ tool.error",
+            "tool_progress": "📶 tool.progress",
         }
         label = label_map.get(event_type, event_type)
         safe_detail = (detail or "").replace("[", "\\[").replace("]", "\\]")
@@ -2185,6 +2189,7 @@ class MotionTUI(App):
     BINDINGS = [
         Binding("ctrl+q", "quit", "Quit"),
         Binding("ctrl+c", "request_cancel", "Cancel"),
+        Binding("escape", "request_cancel", "Cancel"),
     ]
 
     def __init__(self, model_config: Optional[ModelConfig] = None, provider_id: str = "", workspace: str = WORKSPACE, **kwargs) -> None:
