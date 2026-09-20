@@ -116,15 +116,46 @@ async def test_scrape_ollama_cloud_models_returns_empty_on_error():
 
 
 async def test_update_ollama_cloud_models_merges_into_catalog():
+    # Seed an empty list so the refresh actually scrapes (a populated list is
+    # authoritative and is left alone).
+    models = BUILTIN_CATALOG["ollama-cloud"]["models"]
+    original = dict(models)
+    models.clear()
+
     fake_resp = MagicMock()
     fake_resp.text = '<a href="/library/brand-new-model">New</a>'
 
-    with patch("core.catalog.httpx.AsyncClient") as MockClient:
-        client = MockClient.return_value
-        client.get = AsyncMock(return_value=fake_resp)
-        client.__aenter__ = AsyncMock(return_value=client)
-        client.__aexit__ = AsyncMock(return_value=False)
-        added = await update_ollama_cloud_models()
+    try:
+        with patch("core.catalog.httpx.AsyncClient") as MockClient:
+            client = MockClient.return_value
+            client.get = AsyncMock(return_value=fake_resp)
+            client.__aenter__ = AsyncMock(return_value=client)
+            client.__aexit__ = AsyncMock(return_value=False)
+            added = await update_ollama_cloud_models()
 
-    assert added >= 1
-    assert "brand-new-model" in BUILTIN_CATALOG["ollama-cloud"]["models"]
+        assert added >= 1
+        assert "brand-new-model" in BUILTIN_CATALOG["ollama-cloud"]["models"]
+    finally:
+        models.clear()
+        models.update(original)
+
+
+async def test_update_ollama_cloud_models_skips_when_populated():
+    # A pre-populated model list is authoritative: refresh must not scrape.
+    models = BUILTIN_CATALOG["ollama-cloud"]["models"]
+    original = dict(models)
+    models["some-existing-model"] = {"temperature": 0.7, "max_tokens": 4096}
+
+    try:
+        with patch("core.catalog.httpx.AsyncClient") as MockClient:
+            client = MockClient.return_value
+            client.get = AsyncMock()
+            client.__aenter__ = AsyncMock(return_value=client)
+            client.__aexit__ = AsyncMock(return_value=False)
+            added = await update_ollama_cloud_models()
+
+        assert added == 0
+        client.get.assert_not_called()
+    finally:
+        models.clear()
+        models.update(original)

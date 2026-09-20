@@ -1095,6 +1095,7 @@ class CommandPalette(Screen):
         super().__init__(**kwargs)
         self._main = main_screen
         self._commands: list[tuple[str, str]] = []
+        self._selection_index: Optional[int] = None
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(id="palette_box"):
@@ -1115,77 +1116,113 @@ class CommandPalette(Screen):
             ("Copy last code block", "copy_code"),
             ("Toggle context panel", "context"),
             ("Manage API keys (/auth)", "auth"),
+            ("Close menu (Esc)", "close"),
         ]
         lv = self.query_one("#palette_list", ListView)
         for label, _ in self._commands:
             lv.append(ListItem(Label(label)))
-        # Items are appended after the ListView itself mounts, so Textual's
-        # own initial-highlight logic never runs - set it explicitly so the
-        # first row is highlighted and ready for arrow-key/Enter selection.
         if lv.children:
             lv.index = 0
+            self._selection_index = 0
         self.query_one("#palette_input", Input).focus()
 
     def on_input_changed(self, event: Input.Changed) -> None:
         query = event.value.strip().lower()
         lv = self.query_one("#palette_list", ListView)
-        lv.clear()
-        for label, action in self._commands:
-            if query in label.lower():
-                lv.append(ListItem(Label(label)))
-        if lv.children:
-            lv.index = 0
+        first_visible: Optional[int] = None
+        for idx, (label, _) in enumerate(self._commands):
+            visible = query in label.lower()
+            item = lv.children[idx]
+            item.display = visible
+            if visible and first_visible is None:
+                first_visible = idx
+        # Re-clamp the highlight: with display-toggling, Textual keeps the
+        # stale index, so point it at the first *visible* row. If nothing
+        # matches, clear the highlight so Enter has no target.
+        self._selection_index = first_visible
+        if first_visible is None:
+            lv.index = None
+        else:
+            lv.index = first_visible
 
     def action_nav_up(self) -> None:
         # The Input owns focus while typing, so arrow keys land here instead
-        # of on the (sibling, unfocused) ListView - forward them manually.
-        self.query_one("#palette_list", ListView).action_cursor_up()
+        # of on the (sibling, unfocused) ListView - forward them manually,
+        # stepping only over visible (non-filtered) rows.
+        self._move_selection(-1)
 
     def action_nav_down(self) -> None:
-        self.query_one("#palette_list", ListView).action_cursor_down()
+        self._move_selection(1)
+
+    def _move_selection(self, delta: int) -> None:
+        lv = self.query_one("#palette_list", ListView)
+        order = [i for i, (label, _) in enumerate(self._commands) if lv.children[i].display]
+        if not order:
+            self._selection_index = None
+            lv.index = None
+            return
+        current = self._selection_index
+        if current is None or current not in order:
+            idx = order[0] if delta >= 0 else order[-1]
+        else:
+            pos = order.index(current)
+            pos = max(0, min(len(order) - 1, pos + delta))
+            idx = order[pos]
+        self._selection_index = idx
+        lv.index = idx
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
-        if event.item is None:
+        item = event.item
+        if item is None:
             return
-        self._activate_label(event.item)
+        if not item.display:
+            return
+        self._activate_label(item)
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         # Enter in the input box: pick the highlighted / first filtered command.
         lv = self.query_one("#palette_list", ListView)
-        item = lv.highlighted_child or (lv.children[0] if lv.children else None)
-        if item is not None:
-            event.stop()
-            self._activate_label(item)
+        item = lv.highlighted_child
+        if item is None or not item.display:
+            return
+        event.stop()
+        self._activate_label(item)
 
     def _activate_label(self, item) -> None:
-        try:
-            label = str(item.query_one(Label).content)
-        except Exception:
-            return
-        for lab, action in self._commands:
-            if lab == label:
-                self._run(action)
-                return
+        # Match by position rather than parsing the row's label text, which
+        # isn't portable across Textual versions (Label.content only exists in
+        # newer releases - older ones store it as Label._content). Items are
+        # appended in _commands order and we track the highlight index, so
+        # resolve straight to the command by index.
+        idx = self._selection_index
+        if idx is not None and 0 <= idx < len(self._commands):
+            self._run(self._commands[idx][1])
 
     def _run(self, action: str) -> None:
-        # Actions that push their own screen keep the palette open underneath,
-        # so Esc returns to the command menu. Direct toggles close it first.
-        if action in ("model", "auth"):
+        # Subscreen-opening commands (model, auth, theme, shortcuts) push
+        # their own screen with the palette left open underneath, so Esc from
+        # that submenu returns to the command palette instead of dumping you
+        # back to the chat - handy for picking a different command. Immediate
+        # toggles (agent/trace/thinking/copy/context) run right away and
+        # close the palette first.
+        if action in ("model", "auth", "theme", "shortcuts"):
             if action == "model":
                 self._main.action_open_model_dialog()
             elif action == "auth":
                 self._main.action_open_auth()
+            elif action == "theme":
+                self._main.action_open_theme_menu()
+            elif action == "shortcuts":
+                self._main.action_show_shortcuts()
             return
         self.app.pop_screen()
+        if action == "close":
+            return
         if action == "agent":
             try:
                 self._main.query_one(ChatPane)._toggle_agent_mode()
             except Exception:
                 pass
-        elif action == "theme":
-            self._main.action_open_theme_menu()
-        elif action == "shortcuts":
-            self._main.action_show_shortcuts()
         elif action == "trace":
             try:
                 self._main.query_one(ChatPane).action_toggle_trace_panel()
@@ -1268,6 +1305,8 @@ class ModelDialog(Screen):
         super().__init__(**kwargs)
         self.state = state
         self._entries: list[tuple[str, str]] = []  # (label, full_id)
+        self._selection_index: Optional[int] = None
+        self._populated = False  # ensures rows are mounted exactly once
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(id="model_box"):
@@ -1281,21 +1320,78 @@ class ModelDialog(Screen):
         # editing config.yml) since this ConfigManager was last loaded.
         self.state.config_manager.reload()
         self._entries = self._collect_entries()
-        self._render_models("")
+        self.run_worker(self._populate_models(), thread=False)
         self.query_one("#model_input", Input).focus()
-        # Kick off a refresh so cloud model lists stay current.
-        self.action_refresh_models()
+
+    def _render_models(self, query: str) -> None:
+        q = query.strip().lower()
+        lv = self.query_one("#model_list", ListView)
+        # Populate/rebuild the rows when they don't match the current entry
+        # set (first frame from on_mount, or after a refresh added models).
+        # append()/clear() are async in Textual 3.x, so rows are added via the
+        # awaitable _set_model_rows_async() (called from the populate/rebuild
+        # helpers); live typing afterwards only toggles display (never
+        # re-mounts), which preserves the ListView's selection.
+        if not lv.children:
+            return
+        first_visible: Optional[int] = None
+        for idx in range(min(len(self._entries), len(lv.children))):
+            label, _full = self._entries[idx]
+            visible = (not q) or q in label.lower()
+            lv.children[idx].display = visible
+            if visible and first_visible is None:
+                first_visible = idx
+        if first_visible is None:
+            self._selection_index = None
+            lv.index = None
+        else:
+            self._selection_index = first_visible
+            lv.index = first_visible
+
+    async def _set_model_rows_async(self, rows: list[ModelOption]) -> None:
+        """Awaitable variant of row population for Textual 3.x and 8.x.
+
+        Textual 3.x (used by the `motion` launcher) only accepts one ListItem
+        per append() call, unlike 8.x which accepts a splat, so we loop and
+        await each one to ensure children are present when we re-render."""
+        lv = self.query_one("#model_list", ListView)
+        if lv.children:
+            await lv.clear()
+        for row in rows:
+            await lv.append(row)
+
+    async def _populate_models(self) -> None:
+        """Mount the entry rows once, awaiting so children exist before the
+        first filter is applied; then re-render to set the initial highlight."""
+        if self._populated:
+            return
+        self._populated = True
+        await self._set_model_rows_async([ModelOption(label, full) for label, full in self._entries])
+        query = self.query_one("#model_input", Input).value
+        self._render_models(query)
+
+    async def _rebuild_models(self, query: str) -> None:
+        """Rebuild the row set from the current entries (after a refresh or
+        screen resume where the model list may have changed), then re-render."""
+        lv = self.query_one("#model_list", ListView)
+        if lv.children:
+            await self._set_model_rows_async([ModelOption(label, full) for label, full in self._entries])
+        self._render_models(query)
 
     def on_screen_resume(self) -> None:
         """Re-sync the list whenever this dialog becomes active again, e.g.
         after returning from AddModelScreen."""
         self.state.config_manager.reload()
         self._entries = self._collect_entries()
+        # on_mount's _populate_models owns the very first population; resume
+        # (which also fires on first push) must not race it and re-append.
+        if not self._populated:
+            return
         try:
             query = self.query_one("#model_input", Input).value
         except Exception:
             query = ""
-        self._render_models(query)
+        self.run_worker(self._rebuild_models(query), thread=False)
 
     def action_add_model(self) -> None:
         self.app.push_screen(AddModelScreen(self.state))
@@ -1313,7 +1409,7 @@ class ModelDialog(Screen):
         # immediately and survive restarts.
         self.state.config_manager.reload()
         self._entries = self._collect_entries()
-        self._render_models(self.query_one("#model_input", Input).value)
+        await self._rebuild_models(self.query_one("#model_input", Input).value)
         if added:
             self.notify(f"Found {added} new model{'s' if added != 1 else ''}")
         else:
@@ -1332,39 +1428,44 @@ class ModelDialog(Screen):
                 entries.append((name, pid))
         return entries
 
-    def _render_models(self, query: str) -> None:
-        q = query.strip().lower()
-        lv = self.query_one("#model_list", ListView)
-        lv.clear()
-        for label, full in self._entries:
-            if q and q not in label.lower():
-                continue
-            lv.append(ModelOption(label, full))
-        # Items are appended after the ListView mounts, so Textual's own
-        # initial-highlight never fires - highlight the first match explicitly.
-        if lv.children:
-            lv.index = 0
-
     def on_input_changed(self, event: Input.Changed) -> None:
         self._render_models(event.value)
 
     def action_nav_up(self) -> None:
         # The search Input owns focus, so forward arrow keys to the sibling
-        # ListView, which never receives them directly while unfocused.
-        self.query_one("#model_list", ListView).action_cursor_up()
+        # ListView, which never receives them directly while unfocused -
+        # stepping only over visible (non-filtered) rows.
+        self._move_selection(-1)
 
     def action_nav_down(self) -> None:
-        self.query_one("#model_list", ListView).action_cursor_down()
+        self._move_selection(1)
+
+    def _move_selection(self, delta: int) -> None:
+        lv = self.query_one("#model_list", ListView)
+        order = [i for i in range(len(lv.children)) if lv.children[i].display]
+        if not order:
+            lv.index = None
+            return
+        current = getattr(self, "_selection_index", None)
+        if current is None or current not in order:
+            idx = order[0] if delta >= 0 else order[-1]
+        else:
+            pos = order.index(current)
+            pos = max(0, min(len(order) - 1, pos + delta))
+            idx = order[pos]
+        self._selection_index = idx
+        lv.index = idx
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         lv = self.query_one("#model_list", ListView)
-        item = lv.highlighted_child or (lv.children[0] if lv.children else None)
-        if item is not None:
-            event.stop()
-            self._select(item)
+        item = lv.highlighted_child
+        if item is None or not item.display:
+            return
+        event.stop()
+        self._select(item)
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
-        if event.item is not None:
+        if event.item is not None and event.item.display:
             self._select(event.item)
 
     def _select(self, item) -> None:
@@ -1387,7 +1488,9 @@ class ModelDialog(Screen):
             try:
                 for screen in self.app.screen_stack:
                     if isinstance(screen, MainScreen):
-                        screen.query_one(ChatPane)._refresh_meta()
+                        pane = screen.query_one(ChatPane)
+                        pane._refresh_meta()
+                        pane._refresh_connection_line()
                         screen.refresh_session_footer()
                         break
             except Exception:
@@ -2123,14 +2226,29 @@ class ChatPane(Vertical):
             self._set_trace_panel_visible(True)
 
     def on_mount(self) -> None:
-        name = self.state.agent.provider.config.name if self.state.agent else "?"
         log = self.query_one("#chat_log", VerticalScroll)
-        log.mount(SystemMessage(f"⚡ Motion Harness — connected to {name}"))
+        log.mount(SystemMessage("⚡ Motion Harness", id="connection_line"))
         log.mount(SystemMessage("Tip: Ctrl+K commands · Ctrl+O model · Tab agent · F7 thinking · F8 trace · F9 copy · /skill save <name>"))
-        self._append_trace("session_start", f"provider={name}")
+        self._refresh_connection_line()
+        self._append_trace("session_start", f"provider={self.state.current_provider_id}")
         self._set_trace_panel_visible(self.state.show_trace_panel)
         self._refresh_meta()
         self.query_one("#chat_input", ChatComposer).focus()
+
+    def _refresh_connection_line(self) -> None:
+        """Update the intro "connected to" line whenever the provider/model
+        changes, so it never lags behind a reconnect."""
+        try:
+            line = self.query_one("#connection_line", SystemMessage)
+        except Exception:
+            return
+        pid = self.state.current_provider_id or "?"
+        base, _, model = pid.partition("/")
+        if model:
+            text = f"⚡ Motion Harness — connected to {base} · {model}"
+        else:
+            text = f"⚡ Motion Harness — connected to {pid}"
+        line.update(text)
 
     def _set_trace_panel_visible(self, visible: bool) -> None:
         self.state.show_trace_panel = visible
@@ -2345,14 +2463,23 @@ class ChatPane(Vertical):
         agent = self.state.agent_mode
         agent_label = agent.capitalize()
         provider_id = self.state.current_provider_id or ""
-        model = self.state.agent.provider.config.name if self.state.agent else "?"
+        # current_provider_id holds "provider/model"; split so the meta line
+        # shows the actual model and the bare provider. ModelConfig.name is
+        # the provider's display name, so it can't substitute for the model.
+        if "/" in provider_id:
+            base_provider, model = provider_id.split("/", 1)
+        else:
+            base_provider, model = provider_id, ""
         agent_color = self._agent_color()
         # Resolve CSS variable name to a concrete hex color for Rich markup.
         theme = self.app.get_theme(self.app.theme)
         agent_hex = self._agent_hex(theme, agent_color)
+        model_disp = model or (self.state.agent.provider.config.name if self.state.agent else "?")
+        provider_disp = base_provider or provider_id
         # opencode-style meta: "Build · deepseek-v4-flash ollama-cloud"
         meta_markup = (
-            f"[{agent_hex} bold]{agent_label}[/] [dim]·[/] {model} [dim]{provider_id}[/]"
+            f"[{agent_hex} bold]{agent_label}[/] [dim]·[/] {model_disp} "
+            f"[dim]{provider_disp}[/]"
         )
         composer.set_meta(meta_markup)
         # Tint the left border of the composer with the agent color.
