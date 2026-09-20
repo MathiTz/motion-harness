@@ -18,12 +18,68 @@ class ModelConfig:
     options: Dict[str, Any] = field(default_factory=dict)
 
 
+def _openai_usage(data: Dict[str, Any]) -> Optional[Dict[str, int]]:
+    """Extract real token usage from an OpenAI-compatible chat response."""
+    usage = data.get("usage") if isinstance(data, dict) else None
+    if not isinstance(usage, dict):
+        return None
+    prompt = usage.get("prompt_tokens")
+    completion = usage.get("completion_tokens")
+    if prompt is None and completion is None:
+        return None
+    prompt = int(prompt or 0)
+    completion = int(completion or 0)
+    return {
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": int(usage.get("total_tokens") or (prompt + completion)),
+    }
+
+
+def _anthropic_usage(data: Dict[str, Any]) -> Optional[Dict[str, int]]:
+    """Extract real token usage from an Anthropic Messages API response."""
+    usage = data.get("usage") if isinstance(data, dict) else None
+    if not isinstance(usage, dict):
+        return None
+    prompt = usage.get("input_tokens")
+    completion = usage.get("output_tokens")
+    if prompt is None and completion is None:
+        return None
+    prompt = int(prompt or 0)
+    completion = int(completion or 0)
+    return {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": prompt + completion}
+
+
+def _ollama_usage(data: Dict[str, Any]) -> Optional[Dict[str, int]]:
+    """Extract real token usage from an Ollama /api/chat response."""
+    if not isinstance(data, dict):
+        return None
+    prompt = data.get("prompt_eval_count")
+    completion = data.get("eval_count")
+    if prompt is None and completion is None:
+        return None
+    prompt = int(prompt or 0)
+    completion = int(completion or 0)
+    return {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": prompt + completion}
+
+
 class BaseProvider(ABC):
     """Abstract Base Class for all model providers."""
 
     def __init__(self, config: ModelConfig):
         self.config = config
-        self._client = httpx.AsyncClient(timeout=30.0)
+        # Configurable timeout (seconds) via options.timeout. Default is 30s so
+        # long reasoning/tool loops have enough time; lower it if you want to
+        # fail faster on a stalled provider.
+        timeout_seconds = float(config.options.get("timeout", 30.0))
+        self._client = httpx.AsyncClient(timeout=timeout_seconds)
+        # Real token usage from the most recently completed request, when the
+        # provider's response includes it (OpenAI/Anthropic/Ollama all do).
+        # None means "no usage reported for the last call" - callers should
+        # fall back to a char-based estimate in that case. This replaces
+        # fabricated len(text)//4 estimates with real provider-reported
+        # counts wherever available (#10 in the issue report).
+        self.last_usage: Optional[Dict[str, int]] = None
 
     @abstractmethod
     async def complete(self, prompt: str, system_prompt: str = "", history: Optional[List[Dict[str, str]]] = None, **kwargs) -> str:
@@ -70,6 +126,7 @@ class LocalProvider(BaseProvider):
         resp = await self._client.post(url, json=payload)
         resp.raise_for_status()
         data = resp.json()
+        self.last_usage = _ollama_usage(data)
         return data.get("message", {}).get("content", "")
 
     async def stream_complete(self, prompt: str, system_prompt: str = "", history: Optional[List[Dict[str, str]]] = None, **kwargs) -> AsyncIterator[str]:
@@ -101,6 +158,8 @@ class LocalProvider(BaseProvider):
                     data = json.loads(line)
                 except Exception:
                     continue
+                if data.get("done"):
+                    self.last_usage = _ollama_usage(data)
                 chunk = data.get("message", {}).get("content", "")
                 if chunk:
                     yield chunk
@@ -220,6 +279,7 @@ class CloudProvider(BaseProvider):
         resp = await self._client.post(url, json=payload, headers=headers)
         resp.raise_for_status()
         data = resp.json()
+        self.last_usage = _anthropic_usage(data)
         return data.get("content", [{}])[0].get("text", "")
 
     async def _openai_complete(self, prompt: str, system_prompt: str, api_key: str, history: Optional[List[Dict[str, str]]] = None) -> str:
@@ -246,6 +306,7 @@ class CloudProvider(BaseProvider):
         resp = await self._client.post(url, json=payload, headers=headers)
         resp.raise_for_status()
         data = resp.json()
+        self.last_usage = _openai_usage(data)
         return data.get("choices", [{}])[0].get("message", {}).get("content", "")
 
 
@@ -273,6 +334,7 @@ class ProxyProvider(BaseProvider):
         resp = await self._client.post(url, json=payload, headers=headers)
         resp.raise_for_status()
         data = resp.json()
+        self.last_usage = _openai_usage(data)
         return data.get("choices", [{}])[0].get("message", {}).get("content", "")
 
     async def stream_complete(self, prompt: str, system_prompt: str = "", history: Optional[List[Dict[str, str]]] = None, **kwargs) -> AsyncIterator[str]:

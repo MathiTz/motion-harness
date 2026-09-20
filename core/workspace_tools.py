@@ -4,8 +4,17 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 from pathlib import Path
 from typing import Any
+
+# Default ceiling on how long a run_command invocation may take. Kept
+# generous since build tasks may run tests/installs, but bounded so a
+# hanging command can't stall the tool loop forever.
+DEFAULT_COMMAND_TIMEOUT = 120
+# Truncate captured output so a chatty command doesn't blow up the context
+# window the same way read_file's `limit` protects against huge files.
+COMMAND_OUTPUT_LIMIT = 20_000
 
 
 # `\s*` right after `<` (and after `<` before `/`) tolerates stray spaces
@@ -22,7 +31,7 @@ MOTION_ENVELOPE_PATTERN = re.compile(
     re.DOTALL | re.IGNORECASE,
 )
 DIRECT_TOOL_PATTERN = re.compile(
-    r"<\s*(?P<name>list_files|read_file|write_file|replace_in_file)\b[^>]*>"
+    r"<\s*(?P<name>list_files|read_file|write_file|replace_in_file|run_command)\b[^>]*>"
     r"\s*(?P<arguments>\{.*?\})\s*<\s*/\s*(?P=name)\b[^>]*>",
     re.DOTALL,
 )
@@ -41,6 +50,7 @@ TOOL_MARKERS = (
     "read_file",
     "write_file",
     "replace_in_file",
+    "run_command",
 )
 
 
@@ -69,19 +79,41 @@ class WorkspaceToolError(ValueError):
     """Raised when a tool request is invalid or escapes the workspace."""
 
 
+class OutOfWorkspaceError(WorkspaceToolError):
+    """Raised when a tool request resolves to a path outside the workspace
+    and hasn't been explicitly approved. Carries the resolved path so
+    callers can offer the user a permission prompt instead of a hard
+    failure (FR in the issue report)."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        super().__init__(f"path escapes the workspace: {path}")
+
+
 class WorkspaceTools:
     """Small, deterministic filesystem toolset restricted to one workspace."""
 
-    def __init__(self, workspace: str | Path, read_only: bool = False) -> None:
+    def __init__(
+        self,
+        workspace: str | Path,
+        read_only: bool = False,
+        allowed_paths: "set[Path] | None" = None,
+    ) -> None:
         self.root = Path(workspace).expanduser().resolve()
         self.read_only = read_only
+        # Paths outside self.root that the user has explicitly approved this
+        # session (see OutOfWorkspaceError / MotionAgent.run's
+        # on_permission_request). Passed in by the caller so approvals
+        # persist across turns, not just within one run() call.
+        self.allowed_paths: set[Path] = allowed_paths if allowed_paths is not None else set()
 
     @property
     def instructions(self) -> str:
         mode = "READ-ONLY plan mode" if self.read_only else "BUILD mode with write access"
         write_tools = "" if self.read_only else """
 - write_file: {"path": "relative/path", "content": "complete file contents"}
-- replace_in_file: {"path": "relative/path", "old": "exact text", "new": "replacement text"}"""
+- replace_in_file: {"path": "relative/path", "old": "exact text", "new": "replacement text"}
+- run_command: {"command": "pytest -q"} — runs a shell command in the workspace root (build mode only), returns exit_code/stdout/stderr"""
         if self.read_only:
             # Plan mode must never be told to write files - write_file/replace_in_file
             # are unavailable and calling them always fails. Instead of leaving the
@@ -137,9 +169,20 @@ answer that follow-up directly.
         candidate = (self.root / raw_path).resolve()
         try:
             candidate.relative_to(self.root)
-        except ValueError as exc:
-            raise WorkspaceToolError("path escapes the workspace") from exc
+        except ValueError:
+            if candidate in self.allowed_paths:
+                return candidate
+            raise OutOfWorkspaceError(candidate)
         return candidate
+
+    def _display_path(self, path: Path) -> str:
+        """Format a resolved path for tool results: relative to the workspace
+        when inside it (the common case), or absolute for an
+        explicitly-approved out-of-workspace path."""
+        try:
+            return str(path.relative_to(self.root))
+        except ValueError:
+            return str(path)
 
     def execute(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(arguments, dict):
@@ -154,6 +197,9 @@ answer that follow-up directly.
         if name == "replace_in_file":
             self._require_write_access()
             return self._replace_in_file(arguments)
+        if name == "run_command":
+            self._require_write_access()
+            return self._run_command(arguments)
         raise WorkspaceToolError(f"unknown tool: {name}")
 
     def _require_write_access(self) -> None:
@@ -168,7 +214,7 @@ answer that follow-up directly.
         if not directory.is_dir():
             raise WorkspaceToolError("list_files path must be a directory")
         files = [
-            str(path.relative_to(self.root))
+            self._display_path(path)
             for path in directory.rglob(pattern)
             if path.is_file()
         ]
@@ -181,7 +227,7 @@ answer that follow-up directly.
         content = path.read_text(encoding="utf-8", errors="replace")
         limit = 200_000
         return {
-            "path": str(path.relative_to(self.root)),
+            "path": self._display_path(path),
             "content": content[:limit],
             "truncated": len(content) > limit,
         }
@@ -194,7 +240,7 @@ answer that follow-up directly.
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
         return {
-            "path": str(path.relative_to(self.root)),
+            "path": self._display_path(path),
             "bytes_written": len(content.encode("utf-8")),
         }
 
@@ -215,7 +261,48 @@ answer that follow-up directly.
                 f"old text must occur exactly once; found {occurrences} occurrences"
             )
         path.write_text(content.replace(old, new, 1), encoding="utf-8")
-        return {"path": str(path.relative_to(self.root)), "replacements": 1}
+        return {"path": self._display_path(path), "replacements": 1}
+
+    def _run_command(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Run a shell command in the workspace root (build mode only).
+
+        Uses the same access boundary as write_file/replace_in_file - no
+        extra approval prompt or allowlist beyond that, per the agreed
+        safety model. Output is captured (not streamed) and truncated to
+        keep the tool result within a reasonable size for the model.
+        """
+        command = arguments.get("command")
+        if not isinstance(command, str) or not command.strip():
+            raise WorkspaceToolError("command must be a non-empty string")
+        timeout = arguments.get("timeout") or DEFAULT_COMMAND_TIMEOUT
+        try:
+            timeout = float(timeout)
+        except (TypeError, ValueError):
+            timeout = DEFAULT_COMMAND_TIMEOUT
+        try:
+            proc = subprocess.run(
+                command,
+                shell=True,
+                cwd=str(self.root),
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise WorkspaceToolError(
+                f"command timed out after {timeout:.0f}s: {command}"
+            ) from exc
+        except Exception as exc:
+            raise WorkspaceToolError(f"failed to run command: {exc}") from exc
+        stdout = (proc.stdout or "")
+        stderr = (proc.stderr or "")
+        return {
+            "command": command,
+            "exit_code": proc.returncode,
+            "stdout": stdout[:COMMAND_OUTPUT_LIMIT],
+            "stderr": stderr[:COMMAND_OUTPUT_LIMIT],
+            "truncated": len(stdout) > COMMAND_OUTPUT_LIMIT or len(stderr) > COMMAND_OUTPUT_LIMIT,
+        }
 
 
 def parse_tool_call(text: str) -> tuple[str, dict[str, Any]] | None:

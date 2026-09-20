@@ -31,11 +31,13 @@ Launch:  python main.py              → TUI (default)
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 import os
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 from rich.console import Group
 from rich.markdown import Markdown as RichMarkdown
 from rich.style import Style
@@ -68,6 +70,7 @@ from ui.themes import ThemeRegistry
 
 WORKSPACE = os.getenv("MOTION_WORKSPACE", os.getcwd())
 KB_DIR = os.path.join(WORKSPACE, "knowledge")
+logger = logging.getLogger(__name__)
 
 
 def _suppress_logging() -> None:
@@ -99,6 +102,10 @@ class AppState:
         self.ui_mode: str = "conservative"
         self.show_activity_rail: bool = True
         self.show_trace_panel: bool = False
+        # One-time nudge shown on the first agent turn pointing at F8/trace,
+        # since the trace panel exists but is easy to miss (#9 in the issue
+        # report: user found it by accident after asking for a checklist).
+        self.seen_first_turn_hint: bool = False
         # When enabled, the agent's intermediate tool-loop responses (its
         # visible "thinking" between tool calls) are shown inline in the chat
         # log, not just summarized in the trace panel. Off by default since
@@ -116,6 +123,18 @@ class AppState:
         self.last_agent_response: str = ""
         self.prompt_history: list[str] = []  # submitted prompts for up/down recall
         self._history_index: int = -1
+        # Paths outside the workspace root the user has approved "for this
+        # session" via the out-of-workspace PermissionScreen (FR in the
+        # issue report). Holds resolved Path objects (matching what
+        # WorkspaceTools compares against) and is passed to
+        # MotionAgent.run() on every turn so approvals persist without
+        # re-prompting.
+        self.allowed_workspace_paths: set[Path] = set()
+        # Per-session JSONL transcript path (prompt + full response per
+        # turn), created lazily on first write. Only used when the user has
+        # opted in via track_interactions in config.yml (asked once, at
+        # first launch - see TrackingConsentScreen).
+        self._interaction_log_path: Optional[Path] = None
         self.session_context: str = ""  # rolling, bounded summary of the session
         self._context_turns: list[tuple[str, str]] = []  # recent turns used to build context
         self.conversation_turns: list[tuple[str, str]] = []  # (prompt, response)
@@ -264,6 +283,33 @@ class AppState:
         """Return all providers: (pid, name, models, is_default, has_key)."""
         cm = ConfigManager()
         return cm.list_providers()
+
+    def log_interaction(self, prompt: str, response: str) -> None:
+        """Append one turn (prompt + full response) to this session's JSONL
+        transcript, if the user has opted into tracking.
+
+        A no-op when track_interactions is unset/False. One file per app
+        run, created lazily under <workspace>/sessions/ on the first logged
+        turn, named by the session's start timestamp.
+        """
+        if not self.config_manager.get("track_interactions"):
+            return
+        try:
+            if self._interaction_log_path is None:
+                sessions_dir = Path(WORKSPACE) / "sessions"
+                sessions_dir.mkdir(parents=True, exist_ok=True)
+                ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+                self._interaction_log_path = sessions_dir / f"{ts}.jsonl"
+            record = {
+                "timestamp": datetime.now().isoformat(),
+                "provider": self.current_provider_id,
+                "prompt": prompt,
+                "response": response,
+            }
+            with open(self._interaction_log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
 
 
 def _slugify_name(name: str) -> str:
@@ -711,11 +757,17 @@ class ProviderSelectScreen(Screen):
                 yield Label("↑↓ Navigate · Enter Select · Q Quit", id="provider_status")
 
     def on_mount(self) -> None:
+        # Config may have changed on disk since this ConfigManager was last
+        # loaded (manual edit, or the agent itself writing config.yml).
+        self.state.config_manager.reload()
         self.query_one("#provider_box", Container).border_title = " Motion Harness "
         providers = self.state.config_manager.list_providers()
         lv = self.query_one("#provider_list", ListView)
         for pid, name, models, is_default, has_key in providers:
             lv.append(ProviderOption(pid, name, models, is_default, has_key))
+        if lv.children:
+            lv.index = 0
+        lv.focus()
 
     def action_select(self) -> None:
         lv = self.query_one("#provider_list", ListView)
@@ -727,7 +779,31 @@ class ProviderSelectScreen(Screen):
             return
 
         if not option.has_key:
-            self.notify("🔒 No API key configured for this provider", severity="warning")
+            # Instead of a dead-end warning, let the user enter a key right
+            # here and reconnect automatically once it's saved.
+            provider_id = option.provider_id
+            models = option.models
+
+            def _connect_after_auth() -> None:
+                self.state.config_manager.reload()
+                if not self.state.config_manager.has_api_key(provider_id):
+                    self.notify("No API key saved; provider still locked.", severity="warning")
+                    return
+                provider_cfg = self.state.config_manager.get_provider_config(provider_id)
+                default_model = provider_cfg.get("default_model") or (models[0] if models else None)
+                full_id = f"{provider_id}/{default_model}" if default_model else provider_id
+                try:
+                    self.state.reconnect(full_id)
+                except Exception as e:
+                    self.notify(f"Connection failed: {e}", severity="error")
+                    return
+                try:
+                    self.state.config_manager.set("last_provider", full_id)
+                except Exception:
+                    pass
+                self.app.switch_screen(MainScreen(self.state))
+
+            self.app.push_screen(AuthInputScreen(provider_id, self.state, on_saved=_connect_after_auth))
             return
 
         provider_id = option.provider_id
@@ -741,6 +817,10 @@ class ProviderSelectScreen(Screen):
         except Exception as e:
             self.notify(f"Connection failed: {e}", severity="error")
             return
+        try:
+            self.state.config_manager.set("last_provider", full_id)
+        except Exception:
+            pass
 
         self.app.switch_screen(MainScreen(self.state))
 
@@ -803,6 +883,30 @@ class ContextPanel(Vertical):
     def compose(self) -> ComposeResult:
         yield Label("Context", id="context_header")
         yield VerticalScroll(id="context_body")
+
+    def update_current_steps(self, lines: list[str]) -> None:
+        """Live-update a "Current turn" checklist fed by the same tool-op
+        lines shown inline in chat, so the user has an at-a-glance view of
+        what step the agent is on without needing to open the trace panel
+        (#9 in the issue report: no checklist to follow along with).
+        """
+        try:
+            container = self.query_one("#context_body", VerticalScroll)
+        except Exception:
+            return
+        try:
+            existing = self.query_one("#current_steps_block", Static)
+        except Exception:
+            existing = None
+        if not lines:
+            if existing is not None:
+                existing.remove()
+            return
+        text = "[bold]Current turn[/]\n" + "\n".join(f"• {s}" for s in lines[-8:])
+        if existing is not None:
+            existing.update(text)
+        else:
+            container.mount(Static(text, id="current_steps_block", classes="context_turn"), before=0)
 
     def refresh_context(self) -> None:
         container = self.query_one("#context_body", VerticalScroll)
@@ -983,6 +1087,8 @@ class CommandPalette(Screen):
 
     BINDINGS = [
         Binding("escape", "dismiss_palette", "Close", priority=True),
+        Binding("up", "nav_up", "Up", show=False),
+        Binding("down", "nav_down", "Down", show=False),
     ]
 
     def __init__(self, main_screen: "MainScreen", **kwargs) -> None:
@@ -994,24 +1100,30 @@ class CommandPalette(Screen):
         with VerticalScroll(id="palette_box"):
             yield Input(placeholder="Type a command…", id="palette_input")
             yield ListView(id="palette_list")
-            yield Label("Esc to close", id="palette_hint")
+            yield Label("↑↓ Navigate · Esc to close", id="palette_hint")
 
     def on_mount(self) -> None:
         self.query_one("#palette_box", VerticalScroll).border_title = " Commands "
         self._commands = [
             ("Switch model…", "model"),
             ("Toggle agent (build/plan)", "agent"),
-            ("Toggle theme", "theme"),
+            ("Theme menu", "theme"),
             ("Show shortcuts", "shortcuts"),
             ("Toggle trace panel", "trace"),
             ("Toggle agent thinking", "thinking"),
             ("Copy last response", "copy"),
+            ("Copy last code block", "copy_code"),
             ("Toggle context panel", "context"),
             ("Manage API keys (/auth)", "auth"),
         ]
         lv = self.query_one("#palette_list", ListView)
         for label, _ in self._commands:
             lv.append(ListItem(Label(label)))
+        # Items are appended after the ListView itself mounts, so Textual's
+        # own initial-highlight logic never runs - set it explicitly so the
+        # first row is highlighted and ready for arrow-key/Enter selection.
+        if lv.children:
+            lv.index = 0
         self.query_one("#palette_input", Input).focus()
 
     def on_input_changed(self, event: Input.Changed) -> None:
@@ -1021,6 +1133,16 @@ class CommandPalette(Screen):
         for label, action in self._commands:
             if query in label.lower():
                 lv.append(ListItem(Label(label)))
+        if lv.children:
+            lv.index = 0
+
+    def action_nav_up(self) -> None:
+        # The Input owns focus while typing, so arrow keys land here instead
+        # of on the (sibling, unfocused) ListView - forward them manually.
+        self.query_one("#palette_list", ListView).action_cursor_up()
+
+    def action_nav_down(self) -> None:
+        self.query_one("#palette_list", ListView).action_cursor_down()
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         if event.item is None:
@@ -1037,7 +1159,7 @@ class CommandPalette(Screen):
 
     def _activate_label(self, item) -> None:
         try:
-            label = str(item.query_one(Label).renderable)
+            label = str(item.query_one(Label).content)
         except Exception:
             return
         for lab, action in self._commands:
@@ -1061,7 +1183,7 @@ class CommandPalette(Screen):
             except Exception:
                 pass
         elif action == "theme":
-            self._main.action_toggle_theme()
+            self._main.action_open_theme_menu()
         elif action == "shortcuts":
             self._main.action_show_shortcuts()
         elif action == "trace":
@@ -1077,6 +1199,11 @@ class CommandPalette(Screen):
         elif action == "copy":
             try:
                 self._main.query_one(ChatPane).action_copy_last_response()
+            except Exception:
+                pass
+        elif action == "copy_code":
+            try:
+                self._main.query_one(ChatPane).action_copy_last_code_block()
             except Exception:
                 pass
         elif action == "context":
@@ -1132,6 +1259,9 @@ class ModelDialog(Screen):
     BINDINGS = [
         Binding("escape", "dismiss_model", "Close", priority=True),
         Binding("ctrl+r", "refresh_models", "Refresh", priority=True),
+        Binding("ctrl+n", "add_model", "Add model", priority=True),
+        Binding("up", "nav_up", "Up", show=False),
+        Binding("down", "nav_down", "Down", show=False),
     ]
 
     def __init__(self, state: AppState, **kwargs) -> None:
@@ -1144,24 +1274,44 @@ class ModelDialog(Screen):
             yield Label("Select Model", id="model_title")
             yield Input(placeholder="Search models…", id="model_input")
             yield ListView(id="model_list")
-            yield Label("Type to filter · Enter to select · Ctrl+R refresh · Esc to close", id="model_hint")
+            yield Label("Type to filter · ↑↓ Navigate · Enter to select · Ctrl+R refresh · Ctrl+N add custom model · Esc to close", id="model_hint")
 
     def on_mount(self) -> None:
+        # Config may have changed on disk (manual edit, or the agent itself
+        # editing config.yml) since this ConfigManager was last loaded.
+        self.state.config_manager.reload()
         self._entries = self._collect_entries()
         self._render_models("")
         self.query_one("#model_input", Input).focus()
         # Kick off a refresh so cloud model lists stay current.
         self.action_refresh_models()
 
+    def on_screen_resume(self) -> None:
+        """Re-sync the list whenever this dialog becomes active again, e.g.
+        after returning from AddModelScreen."""
+        self.state.config_manager.reload()
+        self._entries = self._collect_entries()
+        try:
+            query = self.query_one("#model_input", Input).value
+        except Exception:
+            query = ""
+        self._render_models(query)
+
+    def action_add_model(self) -> None:
+        self.app.push_screen(AddModelScreen(self.state))
+
     @work
     async def action_refresh_models(self) -> None:
-        """Scrape the latest Ollama Cloud model list and re-render."""
+        """Scrape the latest Ollama Cloud model list, persist it, and re-render."""
         self.notify("Refreshing model list…")
         try:
             from core.catalog import update_ollama_cloud_models
             added = await update_ollama_cloud_models()
         except Exception:
             added = 0
+        # Reload the running config manager so newly persisted models appear
+        # immediately and survive restarts.
+        self.state.config_manager.reload()
         self._entries = self._collect_entries()
         self._render_models(self.query_one("#model_input", Input).value)
         if added:
@@ -1190,9 +1340,21 @@ class ModelDialog(Screen):
             if q and q not in label.lower():
                 continue
             lv.append(ModelOption(label, full))
+        # Items are appended after the ListView mounts, so Textual's own
+        # initial-highlight never fires - highlight the first match explicitly.
+        if lv.children:
+            lv.index = 0
 
     def on_input_changed(self, event: Input.Changed) -> None:
         self._render_models(event.value)
+
+    def action_nav_up(self) -> None:
+        # The search Input owns focus, so forward arrow keys to the sibling
+        # ListView, which never receives them directly while unfocused.
+        self.query_one("#model_list", ListView).action_cursor_up()
+
+    def action_nav_down(self) -> None:
+        self.query_one("#model_list", ListView).action_cursor_down()
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         lv = self.query_one("#model_list", ListView)
@@ -1211,7 +1373,25 @@ class ModelDialog(Screen):
         full_id = item.full_id
         try:
             self.state.reconnect(full_id)
+            # Persist so the next `motion` launch reconnects to this model
+            # instead of always falling back to the catalog default.
+            try:
+                self.state.config_manager.set("last_provider", full_id)
+            except Exception:
+                pass
             self.notify(f"Switched to {full_id}")
+            # self.app.screen is this dialog (or the command palette beneath
+            # it if opened that way) - not MainScreen - so the old lookup
+            # never matched and the composer meta / footer never refreshed.
+            # Walk the whole screen stack to find MainScreen instead.
+            try:
+                for screen in self.app.screen_stack:
+                    if isinstance(screen, MainScreen):
+                        screen.query_one(ChatPane)._refresh_meta()
+                        screen.refresh_session_footer()
+                        break
+            except Exception:
+                pass
         except Exception as e:
             self.notify(f"Connection failed: {e}", severity="error")
         self.app.pop_screen()
@@ -1226,6 +1406,250 @@ class ModelOption(ListItem):
     def __init__(self, label: str, full_id: str, **kwargs) -> None:
         self.full_id = full_id
         super().__init__(Label(label), **kwargs)
+
+
+class AddModelScreen(Screen):
+    """Add a custom model to a provider (fixes: only config.yml models were
+    usable, with no in-app way to add one - #7 in the issue report)."""
+
+    CSS = """
+    AddModelScreen {
+        align: center middle;
+    }
+    #addmodel_box {
+        width: 72;
+        border: round $border;
+        background: $surface;
+        padding: 1 2;
+    }
+    #addmodel_title {
+        color: $text;
+        text-style: bold;
+        text-align: center;
+        margin-bottom: 1;
+    }
+    #addmodel_label {
+        color: $text-muted;
+        margin-top: 1;
+    }
+    .addmodel_input {
+        margin-bottom: 1;
+        border: solid $border;
+    }
+    #addmodel_hint {
+        color: $text-muted;
+        text-align: center;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "dismiss_add_model", "Close", priority=True),
+    ]
+
+    def __init__(self, state: AppState, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.state = state
+
+    def compose(self) -> ComposeResult:
+        with Container(id="addmodel_box"):
+            yield Label("Add Custom Model", id="addmodel_title")
+            yield Label("Provider id (e.g. ollama-cloud):", id="addmodel_label")
+            yield Input(placeholder="provider id…", id="addmodel_provider_input", classes="addmodel_input")
+            yield Label("Model name:", id="addmodel_label_2")
+            yield Input(placeholder="model name…", id="addmodel_model_input", classes="addmodel_input")
+            yield Label("Enter in either field to save · Esc to cancel", id="addmodel_hint")
+
+    def on_mount(self) -> None:
+        # Pre-fill the provider field with the currently connected provider
+        # for convenience (the common case: adding another model for it).
+        base_provider = (self.state.current_provider_id or "").split("/", 1)[0]
+        if base_provider:
+            self.query_one("#addmodel_provider_input", Input).value = base_provider
+        self.query_one("#addmodel_model_input", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        provider_id = self.query_one("#addmodel_provider_input", Input).value.strip()
+        model_name = self.query_one("#addmodel_model_input", Input).value.strip()
+        if not provider_id or not model_name:
+            self.notify("Provide both a provider id and a model name.", severity="warning")
+            return
+        try:
+            self.state.config_manager.add_model(provider_id, model_name)
+        except Exception as e:
+            self.notify(f"Could not add model: {e}", severity="error")
+            return
+        self.notify(f"Added {model_name} to {provider_id}")
+        self.app.pop_screen()
+
+    def action_dismiss_add_model(self) -> None:
+        self.app.pop_screen()
+
+
+class PermissionOption(ListItem):
+    """A choice row in the out-of-workspace permission prompt."""
+
+    def __init__(self, label: str, choice: str, **kwargs) -> None:
+        self.choice = choice
+        super().__init__(Label(label), **kwargs)
+
+
+class PermissionScreen(Screen):
+    """Modal asking the user to approve a tool call that would touch a path
+    outside the workspace root, instead of the previous hard failure (FR in
+    the issue report: "não acessa coisa fora do workspace, tinha que pedir
+    permissão"). Returned via ``dismiss()`` so callers can ``await
+    app.push_screen_wait(PermissionScreen(path))``.
+    """
+
+    CSS = """
+    PermissionScreen {
+        align: center middle;
+    }
+    #permission_box {
+        width: 76;
+        border: round $warning;
+        background: $surface;
+        padding: 1 2;
+    }
+    #permission_title {
+        color: $warning;
+        text-style: bold;
+        margin-bottom: 1;
+    }
+    #permission_path {
+        color: $text;
+        margin-bottom: 1;
+    }
+    #permission_list {
+        height: auto;
+        border: blank;
+        padding: 0 1;
+    }
+    #permission_hint {
+        color: $text-muted;
+        text-align: center;
+        margin-top: 1;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "deny", "Deny", priority=True),
+    ]
+
+    def __init__(self, path: str, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.path = path
+
+    def compose(self) -> ComposeResult:
+        with Container(id="permission_box"):
+            yield Label("⚠ Out-of-workspace access requested", id="permission_title")
+            yield Static(f"[dim]{self.path}[/]", id="permission_path")
+            yield ListView(id="permission_list")
+            yield Label("Enter to choose · Esc to deny", id="permission_hint")
+
+    def on_mount(self) -> None:
+        lv = self.query_one("#permission_list", ListView)
+        lv.append(PermissionOption("Allow once", "once"))
+        lv.append(PermissionOption("Allow for this session", "session"))
+        lv.append(PermissionOption("Deny", "deny"))
+        lv.index = 0
+        lv.focus()
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        choice = event.item.choice if isinstance(event.item, PermissionOption) else "deny"
+        self.dismiss(choice)
+
+    def action_deny(self) -> None:
+        self.dismiss("deny")
+
+
+class TrackingOption(ListItem):
+    """A choice row in the interaction-tracking consent prompt."""
+
+    def __init__(self, label: str, choice: bool, **kwargs) -> None:
+        self.choice = choice
+        super().__init__(Label(label), **kwargs)
+
+
+class TrackingConsentScreen(Screen):
+    """One-time, first-launch prompt asking whether to log full session
+    interactions (prompt + full response) to a local JSONL file.
+
+    Shown once (config_manager.get("track_interactions") is None means it
+    has never been answered); the choice is persisted to config.yml so this
+    never asks again. Reachable later via the command palette ("Toggle
+    interaction tracking") to change the choice.
+    """
+
+    CSS = """
+    TrackingConsentScreen {
+        align: center middle;
+    }
+    #tracking_box {
+        width: 76;
+        border: round $border;
+        background: $surface;
+        padding: 1 2;
+    }
+    #tracking_title {
+        color: $text;
+        text-style: bold;
+        margin-bottom: 1;
+    }
+    #tracking_body {
+        color: $text-muted;
+        margin-bottom: 1;
+    }
+    #tracking_list {
+        height: auto;
+        border: blank;
+        padding: 0 1;
+    }
+    #tracking_hint {
+        color: $text-muted;
+        text-align: center;
+        margin-top: 1;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "decline", "No thanks", priority=True),
+    ]
+
+    def compose(self) -> ComposeResult:
+        with Container(id="tracking_box"):
+            yield Label("💾 Track session interactions?", id="tracking_title")
+            yield Static(
+                "Save every prompt + full response this session to a local "
+                "JSONL file (sessions/<timestamp>.jsonl) for your own review "
+                "or later context reuse. Nothing leaves your machine. You can "
+                "change this anytime from the command palette.",
+                id="tracking_body",
+            )
+            yield ListView(id="tracking_list")
+            yield Label("Enter to choose · Esc = No thanks", id="tracking_hint")
+
+    def on_mount(self) -> None:
+        lv = self.query_one("#tracking_list", ListView)
+        lv.append(TrackingOption("Yes, track this and future sessions", True))
+        lv.append(TrackingOption("No thanks", False))
+        lv.index = 0
+        lv.focus()
+
+    def _choose(self, enabled: bool) -> None:
+        try:
+            self.app.state.config_manager.set("track_interactions", enabled)
+        except Exception:
+            pass
+        self.notify("Interaction tracking " + ("enabled" if enabled else "disabled"))
+        self.app.pop_screen()
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        choice = event.item.choice if isinstance(event.item, TrackingOption) else False
+        self._choose(choice)
+
+    def action_decline(self) -> None:
+        self._choose(False)
 
 
 class AuthInputScreen(Screen):
@@ -1261,10 +1685,17 @@ class AuthInputScreen(Screen):
         Binding("escape", "dismiss_auth", "Close", priority=True),
     ]
 
-    def __init__(self, provider: str, state: AppState, **kwargs) -> None:
+    def __init__(
+        self,
+        provider: str,
+        state: AppState,
+        on_saved: Optional[Callable[[], None]] = None,
+        **kwargs,
+    ) -> None:
         super().__init__(**kwargs)
         self.provider = provider
         self.state = state
+        self.on_saved = on_saved
 
     def compose(self) -> ComposeResult:
         with Container(id="auth_box"):
@@ -1284,6 +1715,11 @@ class AuthInputScreen(Screen):
         auth.set_key(self.provider, key)
         self.notify(f"Saved API key for {self.provider}")
         self.app.pop_screen()
+        if self.on_saved:
+            try:
+                self.on_saved()
+            except Exception:
+                pass
 
     def action_dismiss_auth(self) -> None:
         self.app.pop_screen()
@@ -1339,12 +1775,15 @@ class AuthListScreen(Screen):
             yield Label("Enter to set a key · Esc to close", id="authlist_hint")
 
     def on_mount(self) -> None:
+        self.state.config_manager.reload()
         self.query_one("#authlist_box", VerticalScroll).border_title = " Auth "
         lv = self.query_one("#authlist_list", ListView)
         for pid, name, models, is_default, has_key in self.state.config_manager.list_providers():
             status = "🔑" if has_key else "🔒"
             lv.append(AuthOption(pid, name, has_key, status))
-        self.query_one("#authlist_list", ListView).focus()
+        if lv.children:
+            lv.index = 0
+        lv.focus()
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         option = event.item
@@ -1366,6 +1805,102 @@ class AuthOption(ListItem):
         super().__init__(Label(label), **kwargs)
 
 
+class ThemeOption(ListItem):
+    """A selectable theme row in the theme menu."""
+
+    def __init__(self, theme_id: str, **kwargs) -> None:
+        self.theme_id = theme_id
+        super().__init__(Label(theme_id), **kwargs)
+
+
+class ThemeMenuScreen(Screen):
+    """Theme picker menu (replaces blind Ctrl+T cycling - #2 in the issue
+    report). Live-previews the highlighted theme; Enter confirms (and
+    persists it), Esc reverts to whatever theme was active on open."""
+
+    CSS = """
+    ThemeMenuScreen {
+        align: center middle;
+    }
+    #theme_box {
+        width: 48;
+        max-height: 80%;
+        border: round $border;
+        background: $surface;
+        padding: 1 2;
+        scrollbar-size: 1 1;
+    }
+    #theme_title {
+        color: $text;
+        text-style: bold;
+        text-align: center;
+        margin-bottom: 1;
+    }
+    #theme_list {
+        height: auto;
+        max-height: 60%;
+        scrollbar-size: 1 1;
+        padding: 0 1;
+        border: blank;
+    }
+    #theme_hint {
+        color: $text-muted;
+        text-align: center;
+        margin-top: 1;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel", priority=True),
+        Binding("enter", "confirm", "Apply", priority=True),
+    ]
+
+    def __init__(self, main_screen: "MainScreen", **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._main = main_screen
+        self._original_theme = main_screen.state.current_theme
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll(id="theme_box"):
+            yield Label("Select Theme", id="theme_title")
+            yield ListView(id="theme_list")
+            yield Label("↑↓ preview · Enter to apply · Esc to cancel", id="theme_hint")
+
+    def on_mount(self) -> None:
+        lv = self.query_one("#theme_list", ListView)
+        themes = ThemeRegistry.theme_ids()
+        for idx, tid in enumerate(themes):
+            lv.append(ThemeOption(tid))
+            if tid == self._original_theme:
+                lv.index = idx
+        if lv.index is None and lv.children:
+            lv.index = 0
+        lv.focus()
+
+    def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
+        if isinstance(event.item, ThemeOption):
+            self.app.theme = event.item.theme_id
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        if isinstance(event.item, ThemeOption):
+            self._main.set_theme(event.item.theme_id)
+            self.notify(f"Theme → {event.item.theme_id}")
+        self.app.pop_screen()
+
+    def action_confirm(self) -> None:
+        lv = self.query_one("#theme_list", ListView)
+        item = lv.highlighted_child
+        if isinstance(item, ThemeOption):
+            self._main.set_theme(item.theme_id)
+            self.notify(f"Theme → {item.theme_id}")
+        self.app.pop_screen()
+
+    def action_cancel(self) -> None:
+        # Revert the live preview if the user backs out without confirming.
+        self.app.theme = self._original_theme
+        self.app.pop_screen()
+
+
 class MainScreen(Screen):
     """The main chat screen with a right-hand context panel."""
 
@@ -1382,10 +1917,11 @@ class MainScreen(Screen):
     """
 
     BINDINGS = [
-        Binding("ctrl+t", "toggle_theme", "Theme", priority=True),
+        Binding("ctrl+t", "open_theme_menu", "Theme", priority=True),
         Binding("ctrl+b", "toggle_context_panel", "Context", priority=True),
         Binding("ctrl+k", "open_command_palette", "Commands", priority=True),
         Binding("ctrl+o", "open_model_dialog", "Model", priority=True),
+        Binding("ctrl+a", "open_auth", "Auth", priority=True),
         Binding("ctrl+q", "quit", "Quit", priority=True),
         Binding("question_sign", "show_shortcuts", "Shortcuts", priority=True),
     ]
@@ -1424,6 +1960,9 @@ class MainScreen(Screen):
     def action_open_auth(self) -> None:
         self.app.push_screen(AuthListScreen(self.state))
 
+    def action_open_theme_menu(self) -> None:
+        self.app.push_screen(ThemeMenuScreen(self))
+
     def refresh_session_footer(self) -> None:
         s = self.state.session_metrics or {}
         provider_hint = self.state.current_provider_id or "unknown"
@@ -1440,12 +1979,14 @@ class MainScreen(Screen):
         except Exception:
             pass
 
-    def action_toggle_theme(self) -> None:
-        themes = ThemeRegistry.theme_ids()
-        idx = themes.index(self.state.current_theme)
-        self.state.current_theme = themes[(idx + 1) % len(themes)]
-        self.app.theme = self.state.current_theme
-        self.notify(f"Theme → {self.state.current_theme}")
+    def set_theme(self, theme_id: str) -> None:
+        """Apply a theme and persist it so it's restored on the next launch."""
+        self.state.current_theme = theme_id
+        self.app.theme = theme_id
+        try:
+            self.state.config_manager.set("default_theme", theme_id)
+        except Exception:
+            pass
 
     def action_toggle_context_panel(self) -> None:
         panel = self.query_one("#context_panel", ContextPanel)
@@ -1463,6 +2004,7 @@ class ChatPane(Vertical):
     BINDINGS = [
         Binding("ctrl+shift+t", "toggle_trace_panel", "Trace", priority=True),
         Binding("ctrl+shift+c", "copy_last_response", "Copy", priority=True),
+        Binding("ctrl+shift+k", "copy_last_code_block", "Copy code", priority=True),
         Binding("f7", "toggle_thinking", "Thinking", priority=True),
         Binding("f8", "toggle_trace_panel", "Trace", priority=True),
         Binding("f9", "copy_last_response", "Copy", priority=True),
@@ -1640,26 +2182,51 @@ class ChatPane(Vertical):
 
     def action_open_external_editor(self) -> None:
         """Open the composer draft in $EDITOR and read it back (opencode Ctrl+E)."""
+        self._open_external_editor()
+
+    @work(thread=True, exclusive=True)
+    def _open_external_editor(self) -> None:
+        """Run $EDITOR in a worker thread while the app is suspended.
+
+        Previously this called subprocess.call(...) directly on the UI/event
+        loop thread, which froze Textual's rendering and input handling for
+        the whole duration the editor was open - keystrokes (including :q)
+        landed in whichever process actually had the terminal, and the app
+        appeared to hang or exit. `App.suspend()` properly hands the terminal
+        to the child editor and restores Textual's terminal mode (and theme)
+        on return; running it in a worker thread keeps the event loop free.
+        """
         import subprocess
         import tempfile
         editor = os.environ.get("EDITOR") or os.environ.get("VISUAL") or "vi"
-        try:
+
+        def _get_draft() -> str:
+            return self.query_one("#chat_input", ChatComposer).value
+
+        def _apply(content: str) -> None:
             input_box = self.query_one("#chat_input", ChatComposer)
+            input_box.value = content
+            input_box.focus()
+            self.notify("Editor content loaded into composer.")
+
+        def _fail(message: str) -> None:
+            self.notify(message, severity="error")
+
+        try:
+            draft = self.app.call_from_thread(_get_draft)
         except Exception:
             return
-        draft = input_box.value
         with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False, encoding="utf-8") as f:
             f.write(draft)
             path = f.name
         try:
-            subprocess.call([editor, path])
+            with self.app.suspend():
+                subprocess.call([editor, path])
             with open(path, encoding="utf-8") as f:
                 content = f.read()
-            input_box.value = content
-            input_box.focus()
-            self.notify("Editor content loaded into composer.")
+            self.app.call_from_thread(_apply, content)
         except Exception as e:
-            self.notify(f"Could not open editor: {e}", severity="error")
+            self.app.call_from_thread(_fail, f"Could not open editor: {e}")
         finally:
             try:
                 os.remove(path)
@@ -1692,6 +2259,40 @@ class ChatPane(Vertical):
     def action_copy_last_response(self) -> None:
         self._copy_last_response()
 
+    def _copy_last_code_block(self) -> None:
+        """Copy the last fenced code block from the last agent response.
+
+        Whole-response copy (F9/Ctrl+Shift+C) is often too coarse when all
+        the user wants is the code the agent just wrote - this extracts just
+        that (#11 in the issue report).
+        """
+        text = self.state.last_agent_response or ""
+        blocks = re.findall(r"```[^\n]*\n(.*?)```", text, re.DOTALL)
+        if not blocks:
+            self.notify("No code block found in the last response.", severity="warning")
+            return
+        code = blocks[-1].strip("\n")
+        copy_fn = getattr(self.app, "copy_to_clipboard", None)
+        if callable(copy_fn):
+            try:
+                copy_fn(code)
+                self.notify("Copied last code block to clipboard.")
+                return
+            except Exception:
+                pass
+        try:
+            input_box = self.query_one("#chat_input", ChatComposer)
+            input_box.value = code[:10000]
+            input_box.focus()
+            self.notify("Clipboard unavailable; code block inserted into input for manual copy.", severity="warning")
+            return
+        except Exception:
+            pass
+        self.notify("Clipboard copy unavailable in this terminal.", severity="warning")
+
+    def action_copy_last_code_block(self) -> None:
+        self._copy_last_code_block()
+
     @staticmethod
     def _theme_code_style(theme_name: str) -> str:
         """Map a TUI theme to a Pygments code style for Rich Markdown."""
@@ -1702,6 +2303,13 @@ class ChatPane(Vertical):
             "one_dark": "one-dark",
             "omni_dark": "dracula",
             "solarized_light": "solarized-light",
+            # Pygments ships no native Catppuccin style; "dracula" is the
+            # closest purple/pink-accented dark style for the three dark
+            # flavors, and "solarized-light" is the closest light one.
+            "catppuccin_mocha": "dracula",
+            "catppuccin_macchiato": "dracula",
+            "catppuccin_frappe": "dracula",
+            "catppuccin_latte": "solarized-light",
         }
         return mapping.get(theme_name, "default")
 
@@ -1857,7 +2465,7 @@ class ChatPane(Vertical):
         log.scroll_end(animate=False)
         self._run_agent(text, live_response)
 
-    def _append_trace(self, event_type: str, detail: str = "") -> None:
+    def _append_trace(self, event_type: str, detail: str = "", **extra) -> None:
         trace_log = self.query_one("#trace_log", VerticalScroll)
         ts = datetime.now().strftime("%H:%M:%S")
         label_map = {
@@ -1874,16 +2482,32 @@ class ChatPane(Vertical):
             "interaction_start": "▶ interaction.start",
             "interaction_error": "❌ interaction.error",
             "interaction_cancelled": "⏹ interaction.cancelled",
-            "tool_start": "🔧 tool.start",
-            "tool_done": "✅ tool.done",
-            "tool_error": "❌ tool.error",
+            "tool_start": "🔧 about to run",
+            "tool_done": "✅ finished",
+            "tool_error": "❌ failed",
             "tool_progress": "📶 tool.progress",
+            "provider_error": "⛔ provider.error",
+            "usage": "🧮 usage",
+            "step_cap_hit": "⚠️ step_cap.hit",
+            "loop_warning": "⚠️ loop.warning",
+            "permission_request": "🔐 permission",
         }
         label = label_map.get(event_type, event_type)
         safe_detail = (detail or "").replace("[", "\\[").replace("]", "\\]")
         line = f"[dim]{ts}[/] {label}"
         if safe_detail:
             line += f" [dim]· {safe_detail[:220]}[/]"
+        # Append extra context (provider, model, prompt_preview, etc.) so trace
+        # errors are explicit without breaking the compact line format.
+        if extra:
+            context_parts = []
+            for key in ("provider", "model", "prompt_preview", "path", "tool", "error", "raw_preview"):
+                value = extra.get(key)
+                if value is not None and value != "":
+                    safe_value = str(value).replace("[", "\\[").replace("]", "\\]")
+                    context_parts.append(f"{key}={safe_value[:120]}")
+            if context_parts:
+                line += " [dim]" + " ".join(context_parts) + "[/]"
         self._last_trace_stage = f"{label}"
         trace_log.mount(SystemMessage(line))
         trace_log.scroll_end(animate=False)
@@ -1942,6 +2566,20 @@ class ChatPane(Vertical):
         steps_widget: Optional[StepsMessage] = None
         step_lines: list[str] = []
         current_raw = ""
+        # Real provider-reported usage accumulated across every request made
+        # during this turn (each tool-loop step + the final completion), so
+        # "44 requests" reconciles with the displayed token count instead of
+        # showing a char-based estimate of only the final prompt/answer.
+        turn_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        has_real_usage = False
+        if not self.state.seen_first_turn_hint:
+            self.state.seen_first_turn_hint = True
+            self.notify(
+                "Tip: press F8 to watch live tool-by-tool traces (or F7 for the model's "
+                "intermediate thinking) while this runs.",
+                title="Trace panel",
+                timeout=8,
+            )
         self._append_trace("interaction_start", prompt[:120])
 
         async def on_stream_chunk(chunk: str) -> None:
@@ -1980,6 +2618,12 @@ class ChatPane(Vertical):
                     preview = "\n".join(f"• {s}" for s in step_lines[-8:])
                     steps_widget.update(Text(preview[:3000], style="dim"))
                     log.scroll_end(animate=False)
+                    try:
+                        main_screen = self.screen
+                        if isinstance(main_screen, MainScreen):
+                            main_screen.query_one("#context_panel", ContextPanel).update_current_steps(step_lines)
+                    except Exception:
+                        pass
                 return
 
             nonlocal reasoning_widget, current_raw
@@ -2012,6 +2656,18 @@ class ChatPane(Vertical):
                 return detail
 
             detail = ""
+            if isinstance(payload, dict) and event_type == "usage":
+                nonlocal has_real_usage
+                has_real_usage = True
+                turn_usage["prompt_tokens"] += int(payload.get("prompt_tokens") or 0)
+                turn_usage["completion_tokens"] += int(payload.get("completion_tokens") or 0)
+                turn_usage["total_tokens"] += int(payload.get("total_tokens") or 0)
+                detail = (
+                    f"+{payload.get('prompt_tokens', 0)} prompt / "
+                    f"+{payload.get('completion_tokens', 0)} completion"
+                )
+                self._append_trace(event_type, detail[:220])
+                return
             if isinstance(payload, dict):
                 # Tool events: build a short, human-readable sentence.
                 if event_type in {"tool_start", "tool_done", "tool_error"}:
@@ -2038,6 +2694,18 @@ class ChatPane(Vertical):
                                     break
                         detail = ", ".join(parts)
             self._append_trace(event_type, detail[:220])
+
+        async def on_permission_request(path: str) -> str:
+            """Modal approval for a tool call that would touch a path outside
+            the workspace root, instead of a hard failure (FR in the issue
+            report). Returns "once", "session", or "deny".
+            """
+            try:
+                choice = await self.app.push_screen_wait(PermissionScreen(str(path)))
+            except Exception:
+                choice = "deny"
+            return choice if choice in ("once", "session") else "deny"
+
         try:
             # Reference prior conversation so the model isn't left to guess:
             # the context query pulls related memory AND the last turns keep
@@ -2060,6 +2728,8 @@ class ChatPane(Vertical):
                 context_query=context_query or None,
                 workspace=WORKSPACE,
                 agent_mode=self.state.agent_mode,
+                on_permission_request=on_permission_request,
+                allowed_paths=self.state.allowed_workspace_paths,
             )
             if not chunks:
                 raw = response or ""
@@ -2074,8 +2744,16 @@ class ChatPane(Vertical):
                 reasoning, answer = _extract_reasoning_and_answer("".join(chunks))
                 self.state.last_agent_response = answer or ""
                 live_response.update(self._render_agent_markdown(header_ts, answer or ""))
-            est_prompt_tokens = max(1, len(prompt) // 4)
-            est_output_tokens = max(1, len(self.state.last_agent_response or "") // 4)
+            if has_real_usage:
+                # Real counts from the provider(s), summed across every
+                # request this turn made (tool-loop steps + final answer).
+                est_prompt_tokens = turn_usage["prompt_tokens"]
+                est_output_tokens = turn_usage["completion_tokens"]
+            else:
+                # No provider in this turn reported usage - fall back to the
+                # char-based estimate of just the final prompt/answer.
+                est_prompt_tokens = max(1, len(prompt) // 4)
+                est_output_tokens = max(1, len(self.state.last_agent_response or "") // 4)
             provider_type = getattr(self.state.agent.provider.config, "provider_type", "")
             est_cost_usd = 0.0 if provider_type == "local" else None
             self.state.last_turn_metrics = {
@@ -2084,6 +2762,7 @@ class ChatPane(Vertical):
                 "total_tokens_est": est_prompt_tokens + est_output_tokens,
                 "estimated_cost_usd": est_cost_usd,
                 "provider_type": provider_type,
+                "tokens_are_real": has_real_usage,
             }
             session = self.state.session_metrics
             session["turns"] += 1
@@ -2104,12 +2783,36 @@ class ChatPane(Vertical):
         except asyncio.CancelledError:
             live_response.remove()
             log.mount(SystemMessage("⏹ Cancelled."))
-            self._append_trace("interaction_cancelled")
+            self._append_trace(
+                "interaction_cancelled",
+                "user interrupted",
+                prompt_preview=prompt[:120],
+            )
             return True
         except Exception as e:
             live_response.remove()
-            log.mount(SystemMessage(f"❌ {e}"))
-            self._append_trace("interaction_error", str(e))
+            error_detail = f"{type(e).__name__}: {e}"
+            provider_id = self.state.current_provider_id or "unknown"
+            model_name = self.state.agent.provider.config.name if self.state.agent else "?"
+            # Log the full traceback to motion.log (not just the short message
+            # shown in-app) so a "it just stopped"-style report (#8) can be
+            # diagnosed after the fact even without a live repro.
+            logger.exception("Agent turn failed (provider=%s, model=%s)", provider_id, model_name)
+            log.mount(SystemMessage(f"❌ {error_detail}"))
+            self._append_trace(
+                "interaction_error",
+                error_detail,
+                provider=provider_id,
+                model=model_name,
+                prompt_preview=prompt[:120],
+            )
+            # If the provider timed out or errored, append a helpful inline
+            # hint so the user knows how to recover without restarting.
+            if "provider" in error_detail.lower() and "timed out" in error_detail.lower():
+                log.mount(SystemMessage(
+                    "💡 Provider timed out. Try again, check your connection, "
+                    "or switch providers with /auth or the provider picker."
+                ))
             return False
 
     async def _handle_skill_command(self, text: str, log: VerticalScroll) -> None:
@@ -2239,7 +2942,11 @@ class MotionTUI(App):
             ttheme = ThemeRegistry.get_textual_theme(tid)
             self.register_theme(ttheme)
 
-        # Set initial theme
+        # Restore the last-saved theme (config.yml's default_theme), falling
+        # back to AppState's built-in default when unset/unknown.
+        saved_theme = self.state.config_manager.get("default_theme")
+        if saved_theme and saved_theme in ThemeRegistry.theme_ids():
+            self.state.current_theme = saved_theme
         self.theme = self.state.current_theme
         self.set_class(self.state.ui_mode == "experimental", "experimental-ui")
 
@@ -2254,6 +2961,18 @@ class MotionTUI(App):
             self.push_screen(MainScreen(self.state))
         else:
             self.push_screen(ProviderSelectScreen(self.state))
+
+        # One-time tracking consent on first launch: ask before first use so
+        # the user gets a clear choice, but never nag again afterwards.
+        if self.state.config_manager.get("track_interactions") is None:
+            self.call_after_refresh(self._ask_tracking_consent)
+
+    def _ask_tracking_consent(self) -> None:
+        """Show the tracking consent prompt over the current screen."""
+        try:
+            self.push_screen(TrackingConsentScreen())
+        except Exception:
+            pass
 
     def action_request_cancel(self) -> None:
         """Cancel the running agent chat — not a quit."""

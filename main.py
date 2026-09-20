@@ -6,6 +6,7 @@ from core import auth
 from memory.db import MemoryDB, EMBEDDING_DIM
 from memory.retriever import HybridRetriever
 from core.workspace_tools import (
+    OutOfWorkspaceError,
     WorkspaceTools,
     format_tool_result,
     parse_tool_call,
@@ -17,6 +18,8 @@ import logging
 import os
 import re
 from typing import Optional
+
+import httpx
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -76,7 +79,19 @@ class MotionAgent:
         context_query: Optional[str] = None,
         workspace: Optional[str] = None,
         agent_mode: str = "build",
+        on_permission_request=None,
+        allowed_paths: Optional[set] = None,
     ):
+        """
+        ``on_permission_request``, if given, is called as
+        ``on_permission_request(path) -> decision | Awaitable[decision]``
+        whenever a tool call would escape the workspace root, where
+        ``decision`` is one of ``"once"``, ``"session"``, or ``"deny"``
+        (anything else is treated as "deny"). ``"session"`` persists the
+        approval into ``allowed_paths`` (which the caller should keep and
+        pass back on later turns) instead of a hard failure (FR in the
+        issue report).
+        """
         async def emit_trace(stage: str, message: str, **extra):
             if not on_trace_event:
                 return
@@ -90,6 +105,19 @@ class MotionAgent:
                     await maybe
             except Exception:
                 pass
+
+        async def emit_usage(label: str) -> None:
+            """Emit real provider-reported token usage for the request that
+            just completed, when available. Read-then-clear so a call whose
+            response has no usage field doesn't accidentally inherit a
+            previous call's numbers (#10 in the issue report: token counts
+            were fabricated from character counts and never reconciled with
+            the actual number of provider requests in a turn).
+            """
+            usage = getattr(self.provider, "last_usage", None)
+            self.provider.last_usage = None
+            if usage:
+                await emit_trace("usage", f"{label} usage", **usage)
         # 1. Memory Recall
         await emit_trace("memory_recall_start", "Running retriever.retrieve")
         context_chunks = await self.retriever.retrieve(prompt)
@@ -114,6 +142,7 @@ class MotionAgent:
         tools = WorkspaceTools(
             workspace or os.getcwd(),
             read_only=agent_mode == "plan",
+            allowed_paths=allowed_paths,
         )
         system_prompt = (
             f"You are Motion Agent.\n\n{tools.instructions}\n\n"
@@ -129,13 +158,38 @@ class MotionAgent:
         empty_retries = 0
         inspection_only_loops = 0
         tool_operations: list[str] = []
+        last_call_signature: Optional[tuple[str, str]] = None
+        repeat_count = 0
+        provider_type = getattr(getattr(self.provider, "config", None), "provider_type", "unknown")
         for tool_step in range(MAX_TOOL_STEPS):
             step_prompt = prompt if tool_step == 0 else "Continue the task using the tool result above."
-            candidate = await self.provider.complete(
-                step_prompt,
-                system_prompt=system_prompt,
-                history=tool_history or None,
-            )
+            try:
+                candidate = await self.provider.complete(
+                    step_prompt,
+                    system_prompt=system_prompt,
+                    history=tool_history or None,
+                )
+            except httpx.TimeoutException as exc:
+                endpoint = getattr(getattr(self.provider, "config", None), "endpoint", "unknown")
+                error_msg = (
+                    f"Provider {provider_type} timed out ({endpoint}). "
+                    "The model did not respond within the configured timeout."
+                )
+                await emit_trace("provider_error", error_msg, provider=provider_type, error=str(exc))
+                return (
+                    f"⚠️ {error_msg}\n\n"
+                    "I couldn't reach the model provider in time. Try again, "
+                    "check your connection, or select a different provider."
+                )
+            except httpx.HTTPError as exc:
+                endpoint = getattr(getattr(self.provider, "config", None), "endpoint", "unknown")
+                error_msg = f"Provider {provider_type} request failed ({endpoint}): {exc}"
+                await emit_trace("provider_error", error_msg, provider=provider_type, error=str(exc))
+                return (
+                    f"⚠️ {error_msg}\n\n"
+                    "I couldn't reach the model provider. Check your connection or provider status."
+                )
+            await emit_usage(f"tool_step_{tool_step}")
 
             # Stream visible progress for the current step so the UI doesn't stay
             # blank while tools are running. Strip any tool markup from previews.
@@ -150,11 +204,21 @@ class MotionAgent:
             except Exception as exc:
                 # Treat a malformed tool call as context, not a fatal stop.
                 # The model sees the error and can self-correct on the next turn,
-                # while the user stays in control via Esc.
-                await emit_trace("tool_error", "Invalid tool call", error=str(exc))
+                # while the user stays in control via Esc. Be explicit in the trace
+                # about what failed and what the malformed candidate looked like.
+                raw_preview = (candidate or "")[:400].replace("\n", " ")
+                error_msg = f"Invalid tool call: {exc}"
+                await emit_trace(
+                    "tool_error",
+                    error_msg,
+                    tool="invalid",
+                    path="",
+                    error=str(exc),
+                    raw_preview=raw_preview,
+                )
                 tool_history.extend([
                     {"role": "assistant", "content": candidate},
-                    {"role": "user", "content": format_tool_result("invalid", error=str(exc))},
+                    {"role": "user", "content": format_tool_result("invalid", error=error_msg)},
                 ])
                 continue
 
@@ -185,6 +249,23 @@ class MotionAgent:
             else:
                 inspection_only_loops = 0
 
+            # Surface repeated identical calls so the trace panel makes a
+            # stuck loop obvious (#9 in the issue report: "tambem não tem
+            # traces pra eu saber ... se ele caiu num loop").
+            call_signature = (name, str(arguments.get("path", "") or arguments.get("command", "")))
+            if call_signature == last_call_signature:
+                repeat_count += 1
+            else:
+                repeat_count = 1
+                last_call_signature = call_signature
+            if repeat_count == 3:
+                await emit_trace(
+                    "loop_warning",
+                    f"{name} on `{call_signature[1]}` has repeated {repeat_count}x in a row",
+                    tool=name,
+                    path=call_signature[1],
+                )
+
             await emit_trace(
                 "tool_start",
                 f"Running {name}",
@@ -213,54 +294,107 @@ class MotionAgent:
                 await emit_trace("tool_done", f"{name} blocked in plan mode", tool=name)
                 continue
             path = str(arguments.get("path", "") or "").strip()
-            try:
-                result = tools.execute(name, arguments)
-                result_message = format_tool_result(name, result=result)
-                path = str(result.get("path") or path or "").strip()
-                if name == "write_file":
-                    operation = f"wrote `{path}`"
-                    stream_text = f"wrote `{path}` ({result.get('bytes_written', 0)} bytes)"
-                elif name == "replace_in_file":
-                    operation = f"updated `{path}`"
-                    stream_text = operation
-                elif name == "read_file":
-                    operation = f"read `{path}`"
-                    stream_text = operation
-                elif name == "list_files":
-                    operation = f"listed `{path or '.'}`"
-                    stream_text = operation
-                else:
-                    operation = f"ran `{name}`"
-                    stream_text = operation
-                tool_operations.append(operation)
-                # Stream every tool op (not just writes) so the UI can show
-                # live step-by-step progress for the whole loop, however long
-                # it runs.
-                if on_stream_chunk:
-                    maybe = on_stream_chunk(f"_tool_ {stream_text}")
-                    if inspect.isawaitable(maybe):
-                        await maybe
-                await emit_trace("tool_done", f"Completed {name}", tool=name, path=path)
-            except Exception as exc:
+
+            async def _fail_tool(exc: Exception, failed_path: str) -> str:
+                """Build+stream+trace a tool failure, matching the original
+                inline error handling. Returns the <motion_tool_result> to
+                append to tool_history."""
                 operation = f"`{name}` failed: {exc}"
                 result_message = format_tool_result(name, error=str(exc))
                 if on_stream_chunk:
                     maybe = on_stream_chunk(f"_tool_ {operation}")
                     if inspect.isawaitable(maybe):
                         await maybe
-                await emit_trace("tool_error", f"{name} failed", tool=name, path=path, error=str(exc))
-                tool_history.extend([
-                    {"role": "assistant", "content": candidate},
-                    {"role": "user", "content": result_message},
-                ])
-                # Treat tool execution errors as context rather than a hard stop.
-                # The model can see the failure and decide how to proceed; only
-                # the user (via Esc) interrupts the interaction.
-                continue
+                error_msg = f"{name} failed on `{failed_path or '(no path)'}`: {exc}"
+                await emit_trace("tool_error", error_msg, tool=name, path=failed_path, error=str(exc))
+                return result_message
+
+            permission_retry_used = False
+            tool_call_failed = False
+            result_message = ""
+            while True:
+                try:
+                    result = tools.execute(name, arguments)
+                except OutOfWorkspaceError as exc:
+                    if permission_retry_used or not on_permission_request:
+                        result_message = await _fail_tool(exc, str(exc.path))
+                        tool_call_failed = True
+                        break
+                    # decision is one of "once", "session", or "deny" (any
+                    # other/falsy value is treated as "deny").
+                    try:
+                        maybe = on_permission_request(str(exc.path))
+                        decision = await maybe if inspect.isawaitable(maybe) else maybe
+                    except Exception:
+                        decision = "deny"
+                    approved = decision in ("once", "session")
+                    await emit_trace(
+                        "permission_request",
+                        f"{'Approved (' + decision + ')' if approved else 'Denied'} out-of-workspace access to `{exc.path}`",
+                        tool=name,
+                        path=str(exc.path),
+                    )
+                    if not approved:
+                        result_message = await _fail_tool(exc, str(exc.path))
+                        tool_call_failed = True
+                        break
+                    # "once" only affects this WorkspaceTools instance (this
+                    # turn's remaining tool calls); "session" also persists
+                    # into the caller's shared set so future turns don't
+                    # re-prompt for the same path.
+                    tools.allowed_paths.add(exc.path)
+                    if decision == "session" and allowed_paths is not None:
+                        allowed_paths.add(exc.path)
+                    permission_retry_used = True
+                    continue
+                except Exception as exc:
+                    result_message = await _fail_tool(exc, path)
+                    tool_call_failed = True
+                    break
+                else:
+                    result_message = format_tool_result(name, result=result)
+                    path = str(result.get("path") or path or "").strip()
+                    if name == "write_file":
+                        operation = f"wrote `{path}`"
+                        stream_text = f"wrote `{path}` ({result.get('bytes_written', 0)} bytes)"
+                    elif name == "replace_in_file":
+                        operation = f"updated `{path}`"
+                        stream_text = operation
+                    elif name == "read_file":
+                        operation = f"read `{path}`"
+                        stream_text = operation
+                    elif name == "list_files":
+                        operation = f"listed `{path or '.'}`"
+                        stream_text = operation
+                    elif name == "run_command":
+                        cmd = str(arguments.get("command", "")).strip()
+                        exit_code = result.get("exit_code")
+                        operation = f"ran `{cmd}` (exit {exit_code})"
+                        stream_text = operation
+                    else:
+                        operation = f"ran `{name}`"
+                        stream_text = operation
+                    tool_operations.append(operation)
+                    # Stream every tool op (not just writes) so the UI can show
+                    # live step-by-step progress for the whole loop, however long
+                    # it runs.
+                    if on_stream_chunk:
+                        maybe = on_stream_chunk(f"_tool_ {stream_text}")
+                        if inspect.isawaitable(maybe):
+                            await maybe
+                    await emit_trace("tool_done", f"Completed {name}", tool=name, path=path)
+                    break
+
             tool_history.extend([
                 {"role": "assistant", "content": candidate},
                 {"role": "user", "content": result_message},
             ])
+            if tool_call_failed:
+                # Treat tool execution errors (including a denied permission
+                # request) as context rather than a hard stop. The model can
+                # see the failure and decide how to proceed; only the user
+                # (via Esc) interrupts the interaction.
+                continue
 
             if (
                 agent_mode == "build"
@@ -281,7 +415,14 @@ class MotionAgent:
             # of a bare "narrow the task" message that hides completed writes.
             # Hitting this at all is unusual given how high the ceiling is -
             # it almost always means the model is stuck looping rather than
-            # that the task was too big.
+            # that the task was too big. Surface it explicitly in the trace so
+            # a "it just stopped" report (#8) is diagnosable after the fact.
+            await emit_trace(
+                "step_cap_hit",
+                f"Hit the {MAX_TOOL_STEPS}-step safety cap",
+                steps=MAX_TOOL_STEPS,
+                operations=len(tool_operations),
+            )
             if tool_operations:
                 completed = "\n".join(f"- {operation}" for operation in tool_operations)
                 tool_response = (
@@ -337,7 +478,6 @@ class MotionAgent:
         # If the model already returned a natural-language answer in the tool
         # loop, use that. Otherwise fall back to a streaming/oneshot completion.
         stream_chunk_count = 0
-        provider_type = getattr(getattr(self.provider, "config", None), "provider_type", "unknown")
         await emit_trace(
             "model_start",
             "Calling provider for completion",
@@ -358,9 +498,11 @@ class MotionAgent:
                     except Exception:
                         pass
                 raw_response = "".join(raw_chunks)
+                await emit_usage("final_stream")
                 await emit_trace("model_done", "Streaming completion finished", stream_chunks=stream_chunk_count, chars=len(raw_response))
             else:
                 raw_response = await self.provider.complete(prompt, system_prompt=system_prompt, history=history)
+                await emit_usage("final_oneshot")
                 await emit_trace("model_done", "One-shot completion finished", chars=len(raw_response or ""))
 
         # 4. Caveman Compression
@@ -389,21 +531,33 @@ class MotionAgent:
                 await emit_trace("skill_synthesis_error", f"Skill synthesis error: {e}")
         return final_response
 
+def _load_dotenv(config_dir: str) -> None:
+    """Load a .env file (if present) into os.environ without overwriting
+    variables the shell/OS already set.
+
+    Anchored to the given directory (normally REPO_DIR, not CWD) so `motion`
+    finds its own .env regardless of which directory it's invoked from. Used
+    by both the TUI launch path and the --chat/REPL path so API keys placed
+    in .env (e.g. OLLAMA_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY) are
+    always picked up, not just when going through load_agent_from_config.
+    """
+    env_path = os.path.join(config_dir, ".env")
+    if not os.path.exists(env_path):
+        return
+    with open(env_path) as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, _, value = line.partition("=")
+                key, value = key.strip(), value.strip()
+                if key and value:
+                    os.environ.setdefault(key, value)
+
+
 def load_agent_from_config(config_path: str = "", provider_id: str | None = None) -> MotionAgent:
     """Load a MotionAgent using settings from config.yml (or config.example.yml) and .env."""
-    # Load .env file if present. Anchored to REPO_DIR (not CWD) so `motion`
-    # finds its own .env regardless of which directory it's invoked from.
     config_dir = os.path.dirname(os.path.abspath(config_path)) if config_path else REPO_DIR
-    env_path = os.path.join(config_dir, ".env")
-    if os.path.exists(env_path):
-        with open(env_path) as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    key, _, value = line.partition("=")
-                    key, value = key.strip(), value.strip()
-                    if key and value:
-                        os.environ.setdefault(key, value)
+    _load_dotenv(config_dir)
 
     cm = ConfigManager(config_path)
     provider_id = provider_id or cm.get_default_provider()
@@ -548,6 +702,12 @@ def cmd_auth(args) -> None:
 if __name__ == "__main__":
     import sys
     import argparse
+
+    # Load .env before touching ConfigManager anywhere below - the TUI launch
+    # path (the default, no-flags invocation) previously skipped this
+    # entirely, so API keys placed in .env never became visible to
+    # has_api_key()/ModelDialog and no models appeared to choose from.
+    _load_dotenv(REPO_DIR)
 
     parser = argparse.ArgumentParser(description="Motion Agent")
     parser.add_argument("--test", action="store_true", help="Run Caveman compression test (no model needed)")
