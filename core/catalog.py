@@ -233,15 +233,22 @@ async def scrape_ollama_cloud_models() -> List[str]:
 async def update_ollama_cloud_models() -> int:
     """Scrape Ollama Cloud models and merge them into the catalog + config.
 
-    Updates the in-memory BUILTIN_CATALOG so the running UI reflects the
-    latest list, and persists any newly discovered models to config.yml so
-    they survive restarts.
+    Honors an already-populated model list: if ollama-cloud already has a
+    curated (non-empty) model set, we treat it as authoritative and do NOT
+    re-scrape or append - nothing to refresh, so we return 0 without touching
+    the network. Only when the list is empty/unseeded do we scrape, add any
+    missing names, and persist them so the UI reflects the latest list.
     """
+    provider = BUILTIN_CATALOG.get("ollama-cloud", {})
+    models = provider.setdefault("models", {})
+    if models:
+        # A curated model list already exists - leave it alone. Let a caller
+        # who wants a hard re-seed clear it first.
+        return 0
+
     names = await scrape_ollama_cloud_models()
     if not names:
         return 0
-    provider = BUILTIN_CATALOG.get("ollama-cloud", {})
-    models = provider.setdefault("models", {})
     added = 0
     for name in names:
         if name not in models:
