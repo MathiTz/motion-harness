@@ -1314,22 +1314,16 @@ class ModelDialog(Screen):
         self._entries = self._collect_entries()
         self.run_worker(self._populate_models(), thread=False)
         self.query_one("#model_input", Input).focus()
-        # Kick off a refresh so cloud model lists stay current.
-        self.action_refresh_models()
 
     def _render_models(self, query: str) -> None:
         q = query.strip().lower()
         lv = self.query_one("#model_list", ListView)
         # Populate/rebuild the rows when they don't match the current entry
         # set (first frame from on_mount, or after a refresh added models).
-        # append()/clear() are async, so on the very first frame children may
-        # still be empty; _populate_models re-renders after the await, and
-        # typing afterwards only toggles display (never re-mounts), which
-        # preserves the ListView's live selection.
-        if len(lv.children) != len(self._entries):
-            if lv.children:
-                lv.clear()
-            lv.append(*(ModelOption(label, full) for label, full in self._entries))
+        # append()/clear() are async in Textual 3.x, so rows are added via the
+        # awaitable _set_model_rows_async() (called from the populate/rebuild
+        # helpers); live typing afterwards only toggles display (never
+        # re-mounts), which preserves the ListView's selection.
         if not lv.children:
             return
         first_visible: Optional[int] = None
@@ -1346,12 +1340,30 @@ class ModelDialog(Screen):
             self._selection_index = first_visible
             lv.index = first_visible
 
+    async def _set_model_rows_async(self, rows: list[ModelOption]) -> None:
+        """Awaitable variant of row population for Textual 3.x and 8.x.
+
+        Textual 3.x (used by the `motion` launcher) only accepts one ListItem
+        per append() call, unlike 8.x which accepts a splat, so we loop and
+        await each one to ensure children are present when we re-render."""
+        lv = self.query_one("#model_list", ListView)
+        if lv.children:
+            await lv.clear()
+        for row in rows:
+            await lv.append(row)
+
     async def _populate_models(self) -> None:
         """Mount the entry rows once, awaiting so children exist before the
         first filter is applied; then re-render to set the initial highlight."""
-        lv = self.query_one("#model_list", ListView)
-        await lv.append(*(ModelOption(label, full) for label, full in self._entries))
+        await self._set_model_rows_async([ModelOption(label, full) for label, full in self._entries])
         query = self.query_one("#model_input", Input).value
+        self._render_models(query)
+
+    async def _rebuild_models(self, query: str) -> None:
+        """Rebuild the row set from the current entries (after a refresh or
+        screen resume where the model list may have changed), then re-render."""
+        lv = self.query_one("#model_list", ListView)
+        await self._set_model_rows_async([ModelOption(label, full) for label, full in self._entries])
         self._render_models(query)
 
     def on_screen_resume(self) -> None:
@@ -1363,7 +1375,7 @@ class ModelDialog(Screen):
             query = self.query_one("#model_input", Input).value
         except Exception:
             query = ""
-        self._render_models(query)
+        self.run_worker(self._rebuild_models(query), thread=False)
 
     def action_add_model(self) -> None:
         self.app.push_screen(AddModelScreen(self.state))
@@ -1381,7 +1393,7 @@ class ModelDialog(Screen):
         # immediately and survive restarts.
         self.state.config_manager.reload()
         self._entries = self._collect_entries()
-        self._render_models(self.query_one("#model_input", Input).value)
+        await self._rebuild_models(self.query_one("#model_input", Input).value)
         if added:
             self.notify(f"Found {added} new model{'s' if added != 1 else ''}")
         else:
