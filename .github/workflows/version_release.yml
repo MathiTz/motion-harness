@@ -6,7 +6,7 @@ on:
 
 concurrency:
   group: version-release-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 permissions:
   contents: write
@@ -14,8 +14,9 @@ permissions:
 jobs:
   bump-and-release:
     runs-on: ubuntu-latest
-    # Skip if this push is the version-bump commit itself (avoids self-trigger).
-    if: "github.event.head_commit.message != 'chore(version): bump version'"
+    # Skip if this push is our own version-bump commit (avoids infinite
+    # self-trigger loop). Bump commits use `chore(version): bump version to vX.Y.Z`.
+    if: "!startsWith(github.event.head_commit.message, 'chore(version): bump version')"
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -38,8 +39,10 @@ jobs:
           echo "NEW=$NEW" >> "$GITHUB_ENV"
           echo "tag=v$NEW" >> "$GITHUB_OUTPUT"
           printf '%s\n' "$NEW" > VERSION
+          if [ "$OLD" = "$NEW" ]; then echo "NO_CHANGE=1" >> "$GITHUB_ENV"; else echo "NO_CHANGE=0" >> "$GITHUB_ENV"; fi
 
       - name: Commit version bump
+        if: env.NO_CHANGE == '0'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -48,6 +51,7 @@ jobs:
           git push origin HEAD:main
 
       - name: Create tag & release
+        if: env.NO_CHANGE == '0'
         uses: softprops/action-gh-release@v2.2.2
         with:
           tag_name: ${{ steps.version.outputs.tag }}
