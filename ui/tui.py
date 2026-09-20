@@ -1095,6 +1095,7 @@ class CommandPalette(Screen):
         super().__init__(**kwargs)
         self._main = main_screen
         self._commands: list[tuple[str, str]] = []
+        self._selection_index: Optional[int] = None
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(id="palette_box"):
@@ -1119,53 +1120,82 @@ class CommandPalette(Screen):
         lv = self.query_one("#palette_list", ListView)
         for label, _ in self._commands:
             lv.append(ListItem(Label(label)))
-        # Items are appended after the ListView itself mounts, so Textual's
-        # own initial-highlight logic never runs - set it explicitly so the
-        # first row is highlighted and ready for arrow-key/Enter selection.
         if lv.children:
             lv.index = 0
+            self._selection_index = 0
         self.query_one("#palette_input", Input).focus()
 
     def on_input_changed(self, event: Input.Changed) -> None:
         query = event.value.strip().lower()
         lv = self.query_one("#palette_list", ListView)
-        lv.clear()
-        for label, action in self._commands:
-            if query in label.lower():
-                lv.append(ListItem(Label(label)))
-        if lv.children:
-            lv.index = 0
+        first_visible: Optional[int] = None
+        for idx, (label, _) in enumerate(self._commands):
+            visible = query in label.lower()
+            item = lv.children[idx]
+            item.display = visible
+            if visible and first_visible is None:
+                first_visible = idx
+        # Re-clamp the highlight: with display-toggling, Textual keeps the
+        # stale index, so point it at the first *visible* row. If nothing
+        # matches, clear the highlight so Enter has no target.
+        self._selection_index = first_visible
+        if first_visible is None:
+            lv.index = None
+        else:
+            lv.index = first_visible
 
     def action_nav_up(self) -> None:
         # The Input owns focus while typing, so arrow keys land here instead
-        # of on the (sibling, unfocused) ListView - forward them manually.
-        self.query_one("#palette_list", ListView).action_cursor_up()
+        # of on the (sibling, unfocused) ListView - forward them manually,
+        # stepping only over visible (non-filtered) rows.
+        self._move_selection(-1)
 
     def action_nav_down(self) -> None:
-        self.query_one("#palette_list", ListView).action_cursor_down()
+        self._move_selection(1)
+
+    def _move_selection(self, delta: int) -> None:
+        lv = self.query_one("#palette_list", ListView)
+        order = [i for i, (label, _) in enumerate(self._commands) if lv.children[i].display]
+        if not order:
+            self._selection_index = None
+            lv.index = None
+            return
+        current = self._selection_index
+        if current is None or current not in order:
+            idx = order[0] if delta >= 0 else order[-1]
+        else:
+            pos = order.index(current)
+            pos = max(0, min(len(order) - 1, pos + delta))
+            idx = order[pos]
+        self._selection_index = idx
+        lv.index = idx
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
-        if event.item is None:
+        item = event.item
+        if item is None:
             return
-        self._activate_label(event.item)
+        if not item.display:
+            return
+        self._activate_label(item)
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         # Enter in the input box: pick the highlighted / first filtered command.
         lv = self.query_one("#palette_list", ListView)
-        item = lv.highlighted_child or (lv.children[0] if lv.children else None)
-        if item is not None:
-            event.stop()
-            self._activate_label(item)
+        item = lv.highlighted_child
+        if item is None or not item.display:
+            return
+        event.stop()
+        self._activate_label(item)
 
     def _activate_label(self, item) -> None:
-        try:
-            label = str(item.query_one(Label).content)
-        except Exception:
-            return
-        for lab, action in self._commands:
-            if lab == label:
-                self._run(action)
-                return
+        # Match by position rather than parsing the row's label text, which
+        # isn't portable across Textual versions (Label.content only exists in
+        # newer releases - older ones store it as Label._content). Items are
+        # appended in _commands order and we track the highlight index, so
+        # resolve straight to the command by index.
+        idx = self._selection_index
+        if idx is not None and 0 <= idx < len(self._commands):
+            self._run(self._commands[idx][1])
 
     def _run(self, action: str) -> None:
         # Actions that push their own screen keep the palette open underneath,
@@ -1268,6 +1298,7 @@ class ModelDialog(Screen):
         super().__init__(**kwargs)
         self.state = state
         self._entries: list[tuple[str, str]] = []  # (label, full_id)
+        self._selection_index: Optional[int] = None
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(id="model_box"):
@@ -1281,10 +1312,47 @@ class ModelDialog(Screen):
         # editing config.yml) since this ConfigManager was last loaded.
         self.state.config_manager.reload()
         self._entries = self._collect_entries()
-        self._render_models("")
+        self.run_worker(self._populate_models(), thread=False)
         self.query_one("#model_input", Input).focus()
         # Kick off a refresh so cloud model lists stay current.
         self.action_refresh_models()
+
+    def _render_models(self, query: str) -> None:
+        q = query.strip().lower()
+        lv = self.query_one("#model_list", ListView)
+        # Populate/rebuild the rows when they don't match the current entry
+        # set (first frame from on_mount, or after a refresh added models).
+        # append()/clear() are async, so on the very first frame children may
+        # still be empty; _populate_models re-renders after the await, and
+        # typing afterwards only toggles display (never re-mounts), which
+        # preserves the ListView's live selection.
+        if len(lv.children) != len(self._entries):
+            if lv.children:
+                lv.clear()
+            lv.append(*(ModelOption(label, full) for label, full in self._entries))
+        if not lv.children:
+            return
+        first_visible: Optional[int] = None
+        for idx in range(min(len(self._entries), len(lv.children))):
+            label, _full = self._entries[idx]
+            visible = (not q) or q in label.lower()
+            lv.children[idx].display = visible
+            if visible and first_visible is None:
+                first_visible = idx
+        if first_visible is None:
+            self._selection_index = None
+            lv.index = None
+        else:
+            self._selection_index = first_visible
+            lv.index = first_visible
+
+    async def _populate_models(self) -> None:
+        """Mount the entry rows once, awaiting so children exist before the
+        first filter is applied; then re-render to set the initial highlight."""
+        lv = self.query_one("#model_list", ListView)
+        await lv.append(*(ModelOption(label, full) for label, full in self._entries))
+        query = self.query_one("#model_input", Input).value
+        self._render_models(query)
 
     def on_screen_resume(self) -> None:
         """Re-sync the list whenever this dialog becomes active again, e.g.
@@ -1332,39 +1400,44 @@ class ModelDialog(Screen):
                 entries.append((name, pid))
         return entries
 
-    def _render_models(self, query: str) -> None:
-        q = query.strip().lower()
-        lv = self.query_one("#model_list", ListView)
-        lv.clear()
-        for label, full in self._entries:
-            if q and q not in label.lower():
-                continue
-            lv.append(ModelOption(label, full))
-        # Items are appended after the ListView mounts, so Textual's own
-        # initial-highlight never fires - highlight the first match explicitly.
-        if lv.children:
-            lv.index = 0
-
     def on_input_changed(self, event: Input.Changed) -> None:
         self._render_models(event.value)
 
     def action_nav_up(self) -> None:
         # The search Input owns focus, so forward arrow keys to the sibling
-        # ListView, which never receives them directly while unfocused.
-        self.query_one("#model_list", ListView).action_cursor_up()
+        # ListView, which never receives them directly while unfocused -
+        # stepping only over visible (non-filtered) rows.
+        self._move_selection(-1)
 
     def action_nav_down(self) -> None:
-        self.query_one("#model_list", ListView).action_cursor_down()
+        self._move_selection(1)
+
+    def _move_selection(self, delta: int) -> None:
+        lv = self.query_one("#model_list", ListView)
+        order = [i for i in range(len(lv.children)) if lv.children[i].display]
+        if not order:
+            lv.index = None
+            return
+        current = getattr(self, "_selection_index", None)
+        if current is None or current not in order:
+            idx = order[0] if delta >= 0 else order[-1]
+        else:
+            pos = order.index(current)
+            pos = max(0, min(len(order) - 1, pos + delta))
+            idx = order[pos]
+        self._selection_index = idx
+        lv.index = idx
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         lv = self.query_one("#model_list", ListView)
-        item = lv.highlighted_child or (lv.children[0] if lv.children else None)
-        if item is not None:
-            event.stop()
-            self._select(item)
+        item = lv.highlighted_child
+        if item is None or not item.display:
+            return
+        event.stop()
+        self._select(item)
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
-        if event.item is not None:
+        if event.item is not None and event.item.display:
             self._select(event.item)
 
     def _select(self, item) -> None:
