@@ -1306,6 +1306,7 @@ class ModelDialog(Screen):
         self.state = state
         self._entries: list[tuple[str, str]] = []  # (label, full_id)
         self._selection_index: Optional[int] = None
+        self._populated = False  # ensures rows are mounted exactly once
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(id="model_box"):
@@ -1362,6 +1363,9 @@ class ModelDialog(Screen):
     async def _populate_models(self) -> None:
         """Mount the entry rows once, awaiting so children exist before the
         first filter is applied; then re-render to set the initial highlight."""
+        if self._populated:
+            return
+        self._populated = True
         await self._set_model_rows_async([ModelOption(label, full) for label, full in self._entries])
         query = self.query_one("#model_input", Input).value
         self._render_models(query)
@@ -1370,7 +1374,8 @@ class ModelDialog(Screen):
         """Rebuild the row set from the current entries (after a refresh or
         screen resume where the model list may have changed), then re-render."""
         lv = self.query_one("#model_list", ListView)
-        await self._set_model_rows_async([ModelOption(label, full) for label, full in self._entries])
+        if lv.children:
+            await self._set_model_rows_async([ModelOption(label, full) for label, full in self._entries])
         self._render_models(query)
 
     def on_screen_resume(self) -> None:
@@ -1378,6 +1383,10 @@ class ModelDialog(Screen):
         after returning from AddModelScreen."""
         self.state.config_manager.reload()
         self._entries = self._collect_entries()
+        # on_mount's _populate_models owns the very first population; resume
+        # (which also fires on first push) must not race it and re-append.
+        if not self._populated:
+            return
         try:
             query = self.query_one("#model_input", Input).value
         except Exception:
@@ -1479,7 +1488,9 @@ class ModelDialog(Screen):
             try:
                 for screen in self.app.screen_stack:
                     if isinstance(screen, MainScreen):
-                        screen.query_one(ChatPane)._refresh_meta()
+                        pane = screen.query_one(ChatPane)
+                        pane._refresh_meta()
+                        pane._refresh_connection_line()
                         screen.refresh_session_footer()
                         break
             except Exception:
@@ -2215,14 +2226,29 @@ class ChatPane(Vertical):
             self._set_trace_panel_visible(True)
 
     def on_mount(self) -> None:
-        name = self.state.agent.provider.config.name if self.state.agent else "?"
         log = self.query_one("#chat_log", VerticalScroll)
-        log.mount(SystemMessage(f"⚡ Motion Harness — connected to {name}"))
+        log.mount(SystemMessage("⚡ Motion Harness", id="connection_line"))
         log.mount(SystemMessage("Tip: Ctrl+K commands · Ctrl+O model · Tab agent · F7 thinking · F8 trace · F9 copy · /skill save <name>"))
-        self._append_trace("session_start", f"provider={name}")
+        self._refresh_connection_line()
+        self._append_trace("session_start", f"provider={self.state.current_provider_id}")
         self._set_trace_panel_visible(self.state.show_trace_panel)
         self._refresh_meta()
         self.query_one("#chat_input", ChatComposer).focus()
+
+    def _refresh_connection_line(self) -> None:
+        """Update the intro "connected to" line whenever the provider/model
+        changes, so it never lags behind a reconnect."""
+        try:
+            line = self.query_one("#connection_line", SystemMessage)
+        except Exception:
+            return
+        pid = self.state.current_provider_id or "?"
+        base, _, model = pid.partition("/")
+        if model:
+            text = f"⚡ Motion Harness — connected to {base} · {model}"
+        else:
+            text = f"⚡ Motion Harness — connected to {pid}"
+        line.update(text)
 
     def _set_trace_panel_visible(self, visible: bool) -> None:
         self.state.show_trace_panel = visible
@@ -2437,14 +2463,23 @@ class ChatPane(Vertical):
         agent = self.state.agent_mode
         agent_label = agent.capitalize()
         provider_id = self.state.current_provider_id or ""
-        model = self.state.agent.provider.config.name if self.state.agent else "?"
+        # current_provider_id holds "provider/model"; split so the meta line
+        # shows the actual model and the bare provider. ModelConfig.name is
+        # the provider's display name, so it can't substitute for the model.
+        if "/" in provider_id:
+            base_provider, model = provider_id.split("/", 1)
+        else:
+            base_provider, model = provider_id, ""
         agent_color = self._agent_color()
         # Resolve CSS variable name to a concrete hex color for Rich markup.
         theme = self.app.get_theme(self.app.theme)
         agent_hex = self._agent_hex(theme, agent_color)
+        model_disp = model or (self.state.agent.provider.config.name if self.state.agent else "?")
+        provider_disp = base_provider or provider_id
         # opencode-style meta: "Build · deepseek-v4-flash ollama-cloud"
         meta_markup = (
-            f"[{agent_hex} bold]{agent_label}[/] [dim]·[/] {model} [dim]{provider_id}[/]"
+            f"[{agent_hex} bold]{agent_label}[/] [dim]·[/] {model_disp} "
+            f"[dim]{provider_disp}[/]"
         )
         composer.set_meta(meta_markup)
         # Tint the left border of the composer with the agent color.
