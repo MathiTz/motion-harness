@@ -1116,6 +1116,7 @@ class CommandPalette(Screen):
             ("Copy last code block", "copy_code"),
             ("Toggle context panel", "context"),
             ("Manage API keys (/auth)", "auth"),
+            ("Close menu (Esc)", "close"),
         ]
         lv = self.query_one("#palette_list", ListView)
         for label, _ in self._commands:
@@ -1198,24 +1199,30 @@ class CommandPalette(Screen):
             self._run(self._commands[idx][1])
 
     def _run(self, action: str) -> None:
-        # Actions that push their own screen keep the palette open underneath,
-        # so Esc returns to the command menu. Direct toggles close it first.
-        if action in ("model", "auth"):
+        # Subscreen-opening commands (model, auth, theme, shortcuts) push
+        # their own screen with the palette left open underneath, so Esc from
+        # that submenu returns to the command palette instead of dumping you
+        # back to the chat - handy for picking a different command. Immediate
+        # toggles (agent/trace/thinking/copy/context) run right away and
+        # close the palette first.
+        if action in ("model", "auth", "theme", "shortcuts"):
             if action == "model":
                 self._main.action_open_model_dialog()
             elif action == "auth":
                 self._main.action_open_auth()
+            elif action == "theme":
+                self._main.action_open_theme_menu()
+            elif action == "shortcuts":
+                self._main.action_show_shortcuts()
             return
         self.app.pop_screen()
+        if action == "close":
+            return
         if action == "agent":
             try:
                 self._main.query_one(ChatPane)._toggle_agent_mode()
             except Exception:
                 pass
-        elif action == "theme":
-            self._main.action_open_theme_menu()
-        elif action == "shortcuts":
-            self._main.action_show_shortcuts()
         elif action == "trace":
             try:
                 self._main.query_one(ChatPane).action_toggle_trace_panel()
