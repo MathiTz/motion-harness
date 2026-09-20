@@ -12,7 +12,9 @@ available as a fallback.
 from typing import Any, Dict, List, Optional
 
 import httpx
+import os
 import re
+import yaml
 
 from core.providers import LocalProvider, ModelConfig
 
@@ -154,6 +156,51 @@ async def discover_local_models(provider_id: str, cfg: Dict[str, Any]) -> List[s
 
 OLLAMA_SEARCH_URL = "https://ollama.com/search"
 
+# Where to persist discovered models so they survive restarts. Mirrors
+# ConfigManager's repo-root lookup: installed harness, not caller CWD.
+_REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _config_path() -> str:
+    """Return the active config.yml path if it exists, otherwise the example."""
+    for name in ("config.yml", "config.example.yml"):
+        path = os.path.join(_REPO_DIR, name)
+        if os.path.exists(path):
+            return path
+    return os.path.join(_REPO_DIR, "config.yml")
+
+
+def _load_user_providers() -> Dict[str, Any]:
+    """Load the user's providers block from config.yml without merging catalog."""
+    path = _config_path()
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        return data.get("providers", {})
+    except Exception:
+        return {}
+
+
+def _save_user_providers(providers: Dict[str, Any]) -> None:
+    """Persist the providers block back to config.yml, preserving other keys."""
+    path = _config_path()
+    if not os.path.exists(path):
+        data = {"providers": providers}
+    else:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+        except Exception:
+            data = {}
+    data["providers"] = providers
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+    except Exception:
+        pass
+
 
 async def scrape_ollama_cloud_models() -> List[str]:
     """Fetch the list of models available on Ollama Cloud.
@@ -184,10 +231,11 @@ async def scrape_ollama_cloud_models() -> List[str]:
 
 
 async def update_ollama_cloud_models() -> int:
-    """Scrape Ollama Cloud models and merge them into the built-in catalog.
+    """Scrape Ollama Cloud models and merge them into the catalog + config.
 
-    Returns the number of models added/updated. The catalog is updated in
-    memory (BUILTIN_CATALOG) so the model dialog reflects the latest list.
+    Updates the in-memory BUILTIN_CATALOG so the running UI reflects the
+    latest list, and persists any newly discovered models to config.yml so
+    they survive restarts.
     """
     names = await scrape_ollama_cloud_models()
     if not names:
@@ -199,4 +247,15 @@ async def update_ollama_cloud_models() -> int:
         if name not in models:
             models[name] = {"temperature": 0.7, "max_tokens": 4096}
             added += 1
+
+    # Persist discovered models into the user's providers block so they are
+    # available after restart even before a refresh runs.
+    user_providers = _load_user_providers()
+    ollama_user = user_providers.setdefault("ollama-cloud", {})
+    ollama_models = ollama_user.setdefault("models", {})
+    for name in names:
+        if name not in ollama_models:
+            ollama_models[name] = {"temperature": 0.7, "max_tokens": 4096}
+    _save_user_providers(user_providers)
+
     return added

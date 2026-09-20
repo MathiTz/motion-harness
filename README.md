@@ -39,7 +39,7 @@ Get the harness running in under 60 seconds.
 
 ### For complete beginners
 
-**1. Install Python 3.10+** if you don't have it. On macOS: `brew install python@3.14`. On Linux: `sudo apt install python3 python3-venv`.
+**1. Install Python 3.11+** if you don't have it. On macOS: `brew install python@3.11`. On Linux: `sudo apt install python3 python3-venv`.
 
 **2. Clone and install the harness:**
 ```bash
@@ -67,8 +67,8 @@ motion auth login claude
 motion auth list                 # see which providers have keys
 motion auth logout ollama-cloud # remove a key
 ```
-Keys are stored in `~/.config/motion-harness/auth.json` (0600 perms) — never in `config.yml`. You can also use env vars (`OLLAMA_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`). Lookup order: **auth store → env var → config.yml**.
-> **No need to add models one by one.** The harness ships with a built-in catalog of Anthropic, OpenAI, and Ollama Cloud models. Just add the API key and they're all available — press `Ctrl+O` to browse/search them.
+Keys are stored in `~/.config/motion-harness/auth.json` (0600 perms) — never in `config.yml`. You can also use env vars (`OLLAMA_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`), including a `.env` file in the project root — it is loaded automatically on every launch path (`motion`, `motion --chat`, etc.), not just the legacy REPL. Lookup order: **auth store → env var → config.yml**.
+> **No need to add models one by one.** The harness ships with a built-in catalog of Anthropic, OpenAI, and Ollama Cloud models. Just add the API key and they're all available — press `Ctrl+O` to browse/search them, or press `Ctrl+A` from anywhere in the TUI to jump straight to auth management. Providers without a stored key prompt for one inline instead of blocking you.
 
 **5. Launch:**
 ```bash
@@ -83,6 +83,9 @@ motion --provider ollama-cloud/glm-5.2    # TUI with specific provider/model
 motion --chat                             # Legacy REPL mode
 motion --list                             # List available providers/models
 motion --test                             # Run Caveman compression test
+motion auth login <provider>              # Store an API key
+motion auth logout <provider>             # Remove a stored API key
+motion auth list                          # List stored API keys
 ```
 
 *For detailed native installation and GPU configuration, see the [Setup Guide](docs/setup.md).*
@@ -111,27 +114,41 @@ A high-performance terminal interface built with `Textual`, designed for daily-d
 **Workspace regions**:
 - **Conversation canvas** — markdown-first message cards with author/time headers and compact metadata; response code blocks carry theme-aware syntax highlighting.
 - **Right Context panel** — the rolling session context and most recent turns, so you always see what the model is grounded against (`Ctrl+B` to toggle).
-- **Composer** — a compact, opencode-style prompt: auto-growing (soft-wraps instead of scrolling), a thin left accent border colored by agent mode, prompt history (↑/↓), and an inline `agent · model · provider` meta row. Enter sends, Shift+Enter adds a newline.
+- **Composer** — a compact, opencode-style prompt: auto-growing (soft-wraps instead of scrolling), a thick left accent border colored by agent mode, prompt history (↑/↓), and an inline `agent · model · provider` meta row. Enter sends, Shift+Enter adds a newline.
 
-**Agent mode colors**: `build` is **blue**, `plan` is **orange** (matches opencode).
+**Agent modes**: `build` (blue) has write access and creates/edits files; `plan` (orange, opencode-style) is read-only and produces a concrete written plan before you approve implementation. Toggle with `Tab` or via the command palette. Plan mode blocks `write_file`/`replace_in_file` with a soft guidance nudge so the model answers with a plan rather than asking you to repeat yourself.
 
-**Grounded responses**: on every turn the harness passes the prior conversation (user + assistant) as history and the rolling session context as a memory-recall query, so the model references what was actually said instead of hallucinating.
+**Grounded responses**: on every turn the harness passes the prior conversation (user + assistant) as history and the rolling session context as a memory-recall query, so the model references what was actually said instead of hallucinating. Long sessions are capped at the most recent 8 turns to keep the latest user message prominent.
 
 **Theme token model**: semantic tokens (`$background`, `$surface`, `$panel`, `$border`, `$primary`, `$secondary`, `$accent`, `$text`, `$text-muted`, `$success`, `$warning`, `$error`) cascade through every widget via Textual's theme system.
 
-**6 Native Themes**: OpenCode (default), One Dark, Solarized Light, Nord, Dracula, Omni Dark — cycle with `Ctrl+T`.
+**10 Native Themes**: OpenCode (default), One Dark, Solarized Light, Nord, Dracula, Omni Dark, and the full [Catppuccin](https://catppuccin.com/) family (Mocha, Macchiato, Frappé, Latte) — press `Ctrl+T` to open the theme menu (arrow keys preview live, `Enter` confirms, `Esc` reverts). Your choice is saved to `config.yml` (`default_theme`) and restored on the next launch.
+
+**Interaction trace panel** (`F8`): a right-hand panel that shows the live tool loop as human-readable sentences, e.g. "about to run read_file on `main.py`", "write_file finished on `README.md`", or "read_file failed on `missing.txt`: file does not exist". Trace events include the affected path where applicable, plus diagnostics such as `step_cap_hit` (the tool loop hit its safety cap) and `loop_warning` (the same tool+path/command repeated 3x in a row). Unexpected turn failures are also logged with a full traceback to `motion.log` for debugging.
+
+**Real token usage**: when the active provider reports usage, the session footer and per-turn metadata show real prompt/completion/total token counts instead of a character-based estimate; the estimate is used only as a fallback when a provider doesn't return usage data.
+
+**Agent tools**: in `build` mode the agent can call `read_file`, `write_file`, `replace_in_file`, `list_files`, and `run_command` (arbitrary shell commands in the workspace, with a timeout and truncated output) against the workspace. Tool calls that target a path outside the workspace no longer fail outright — you're prompted to **allow once**, **allow for the session**, or **deny**.
+
+**Model persistence**: switching models via `Ctrl+O` (or the startup provider picker) saves your choice as `last_provider` in `config.yml`, so the next `motion` launch reconnects to the same provider/model instead of resetting to the catalog default. An explicit `motion --provider ...` flag always overrides this for that one run and is not persisted.
+
+**Resilient tool loop**: malformed tool calls and individual tool errors are treated as context rather than immediately stopping the agent. Only `Esc` (or an explicit `tool_error`/`Esc` stop signal) halts the loop, and the UI removes stale "Queued" notices as soon as a queued prompt starts running. Provider HTTP calls time out after 30s so cancellation feels responsive.
 
 **Keyboard shortcuts**:
 | Key | Action |
 | :-- | :-- |
-| `Ctrl+T` | Cycle theme |
+| `Ctrl+T` | Open theme menu |
+| `Ctrl+A` | Open auth management |
 | `Ctrl+B` | Toggle context panel |
 | `Ctrl+O` | Switch model (browse/search all models) |
 | `Ctrl+R` (in model dialog) | Refresh the model list (scrapes latest Ollama Cloud models) |
+| `Ctrl+N` (in model dialog) | Add a custom model |
 | `Ctrl+K` | Command palette (all commands) |
-| `Ctrl+E` | Open external editor for the message |
+| `Ctrl+E` | Open external editor for the message (runs in the background, no UI freeze) |
+| `F7` | Toggle agent thinking (show intermediate tool-loop text inline) |
 | `F8` / `Ctrl+Shift+T` | Toggle interaction trace panel |
 | `F9` / `Ctrl+Shift+C` | Copy last assistant response |
+| `Ctrl+Shift+K` | Copy last code block from the assistant's response |
 | `Tab` | Toggle agent (build / plan) |
 | `?` | Show shortcuts overlay (generated from live bindings) |
 | `Enter` (chat input) | Send message |
@@ -141,7 +158,7 @@ A high-performance terminal interface built with `Textual`, designed for daily-d
 | `/auth list` | List stored API keys |
 | `/auth login <provider>` | Store an API key for a provider |
 | `/auth logout <provider>` | Remove a stored API key |
-| `Ctrl+C` / `Ctrl+X` | Cancel current request (does not quit) |
+| `Esc` | Stop the current agent interaction |
 | `Ctrl+Q` | Quit (kills the process) |
 
 **CLI commands**:
@@ -151,6 +168,7 @@ A high-performance terminal interface built with `Textual`, designed for daily-d
 | `motion --chat` | Launch the REPL chat |
 | `motion --list` | List providers/models |
 | `motion --provider <id>` | Launch with a specific provider/model |
+| `motion --test` | Run Caveman compression test |
 | `motion auth login <provider>` | Store an API key (prompts, hidden input) |
 | `motion auth logout <provider>` | Remove a stored API key |
 | `motion auth list` | List which providers have keys |
@@ -159,6 +177,7 @@ A high-performance terminal interface built with `Textual`, designed for daily-d
 - Trace persistence is per-session (not yet written to disk).
 - Theme contrast validation is manual; the bundled themes are tuned for readability but very-low-contrast combinations are not auto-corrected.
 - Clipboard copy falls back to inserting the response into the input box when the terminal lacks clipboard support.
+- Conversation history sent to the model is capped at the most recent 8 turns; earlier context is summarized, not verbatim.
 - File/document ingestion (image / PDF / DOCX / XLSX) is on the roadmap — see [Roadmap](docs/roadmap.md).
 
 ---

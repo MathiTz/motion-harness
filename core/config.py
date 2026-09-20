@@ -46,6 +46,10 @@ class ConfigManager:
         data["providers"] = merged_providers
         return data
 
+    def reload(self) -> None:
+        """Reload config from disk and re-merge with the current catalog."""
+        self.data = self._load_config()
+
     def _env(self, key: str, default: Any = None) -> Any:
         """Resolve a value from environment variables first, then config."""
         return os.environ.get(key) or default
@@ -53,10 +57,25 @@ class ConfigManager:
     def get(self, key: str, default: Any = None) -> Any:
         return self.data.get(key, default)
 
-    def set(self, key: str, value: Any):
+    def set(self, key: str, value: Any) -> None:
+        """Persist a single top-level key (e.g. ``default_theme``,
+        ``last_provider``) to config.yml.
+
+        Reads/writes the raw file directly rather than dumping ``self.data``
+        wholesale - ``self.data["providers"]`` has the full built-in catalog
+        merged in (see ``_load_config``), so writing it back would silently
+        bloat config.yml with every built-in provider/model on the very
+        first settings change (e.g. switching themes).
+        """
+        try:
+            with open(self.config_path, "r") as f:
+                raw = yaml.safe_load(f) or {}
+        except FileNotFoundError:
+            raw = {}
+        raw[key] = value
+        with open(self.config_path, "w") as f:
+            yaml.dump(raw, f, default_flow_style=False, sort_keys=False)
         self.data[key] = value
-        with open(self.config_path, 'w') as f:
-            yaml.dump(self.data, f)
 
     def get_provider_config(self, provider_id: str) -> Dict[str, Any]:
         """Resolve a provider config, supporting provider/model syntax.
@@ -92,11 +111,14 @@ class ConfigManager:
         # Resolve model: explicit model_name > default_model > options.model
         models = config.get("models", {})
         if models:
-            # Provider uses models list
+            # Provider uses models list. For cloud providers, allow arbitrary
+            # model names (live providers add models faster than any hardcoded
+            # catalog). For local providers, keep validation so typos surface.
             chosen_model = model_name or config.get("default_model") or next(iter(models))
-            if chosen_model not in models:
+            is_cloud = config.get("provider_type") == "cloud"
+            if chosen_model not in models and not is_cloud:
                 raise ValueError(f"Unknown model '{chosen_model}' for provider '{base_id}'. Available: {', '.join(models.keys())}")
-            model_opts = models[chosen_model]
+            model_opts = models.get(chosen_model, {"temperature": 0.7, "max_tokens": 4096})
             config = {
                 **config,
                 "name": f"{config.get('name', base_id)} ({chosen_model})",
@@ -111,8 +133,53 @@ class ConfigManager:
 
         return config
 
+    def add_model(self, provider_id: str, model_name: str, options: Optional[Dict[str, Any]] = None) -> None:
+        """Add a model entry to a provider and persist it to config.yml.
+
+        Reads/writes the raw file directly (not self.data, which has the
+        built-in catalog merged in) so this doesn't bloat config.yml with
+        every catalog default the moment a single custom model is added.
+        """
+        model_name = (model_name or "").strip()
+        if not model_name:
+            raise ValueError("model name must not be empty")
+        if not provider_id:
+            raise ValueError("provider id must not be empty")
+
+        try:
+            with open(self.config_path, "r") as f:
+                raw = yaml.safe_load(f) or {}
+        except FileNotFoundError:
+            raw = {}
+        raw_providers = raw.get("providers", {})
+        provider_cfg = raw_providers.get(provider_id)
+        if provider_cfg is None:
+            # The provider may only exist via the built-in catalog merge (not
+            # yet in the raw file) - confirm it's real, then persist a
+            # minimal override that survives independently of the catalog.
+            if provider_id not in self.data.get("providers", {}):
+                raise ValueError(f"Unknown provider: {provider_id}")
+            provider_cfg = {}
+            raw_providers[provider_id] = provider_cfg
+        models = provider_cfg.setdefault("models", {})
+        if model_name not in models:
+            models[model_name] = options or {"temperature": 0.7, "max_tokens": 4096}
+        raw["providers"] = raw_providers
+        with open(self.config_path, "w") as f:
+            yaml.dump(raw, f, default_flow_style=False, sort_keys=False)
+        self.reload()
+
     def get_default_provider(self) -> str:
-        return os.environ.get("MOTION_DEFAULT_PROVIDER") or self.data.get("providers", {}).get("default", "ollama-cloud")
+        """Resolve which provider/model to launch with, in priority order:
+        an explicit env override, the last model the user switched to in
+        the TUI (persisted via ``last_provider``), then the catalog's
+        configured default.
+        """
+        return (
+            os.environ.get("MOTION_DEFAULT_PROVIDER")
+            or self.data.get("last_provider")
+            or self.data.get("providers", {}).get("default", "ollama-cloud")
+        )
 
     def has_api_key(self, provider_id: str) -> bool:
         """Check whether a provider has a usable API key (env var or config)."""
