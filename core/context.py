@@ -49,7 +49,7 @@ def _is_tool_result(msg: Dict[str, Any]) -> bool:
     return msg.get("role") == "user" and isinstance(content, str) and content.startswith(RESULT_PREFIX)
 
 
-def trim_old_tool_results(messages: List[Dict[str, Any]], keep_recent: int = 6, max_chars: int = 1500) -> int:
+def trim_old_tool_results(messages: List[Dict[str, Any]], keep_recent: int = 2, max_chars: int = 600) -> int:
     """Shorten all but the newest ``keep_recent`` tool results in place.
     Returns the number of characters removed."""
     idxs = [i for i, m in enumerate(messages) if _is_tool_result(m)]

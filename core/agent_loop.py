@@ -59,9 +59,18 @@ logger = logging.getLogger(__name__)
 MAX_TOOL_STEPS = 150
 
 # A single tool result larger than this is cut before it enters the context.
-MAX_RESULT_CHARS = 40_000
+MAX_RESULT_CHARS = 12_000
 
 CONTINUE_PROMPT = "Continue the task using the tool result above."
+
+# After this many consecutive read-only steps, tell the model to answer or batch what's missing.
+# Every step re-sends the whole conversation, so open-ended exploring is what makes runs expensive.
+EXPLORATION_NUDGE_EVERY = 6
+EXPLORATION_NUDGE = (
+    "You have now spent {n} consecutive steps only reading. If you can answer well with what you already "
+    "have, answer now. If something specific is still missing, get all of it in ONE step (several tool "
+    "calls together) and then answer."
+)
 
 # Sub-agents (the `task` tool)
 SUBAGENT_MAX_STEPS = 40
@@ -870,6 +879,9 @@ class TurnRunner:
             for n in nudges:
                 self.messages.append({"role": "user", "content": n})
 
+            if self.inspection_only_loops and self.inspection_only_loops % EXPLORATION_NUDGE_EVERY == 0:
+                self.messages.append({"role": "user", "content": EXPLORATION_NUDGE.format(n=self.inspection_only_loops)})
+                await self.trace("exploration_nudge", f"{self.inspection_only_loops} read-only steps in a row: asked the model to wrap up")
             if (
                 self.agent_mode == "build"
                 and self.inspection_only_loops >= 2

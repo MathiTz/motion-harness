@@ -490,7 +490,7 @@ async def test_old_tool_output_is_trimmed_between_steps(tmp_path: Path):
 async def test_context_is_compacted_when_it_nears_the_window(tmp_path: Path):
     (tmp_path / "big.txt").write_text("x" * 50_000)
     steps = [call(str(i), "read_file", path="big.txt") for i in range(9)] + [text("done")]
-    p = Scripted(steps, window=32768)
+    p = Scripted(steps, window=5000)     # small window: results are small now, so it takes a small window to fill
     resp, _, traces = await run(make_agent(p), workspace=str(tmp_path))
     assert resp == "done"
     assert any(s == "context_compacted" for s, _ in traces)
@@ -529,3 +529,58 @@ async def test_auto_remember_stores_substantive_turns_in_background(tmp_path: Pa
     await asyncio.gather(*list(agent._bg_tasks))
     hits = agent.memory.keyword_search("list files")
     assert hits and "please list the files" in hits[0][1]
+
+
+async def _prompt_tokens_for_long_read_run(tmp_path: Path) -> list:
+    from core.context import messages_tokens
+
+    (tmp_path / "big.py").write_text("".join(f"def function_{i}():\n    return {i} * 2  # padding padding\n\n" for i in range(3000)))
+    steps = [call(str(i), "read_file", path="big.py", offset=1 + i * 200, limit=400) for i in range(14)] + [text("done")]
+    p = Scripted(steps, window=10_000_000)
+    await run(make_agent(p), workspace=str(tmp_path))
+    return [messages_tokens(r["messages"], r["system"]) + len(str(r["tools"])) // 4 for r in p.requests]
+
+
+async def test_a_long_run_of_big_reads_no_longer_balloons_the_context(tmp_path: Path, monkeypatch):
+    """Regression for a real session: 16 steps of reading re-sent ~22k tokens per request (217k in
+    total) because every result stayed in full and one read could be ~15k tokens. Compared against
+    the old limits, re-applied on the same scenario."""
+    import core.agent_loop as agent_loop
+    import core.workspace_tools as wt
+    from core import context
+
+    new = await _prompt_tokens_for_long_read_run(tmp_path / "new") if (tmp_path / "new").mkdir() is None else []
+
+    # the previous policy: 60k-char reads (2000 lines), 40k-char result cap, newest 6 results kept in full
+    monkeypatch.setattr(wt, "READ_MAX_CHARS", 60_000)
+    monkeypatch.setattr(wt, "READ_DEFAULT_LINES", 2000)
+    monkeypatch.setattr(agent_loop, "MAX_RESULT_CHARS", 40_000)
+    orig_trim = context.trim_old_tool_results
+    monkeypatch.setattr(agent_loop, "trim_old_tool_results", lambda msgs: orig_trim(msgs, 6, 1500))
+    (tmp_path / "old").mkdir()
+    old = await _prompt_tokens_for_long_read_run(tmp_path / "old")
+
+    assert max(new) < 12_000, new                       # flat, not climbing without bound
+    assert sum(new) < 0.65 * sum(old), (sum(new), sum(old))   # measured 133k vs 223k over these 15 requests (-40%)
+    assert max(old) > 18_000                            # ...and the old limits really did reproduce the reported ~22k/request
+    assert new[-1] - new[-4] < 1_500                    # extra steps add almost nothing once old results are trimmed
+
+
+async def test_endless_reading_gets_a_wrap_up_nudge(tmp_path: Path):
+    (tmp_path / "f.txt").write_text("x")
+    steps = [call(str(i), "read_file", path="f.txt") for i in range(13)] + [text("answer")]
+    p = Scripted(steps)
+    resp, _, traces = await run(make_agent(p), workspace=str(tmp_path), agent_mode="plan")
+    assert resp == "answer"
+    nudges = [s for s, _ in traces if s == "exploration_nudge"]
+    assert len(nudges) == 2                                                     # after the 6th and the 12th read
+    sent = [m["content"] for m in p.requests[6]["messages"] if m["role"] == "user" and isinstance(m["content"], str)]
+    assert any("6 consecutive steps only reading" in c and "ONE step" in c for c in sent)
+
+
+async def test_writing_resets_the_exploration_counter(tmp_path: Path):
+    (tmp_path / "f.txt").write_text("x")
+    steps = ([call(str(i), "read_file", path="f.txt") for i in range(5)] + [call("w", "write_file", path="o.txt", content="1")]
+             + [call(f"r{i}", "read_file", path="f.txt") for i in range(5)] + [text("done")])
+    _, _, traces = await run(make_agent(Scripted(steps)), workspace=str(tmp_path), agent_mode="build")
+    assert not any(s == "exploration_nudge" for s, _ in traces)                # never 6 in a row
