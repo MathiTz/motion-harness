@@ -211,6 +211,7 @@ class AppState:
         agent = MotionAgent(model_config, mcp_manager=self.mcp_manager)
         agent.auto_skill_synthesis = self.auto_synthesis_enabled
         agent.permissions_config = self.config_manager.data
+        agent.sandbox_mode = str(self.config_manager.get("sandbox", "auto"))
         agent.auto_remember = bool(self.config_manager.get("remember_turns", True))
         try:
             agent.recall_timeout = float(self.config_manager.get("recall_timeout", 2.0))
@@ -3156,6 +3157,7 @@ class ChatPane(Vertical):
         "context_compacted": "🗜 context.compacted",
         "native_tools_disabled": "🔁 native_tools.disabled",
         "todo_update": "☑ todo.update",
+        "sandbox": "🧱 sandbox",
     }
     TRACE_BUFFER_MAX = 400
     TRACE_WIDGET_MAX = 250

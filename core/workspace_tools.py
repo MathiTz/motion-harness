@@ -29,6 +29,7 @@ from urllib.parse import parse_qs, quote, urljoin, urlparse
 import httpx
 
 from core.permissions import CommandPolicy
+from core.sandbox import BLOCKED_HINT, Sandbox
 from core.tool_specs import ALL_TOOL_NAMES, MUTATING_TOOLS, PARALLEL_SAFE, SPEC_BY_NAME, TOOL_SPECS
 from core.toolstate import ToolSession
 
@@ -262,6 +263,7 @@ class WorkspaceTools:
         skills: Any = None,
         notes: Any = None,
         enforce_read_before_write: bool = False,
+        sandbox: "Sandbox | None" = None,
     ) -> None:
         self.root = Path(workspace).expanduser().resolve()
         self.read_only = read_only
@@ -284,6 +286,8 @@ class WorkspaceTools:
         self.skills = skills
         self.notes = notes
         self.enforce_read_before_write = enforce_read_before_write
+        # OS-level write confinement for run_command/run_script/run_python.
+        self.sandbox = sandbox
         self._approved_hosts: set[str] = set()
         self._ignore = IgnoreMatcher(self.root)
         # Fallback scratch memory when no persistent note store is supplied.
@@ -385,9 +389,16 @@ checklist current.
                 "Use relative paths. Do not invent tool results. Do not place tool calls in "
                 "Markdown fences."
             )
+        sandbox_note = ""
+        if self.sandbox is not None and self.sandbox.active and not self.read_only:
+            sandbox_note = (
+                "\nShell and Python commands run in a write sandbox: they can only write inside the "
+                "workspace, paths the user approved, and temp/cache directories. To change files "
+                "elsewhere, use write_file (it asks the user first)."
+            )
         return f"""
 You are an agent running on the user's machine in {mode}.
-Workspace root: {self.root}
+Workspace root: {self.root}{sandbox_note}
 
 You have real filesystem, execution, memory and web tools. When the user asks you to
 create, modify, inspect, run, or fetch something, use these tools directly. Never say you
@@ -535,6 +546,11 @@ answer that follow-up directly.
             self._require_write_access()
             path, args, exe = self._script_spec(arguments)
             await self._authorize_command(f"{exe} {path.name} {' '.join(args)}".strip())
+            if path.suffix == ".py" or "python" in Path(str(exe)).name:
+                try:
+                    await self._authorize_code(path.read_text(encoding="utf-8", errors="replace")[:200_000], path.name)
+                except OSError:
+                    pass
             result = await self._arun([exe, str(path), *args], shell=False, timeout=self._timeout(arguments), on_output=on_output)
             result["path"] = self._display_path(path)
             return result
@@ -543,7 +559,7 @@ answer that follow-up directly.
             code = arguments.get("code")
             if not isinstance(code, str) or not code.strip():
                 raise WorkspaceToolError("code must be a non-empty string")
-            await self._authorize_command(f"python -c {code[:200]!r}")
+            await self._authorize_code(code, "python snippet")
             return await self._arun([sys.executable, "-c", code], shell=False, timeout=self._timeout(arguments), on_output=on_output)
         if name == "ask_user":
             return await self._ask_user(arguments)
@@ -577,6 +593,23 @@ answer that follow-up directly.
             self.policy.remember(command)
         elif choice != "once":
             raise WorkspaceToolError(f"user denied command ({reason}): {command}")
+
+    async def _authorize_code(self, code: str, label: str) -> None:
+        decision, reason = self.policy.decide_code(code)
+        if decision == "allow":
+            return
+        if decision == "deny":
+            raise WorkspaceToolError(f"code refused: {reason}")
+        if self.approve_cb is None:
+            raise WorkspaceToolError(
+                f"{label} needs user approval ({reason}) but no interactive approval is available"
+            )
+        preview = code.strip().replace("\n", " ⏎ ")[:200]
+        choice = await _maybe_await(self.approve_cb("command", f"{label}: {preview}", reason))
+        if choice == "session":
+            self.policy.approved.add(self.policy.code_key(code))
+        elif choice != "once":
+            raise WorkspaceToolError(f"user denied {label} ({reason})")
 
     async def _authorize_url(self, url: str) -> None:
         host = self._private_host(url)
@@ -667,8 +700,12 @@ answer that follow-up directly.
         )
         if os.name == "posix":
             kwargs["start_new_session"] = True  # own process group => killable as a tree
+        sandboxed = self.sandbox is not None and self.sandbox.active
         try:
-            if shell:
+            if sandboxed:
+                argv = self.sandbox.wrap(target, shell=shell, extra_writable=self.allowed_paths)  # type: ignore[union-attr]
+                proc = await asyncio.create_subprocess_exec(*argv, **kwargs)
+            elif shell:
                 proc = await asyncio.create_subprocess_shell(str(target), **kwargs)
             else:
                 proc = await asyncio.create_subprocess_exec(*target, **kwargs)  # type: ignore[misc]
@@ -714,12 +751,17 @@ answer that follow-up directly.
             # Cancelled (Esc) or failed: never leave the child running.
             _kill_process_tree(proc)
             raise
-        return {
+        result = {
             "exit_code": proc.returncode,
             "stdout": "".join(bufs["stdout"]),
             "stderr": "".join(bufs["stderr"]),
             "truncated": total["stdout"] > COMMAND_OUTPUT_LIMIT or total["stderr"] > COMMAND_OUTPUT_LIMIT,
         }
+        if sandboxed and proc.returncode and re.search(
+            r"Operation not permitted|Read-only file system|Permission denied", result["stderr"]
+        ):
+            result["sandbox_note"] = BLOCKED_HINT
+        return result
 
     # ── file tools ───────────────────────────────────────────────────────
     def _list_files(self, arguments: dict[str, Any]) -> dict[str, Any]:

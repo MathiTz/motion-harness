@@ -17,11 +17,15 @@ e.g. ``pytest*`` or ``git push*``.
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import re
 from typing import Iterable, Optional, Set, Tuple
 
 _CATASTROPHIC = [
-    (r"\brm\s+(-[a-zA-Z]*\s+)*-[a-zA-Z]*[rf][a-zA-Z]*\s+(-[a-zA-Z]+\s+)*(/|~|\$HOME|/\*|\*)(\s|$)", "recursive delete of / , ~ or *"),
+    # Target may be quoted, end in "/" or "/*", and be followed by a shell or
+    # code delimiter (so it also matches inside os.system('rm -rf ~') and
+    # "$HOME"). Was previously only matched before whitespace/end-of-string.
+    (r"\brm\s+(-[a-zA-Z]*\s+)*-[a-zA-Z]*[rf][a-zA-Z]*\s+(-[a-zA-Z]+\s+)*[\"']?(/|~/?|\$HOME/?|\$\{HOME\}/?|/\*|~/\*|\$HOME/\*|\*)[\"']*(\s|$|[;&|)\]},])", "recursive delete of / , ~ or *"),
     (r":\(\)\s*\{\s*:\|:&\s*\}\s*;\s*:", "fork bomb"),
     (r"\bmkfs(\.\w+)?\b", "formats a filesystem"),
     (r"\bdd\b[^|;&]*\bof=/dev/", "writes directly to a device"),
@@ -44,7 +48,17 @@ _RISKY = [
     (r"\b(shutdown|reboot|halt|poweroff)\b", "powers off the machine"),
 ]
 
+# Python code the agent wants to run. This is a UX prompt, not a security
+# boundary (code can always be obfuscated): the OS sandbox is what enforces
+# confinement. It exists so common destructive/spawning idioms ask first, the
+# way their shell equivalents do.
+_CODE_RISKY = [
+    (r"\b(shutil\.rmtree|rmtree)\s*\(|\bos\.(remove|unlink|rmdir|removedirs)\s*\(|\.(unlink|rmdir)\s*\(", "deletes files/directories"),
+    (r"\bos\.(system|popen|exec\w*|spawn\w*)\s*\(|\bsubprocess\b|\bpty\.spawn\b", "spawns a subprocess, bypassing the shell command rules"),
+]
+
 _CATASTROPHIC_RE = [(re.compile(p), why) for p, why in _CATASTROPHIC]
+_CODE_RISKY_RE = [(re.compile(p), why) for p, why in _CODE_RISKY]
 _RISKY_RE = [(re.compile(p), why) for p, why in _RISKY]
 
 
@@ -93,6 +107,27 @@ class CommandPolicy:
             return "ask", f"matches permissions.commands.ask ({hit})"
         for rx, why in _RISKY_RE:
             if rx.search(cmd):
+                return "ask", why
+        return "allow", ""
+
+    @staticmethod
+    def code_key(code: str) -> str:
+        return "code:" + hashlib.sha1((code or "").encode("utf-8", "replace")).hexdigest()
+
+    def decide_code(self, code: str) -> Tuple[str, str]:
+        """Classify Python source (from run_python / run_script).
+
+        Catastrophic shell strings embedded in the code are refused; deleting
+        or process-spawning idioms ask, like their shell equivalents.
+        """
+        text = code or ""
+        for rx, why in _CATASTROPHIC_RE:
+            if rx.search(text):
+                return "deny", f"blocked: {why}"
+        if self.code_key(text) in self.approved:
+            return "allow", "approved earlier this session"
+        for rx, why in _CODE_RISKY_RE:
+            if rx.search(text):
                 return "ask", why
         return "allow", ""
 

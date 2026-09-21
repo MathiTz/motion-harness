@@ -38,6 +38,9 @@ class MotionAgent:
         self.notes = NoteStore(self.memory)
         # `permissions:` block from config.yml (command allow/ask/deny rules).
         self.permissions_config: dict = {}
+        # "auto" = confine shell/Python writes with an OS sandbox when the
+        # platform has one; "off" disables it (config.yml: sandbox: off).
+        self.sandbox_mode = "auto"
         # Memory recall must never stall a turn: give up after this many seconds.
         self.recall_timeout = 2.0
         # Store substantive turns in memory (off by default; the TUI enables it

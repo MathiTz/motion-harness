@@ -216,6 +216,7 @@ class TaskManager:
                 # per-task database files).
                 agent = MotionAgent(config, memory_path=":memory:", mcp_manager=self.mcp_manager)
                 agent.permissions_config = self.permissions_config
+                agent.sandbox_mode = str(self.permissions_config.get("sandbox", "auto"))
 
                 # Record user turn
                 task.conversation.append({"role": "user", "content": request.prompt})

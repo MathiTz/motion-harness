@@ -38,6 +38,7 @@ from core.context import compact_messages, trim_old_tool_results
 from core.instructions import build_context_blocks
 from core.permissions import CommandPolicy
 from core.providers import BaseProvider, NativeToolsUnsupported, ToolCall
+from core.sandbox import Sandbox, default_protected_paths
 from core.skills import SkillLibrary
 from core.tool_specs import ALL_TOOL_NAMES, MUTATING_TOOLS
 from core.toolstate import ToolSession
@@ -304,6 +305,7 @@ class TurnRunner:
             skills=SkillLibrary.for_workspace(self.workspace),
             notes=getattr(agent, "notes", None),
             enforce_read_before_write=True,
+            sandbox=Sandbox(self.workspace, getattr(agent, "sandbox_mode", "auto"), default_protected_paths()),
         )
 
     def _pick_mode(self) -> str:
@@ -594,6 +596,8 @@ class TurnRunner:
                     t.cancel()
 
         self.tools = self._build_tools()
+        if self.tools.sandbox is not None and not self.tools.read_only:
+            await self.trace("sandbox", f"Command sandbox: {self.tools.sandbox.describe()}")
         self.mode = self._pick_mode()
         self.system_prompt = self._compose_system_prompt(memory_text, context_blocks)
         self.messages = self.history + [self._user_message()]
