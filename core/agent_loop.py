@@ -537,6 +537,15 @@ class TurnRunner:
         if name in ("web_fetch", "web_search"):
             op = f"`{name}` -> {result.get('status', result.get('count', ''))}"
             return op, op
+        if name == "job_start":
+            op = f"started background job `{result.get('job_id', '')}` ({str(arguments.get('command', ''))[:60]})"
+            return op, op
+        if name == "job_output":
+            op = f"read output of `{result.get('job_id', '')}` ({result.get('lines_returned', 0)} lines, {result.get('status', '')})"
+            return op, op
+        if name == "job_stop":
+            op = f"stopped job `{result.get('job_id', '')}`"
+            return op, op
         if name == "todo_write":
             op = f"updated todo list ({result.get('completed', 0)}/{result.get('todos', 0)} done)"
             return op, op

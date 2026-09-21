@@ -138,6 +138,7 @@ async def run_headless(
             err.write(f"[{stage}] {payload.get('message', '')}\n")
             err.flush()
 
+    session = ToolSession()
     ok, result = True, ""
     try:
         if agent.mcp_manager is not None:
@@ -153,7 +154,7 @@ async def run_headless(
             on_trace_event=on_trace,
             workspace=workspace,
             agent_mode="plan" if plan else "build",
-            session=ToolSession(),
+            session=session,
         )
         if stats["error"]:
             ok = False
@@ -162,6 +163,10 @@ async def run_headless(
     except Exception as exc:
         ok, stats["error"] = False, f"{type(exc).__name__}: {exc}"
     finally:
+        try:  # background jobs must not outlive the run
+            await asyncio.wait_for(session.jobs.stop_all(), timeout=5)
+        except Exception:
+            pass
         for closer in (
             lambda: agent.provider.close(),
             lambda: agent.mcp_manager.close_all() if agent.mcp_manager is not None else None,

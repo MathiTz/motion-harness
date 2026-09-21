@@ -372,7 +372,8 @@ a scraper, a component, etc.), write the files with write_file (or run_python fo
 one-off), then actually execute where possible and summarize the real result. Listing
 files or describing the plan again is not enough. After changing code, verify it (run the
 tests or the script) before you report success. For multi-step work keep a todo_write
-checklist current.
+checklist current. Anything that does not exit on its own (dev servers, watchers) must be
+started with job_start, not run_command; then check it with job_output.
 """.strip()
         if native:
             protocol = (
@@ -515,6 +516,8 @@ answer that follow-up directly.
             return self._mcp_call(arguments)
         if name == "ask_user":
             raise WorkspaceToolError("ask_user needs an interactive session")
+        if name.startswith("job_"):
+            raise WorkspaceToolError(f"{name} runs through the async agent loop")
         raise WorkspaceToolError(f"unknown tool: {name}")
 
     # ── asynchronous dispatch (used by the agent loop) ───────────────────
@@ -563,6 +566,8 @@ answer that follow-up directly.
             return await self._arun([sys.executable, "-c", code], shell=False, timeout=self._timeout(arguments), on_output=on_output)
         if name == "ask_user":
             return await self._ask_user(arguments)
+        if name in ("job_start", "job_output", "job_list", "job_stop"):
+            return await self._ajob(name, arguments)
         if name == "web_fetch":
             await self._authorize_url(str(arguments.get("url", "")))
             return await asyncio.to_thread(self.execute, name, arguments)
@@ -646,6 +651,42 @@ answer that follow-up directly.
             if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_unspecified or ip.is_multicast:
                 return host
         return ""
+
+    async def _ajob(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        from core.jobs import JobError
+
+        jobs = self.session.jobs
+        try:
+            if name == "job_list":
+                return {"jobs": jobs.listing()}
+            if name == "job_start":
+                self._require_write_access()
+                command = arguments.get("command")
+                if not isinstance(command, str) or not command.strip():
+                    raise WorkspaceToolError("command must be a non-empty string")
+                await self._authorize_command(command)
+                if self.sandbox is not None and self.sandbox.active:
+                    argv = self.sandbox.wrap(command, shell=True, extra_writable=self.allowed_paths)
+                else:
+                    argv = ["/bin/sh", "-c", command]
+                job = await jobs.start(argv, command=command, cwd=str(self.root), env=safe_env(),
+                                       name=str(arguments.get("name") or "") or None)
+                return {**job.summary(), "note": "running in the background; read logs with job_output, stop with job_stop"}
+            job_id = arguments.get("job_id")
+            if not isinstance(job_id, str) or not job_id:
+                raise WorkspaceToolError("job_id must be a non-empty string")
+            if name == "job_stop":
+                self._require_write_access()
+                return await jobs.stop(job_id)
+            try:
+                lines = max(1, min(int(arguments.get("lines") or 100), 500))
+            except (TypeError, ValueError):
+                raise WorkspaceToolError("lines must be an integer") from None
+            return await jobs.output(
+                job_id, tail=lines, wait_seconds=arguments.get("wait_seconds") or 0, everything=bool(arguments.get("all")),
+            )
+        except JobError as exc:
+            raise WorkspaceToolError(str(exc)) from exc
 
     async def _ask_user(self, arguments: dict[str, Any]) -> dict[str, Any]:
         question = arguments.get("question")

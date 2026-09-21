@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
+from core.jobs import JobManager
+
 # Don't snapshot huge files for undo (they'd bloat memory); the edit is still
 # allowed, it just isn't restorable.
 MAX_SNAPSHOT_BYTES = 5 * 1024 * 1024
@@ -96,3 +98,5 @@ class ToolSession:
     read_files: Set[Path] = field(default_factory=set)
     approved_commands: Set[str] = field(default_factory=set)
     todos: List[Dict[str, Any]] = field(default_factory=list)
+    # Background processes started with job_start; stopped when the session ends.
+    jobs: JobManager = field(default_factory=JobManager)

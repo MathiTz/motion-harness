@@ -648,6 +648,7 @@ class ChatComposer(Static, can_focus=True):
         ("/resume", "list or reload a saved session"),
         ("/todos", "show the agent's task list"),
         ("/mcp", "show connected MCP servers and tools"),
+        ("/jobs", "background processes (stop <id|all>)"),
         ("/synthesize", "toggle auto skill crystallization"),
         ("/parallel", "run sub-tasks on background workers"),
         ("/tools", "list available agent tools"),
@@ -3024,6 +3025,9 @@ class ChatPane(Vertical):
                 bits.append(f"{self._fmt_tokens(t['tokens'])} tok")
             if self.state.message_queue:
                 bits.append(f"{len(self.state.message_queue)} queued")
+            running_jobs = len(self.state.tool_session.jobs.running())
+            if running_jobs:
+                bits.append(f"⚙ {running_jobs} job{'s' if running_jobs != 1 else ''}")
             out = (t.get("out") or "").replace("[", "\\[").replace("]", "\\]")
             if out:
                 bits.append(f"[dim]{out[:70]}[/]")
@@ -3039,6 +3043,9 @@ class ChatPane(Vertical):
                 if isinstance(last_cost, (int, float)) and last_cost > 0:
                     timing += f" [$warning]{format_cost(last_cost)}[/]"
                 timing += "  [dim]·[/]  "
+            running_jobs = len(self.state.tool_session.jobs.running())
+            if running_jobs:
+                timing += f"⚙ {running_jobs} job{'s' if running_jobs != 1 else ''} (/jobs)  [dim]·[/]  "
             status_text.update(
                 f"{timing}"
                 f"[dim]turns[/] {turns}  [dim]·[/]  "
@@ -3077,7 +3084,7 @@ class ChatPane(Vertical):
         if text.startswith("/tools") or text.strip() == "/help":
             await self._handle_tools_command()
             return
-        if text.split()[0] in ("/compact", "/undo", "/new", "/resume", "/todos", "/mcp", "/diff"):
+        if text.split()[0] in ("/compact", "/undo", "/new", "/resume", "/todos", "/mcp", "/diff", "/jobs"):
             await self._handle_session_command(text, log)
             log.scroll_end(animate=False)
             return
@@ -3745,6 +3752,7 @@ class ChatPane(Vertical):
             "  run:      run_command · run_script · run_python",
             "  web:      web_fetch · web_search   (results are treated as untrusted)",
             "  other:    read_image · todo_write · ask_user · use_skill · memory_save/get · MCP tools",
+            "  jobs:     job_start · job_output · job_list · job_stop  (dev servers, watchers)",
             "",
             "Slash commands:",
             "  /attach [path]              attach a file to your next message (sent once)",
@@ -3756,6 +3764,7 @@ class ChatPane(Vertical):
             "  /todos                      show the agent's task list",
             "  /skill list|show|save|delete   manage reusable skills",
             "  /mcp                        connected MCP servers and tools",
+            "  /jobs [stop <id|all>]       background processes the agent started",
             "  /parallel a ; b ; c         run sub-tasks on background workers",
             "  /synthesize on|off          toggle auto-crystallization into skills",
             "  /auth list|login|logout     manage provider API keys",
@@ -3859,6 +3868,32 @@ class ChatPane(Vertical):
                 widget = DiffMessage("")
                 widget.show(path, diff, added, removed, style, max_lines=200)
                 log.mount(widget)
+            return
+
+        if cmd == "/jobs":
+            jobs = self.state.tool_session.jobs
+            parts_ = arg.split()
+            if parts_ and parts_[0] == "stop":
+                target = parts_[1] if len(parts_) > 1 else ""
+                if target == "all":
+                    n = await jobs.stop_all()
+                    log.mount(SystemMessage(f"■ Stopped {n} job(s)."))
+                elif target:
+                    try:
+                        info = await jobs.stop(target)
+                        log.mount(SystemMessage(f"■ {info['job_id']} {info['status']}"))
+                    except Exception as e:
+                        log.mount(SystemMessage(f"⚠ {e}"))
+                else:
+                    log.mount(SystemMessage("Usage: /jobs stop <id|all>"))
+                self._refresh_status()
+                return
+            listing = jobs.listing()
+            if not listing:
+                log.mount(SystemMessage("No background jobs. The agent starts them with job_start (dev servers, watchers)."))
+            for j in listing:
+                mark = "●" if j["status"] == "running" else "○"
+                log.mount(SystemMessage(f"  {mark} {j['job_id']}  {j['status']:<11} {j['uptime_s']}s  {j['lines']} lines  {j['command'][:70]}"))
             return
 
         if cmd == "/todos":
@@ -4297,6 +4332,10 @@ class MotionTUI(App):
 
     async def on_unmount(self) -> None:
         """Graceful shutdown: close provider, MCP and DB connections."""
+        try:  # never leave the agent's background processes running after we exit
+            await asyncio.wait_for(self.state.tool_session.jobs.stop_all(), timeout=5.0)
+        except Exception:
+            pass
         if self.state.mcp_manager is not None:
             try:
                 await asyncio.wait_for(self.state.mcp_manager.close_all(), timeout=3.0)

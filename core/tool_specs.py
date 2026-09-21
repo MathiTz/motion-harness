@@ -174,6 +174,43 @@ TOOL_SPECS: List[ToolSpec] = [
         "exec",
     ),
     ToolSpec(
+        "job_start",
+        "Start a long-running process in the background (dev server, watcher, slow build) and return "
+        "immediately with a job_id. Read its logs with job_output and stop it with job_stop. Use this "
+        "instead of run_command for anything that does not exit on its own. Same approval rules as run_command.",
+        _obj({"command": _S, "name": _s("short label for the job")}, ["command"]),
+        '{"command": "npm run dev", "name": "dev server"}',
+        "exec",
+    ),
+    ToolSpec(
+        "job_output",
+        "Read a background job's output. By default returns only NEW lines since your last read. "
+        "Set wait_seconds (max 30) to wait for output or exit, e.g. until a server prints that it is ready.",
+        _obj(
+            {
+                "job_id": _S,
+                "wait_seconds": {"type": "number", "description": "wait up to this long for new output"},
+                "lines": {"type": "integer", "description": "max lines to return (default 100)"},
+                "all": {"type": "boolean", "description": "return the last lines instead of only new ones"},
+            },
+            ["job_id"],
+        ),
+        '{"job_id": "job1", "wait_seconds": 5}',
+    ),
+    ToolSpec(
+        "job_list",
+        "List background jobs with their status.",
+        _obj({}),
+        "{}",
+    ),
+    ToolSpec(
+        "job_stop",
+        "Stop a background job (and everything it started).",
+        _obj({"job_id": _S}, ["job_id"]),
+        '{"job_id": "job1"}',
+        "exec",
+    ),
+    ToolSpec(
         "run_script",
         "Run an existing script file with the user's Python (or a given interpreter).",
         _obj({"path": _S, "args": {"type": "array", "items": _S}, "interpreter": _S, "timeout": {"type": "number"}}, ["path"]),
