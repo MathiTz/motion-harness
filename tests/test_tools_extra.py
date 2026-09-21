@@ -273,7 +273,11 @@ def test_command_policy_config_rules_and_session_memory():
     assert policy.decide("make deploy staging")[0] == "ask"
 
 
-def test_sync_execute_still_refuses_denied_commands(tmp_path: Path):
+def test_sync_execute_still_refuses_denied_commands(tmp_path: Path, monkeypatch):
+    def boom(*a, **k):
+        raise AssertionError("a refused command reached subprocess")
+
+    monkeypatch.setattr("core.workspace_tools.subprocess.run", boom)
     with pytest.raises(WorkspaceToolError, match="refused"):
         WorkspaceTools(tmp_path).execute("run_command", {"command": "rm -rf /"})
 

@@ -278,7 +278,11 @@ async def test_session_approval_is_remembered_across_turns(tmp_path: Path):
     assert asked == ["rm -rf d"]  # second turn did not re-prompt
 
 
-async def test_catastrophic_command_is_always_refused(tmp_path: Path):
+async def test_catastrophic_command_is_always_refused(tmp_path: Path, monkeypatch):
+    async def boom(self, *a, **k):
+        raise AssertionError("a refused command reached the process runner")
+
+    monkeypatch.setattr(WorkspaceTools, "_arun", boom)
     p = Scripted([call("1", "run_command", command="rm -rf /"), text("ok")])
     await run(make_agent(p), workspace=str(tmp_path), agent_mode="build", on_approval=lambda *a: "session")
     assert "command refused" in tool_msgs(p.requests[1])[0]["content"]
