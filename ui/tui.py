@@ -42,6 +42,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 from rich.console import Group
 from rich.markdown import Markdown as RichMarkdown
+from rich.syntax import Syntax
 from rich.style import Style
 from rich.text import Text
 
@@ -153,6 +154,10 @@ class AppState:
         # first launch - see TrackingConsentScreen).
         self._session_store: Optional[SessionStore] = None
         self.todos: list[dict] = []
+        # Edits made during the most recent turn, for the /diff command, and
+        # whether to show them inline as they happen (config: show_diffs).
+        self.turn_diffs: list[tuple[str, str, int, int]] = []
+        self.show_diffs: bool = bool(self.config_manager.get("show_diffs", True))
         self.session_context: str = ""  # rolling, bounded summary of the session
         self._context_turns: list[tuple[str, str]] = []  # recent turns used to build context
         self.conversation_turns: list[tuple[str, str]] = []  # (prompt, response)
@@ -525,6 +530,31 @@ class StepsMessage(Static):
     }
     """
 
+class DiffMessage(Static):
+    """A file edit shown as a colored unified diff (what the agent changed)."""
+    DEFAULT_CSS = """
+    DiffMessage {
+        background: $panel;
+        border-left: solid $warning;
+        padding: 0 2;
+        margin: 0 0 1 1;
+    }
+    """
+
+    def show(self, path: str, diff: str, added: int, removed: int, code_theme: str, max_lines: int = 24) -> None:
+        self.path = path
+        self.diff_text = diff
+        lines = diff.splitlines()
+        body = "\n".join(lines[:max_lines])
+        if len(lines) > max_lines:
+            body += f"\n… {len(lines) - max_lines} more line(s) — /diff shows the full change"
+        header = Text(f"± {path}  ", style="bold")
+        header.append(f"+{added}", style="green")
+        header.append(" ")
+        header.append(f"−{removed}", style="red")
+        self.update(Group(header, Syntax(body, "diff", theme=code_theme, word_wrap=True, background_color="default")))
+
+
 class AgentMessage(Static):
     """Agent reply — no box, clean text flow, spaced below the user prompt.
 
@@ -613,6 +643,7 @@ class ChatComposer(Static, can_focus=True):
         ("/skill", "list/show/save/delete reusable skills"),
         ("/compact", "summarize the conversation to free context"),
         ("/undo", "revert the file changes of the last turn"),
+        ("/diff", "show the last turn's edits (on|off toggles inline diffs)"),
         ("/new", "start a fresh conversation"),
         ("/resume", "list or reload a saved session"),
         ("/todos", "show the agent's task list"),
@@ -3046,7 +3077,7 @@ class ChatPane(Vertical):
         if text.startswith("/tools") or text.strip() == "/help":
             await self._handle_tools_command()
             return
-        if text.split()[0] in ("/compact", "/undo", "/new", "/resume", "/todos", "/mcp"):
+        if text.split()[0] in ("/compact", "/undo", "/new", "/resume", "/todos", "/mcp", "/diff"):
             await self._handle_session_command(text, log)
             log.scroll_end(animate=False)
             return
@@ -3330,6 +3361,7 @@ class ChatPane(Vertical):
         turn_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         has_real_usage = False
         summary_info: dict = {}
+        self.state.turn_diffs = []
         if not self.state.seen_first_turn_hint:
             self.state.seen_first_turn_hint = True
             self.notify(
@@ -3498,6 +3530,15 @@ class ChatPane(Vertical):
                 elif event_type == "tool_done":
                     st["phase"] = "thinking"
                     detail = _tool_detail("finished", tool, path)
+                    diff = payload.get("diff") or ""
+                    if diff and not payload.get("created"):
+                        added, removed = int(payload.get("added") or 0), int(payload.get("removed") or 0)
+                        self.state.turn_diffs.append((path, diff, added, removed))
+                        if self.state.show_diffs:
+                            widget = DiffMessage("")
+                            widget.show(path, diff, added, removed, self._theme_code_style(self.app.theme))
+                            log.mount(widget, before=live_response)
+                            log.scroll_end(animate=False)
                 else:
                     st["phase"] = "thinking"
                     detail = _tool_detail("failed", tool, path, error)
@@ -3709,6 +3750,7 @@ class ChatPane(Vertical):
             "  /attach [path]              attach a file to your next message (sent once)",
             "  /compact                    summarize the conversation to free context",
             "  /undo                       revert the file changes made in the last turn",
+            "  /diff [on|off]              show the last turn's edits / toggle inline diffs",
             "  /new                        start a fresh conversation",
             "  /resume [id]                list saved sessions / reload one",
             "  /todos                      show the agent's task list",
@@ -3802,6 +3844,21 @@ class ChatPane(Vertical):
             self.state._session_store = SessionStore(WORKSPACE, Path(arg).stem)
             log.mount(SystemMessage(f"↻ Resumed {len(turns)} turn(s) from {arg}. New turns append to that session."))
             self._refresh_context_panel_safe()
+            return
+
+        if cmd == "/diff":
+            if arg in ("on", "off"):
+                self.state.show_diffs = arg == "on"
+                log.mount(SystemMessage(f"Inline diffs {'shown' if self.state.show_diffs else 'hidden'} for this session."))
+                return
+            if not self.state.turn_diffs:
+                log.mount(SystemMessage("No file edits in the last turn."))
+                return
+            style = self._theme_code_style(self.app.theme)
+            for path, diff, added, removed in self.state.turn_diffs:
+                widget = DiffMessage("")
+                widget.show(path, diff, added, removed, style, max_lines=200)
+                log.mount(widget)
             return
 
         if cmd == "/todos":

@@ -486,7 +486,11 @@ class TurnRunner:
         # Stream every tool op (not just writes) so the UI can show live
         # step-by-step progress for the whole loop, however long it runs.
         await self.emit(f"_tool_ {stream_text}")
-        await self.trace("tool_done", f"Completed {name}", tool=name, path=path, diff=result.get("_diff", ""))
+        await self.trace(
+            "tool_done", f"Completed {name}", tool=name, path=path,
+            diff=result.get("_diff", ""), created=bool(result.get("created")),
+            added=result.get("lines_added", 0), removed=result.get("lines_removed", 0),
+        )
         if name == "todo_write":
             await self.trace("todo_update", f"{result.get('completed', 0)}/{result.get('todos', 0)} done", tool=name)
 
