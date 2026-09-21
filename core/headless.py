@@ -79,6 +79,7 @@ async def run_headless(
     provider_id: Optional[str] = None,
     workspace: Optional[str] = None,
     plan: bool = False,
+    effort: Optional[str] = None,
     output_format: str = "text",
     verbose: bool = False,
     out: Optional[TextIO] = None,
@@ -96,6 +97,8 @@ async def run_headless(
         raise HeadlessUsageError(f"workspace is not a directory: {workspace}")
 
     agent = agent_factory() if agent_factory else build_agent(provider_id)
+    if effort:
+        agent.provider.config.options["reasoning_effort"] = effort
     provider_cfg = getattr(agent.provider, "config", None)
     stats: Dict[str, Any] = {
         "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
@@ -238,6 +241,7 @@ def main_headless(args: Any, stdin: Optional[TextIO] = None) -> int:
             provider_id=args.provider,
             workspace=args.workspace,
             plan=args.plan,
+            effort=args.effort,
             output_format=args.output_format,
             verbose=args.verbose,
         ))

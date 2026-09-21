@@ -366,6 +366,8 @@ def build_parser():
     headless.add_argument("--plan", action="store_true", help="Headless: read-only plan mode (no writes or commands)")
     headless.add_argument("--workspace", default=None, help="Headless: directory the agent works in (default: current directory)")
     headless.add_argument("--stdin", action="store_true", help="Headless: append piped stdin to the prompt as context")
+    headless.add_argument("--effort", choices=("low", "medium", "high"), default=None,
+                          help="Headless: reasoning effort for models that support it (lower = faster and cheaper)")
     headless.add_argument("--verbose", action="store_true", help="Headless: print tool activity to stderr")
     sub = parser.add_subparsers(dest="command")
     auth_parser = sub.add_parser("auth", help="Manage provider API keys")
