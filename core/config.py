@@ -29,6 +29,9 @@ class ConfigManager:
     def __init__(self, config_path: str = ""):
         if config_path:
             self.config_path = config_path
+        elif os.environ.get("MOTION_CONFIG"):
+            # Explicit config file (used by scripts/CI and the end-to-end tests).
+            self.config_path = os.environ["MOTION_CONFIG"]
         else:
             # Try config.yml first, fall back to config.example.yml
             self.config_path = next((p for p in self.CONFIG_PATHS if os.path.exists(p)), self.CONFIG_PATHS[0])
