@@ -227,6 +227,9 @@ class AppState:
         agent.permissions_config = self.config_manager.data
         from core.sandbox import sandbox_settings
 
+        from core.budget import Budget
+
+        agent.budget = Budget.from_config(self.config_manager.get)
         agent.sandbox_options = sandbox_settings(self.config_manager.get)
         agent.sandbox_mode = agent.sandbox_options["mode"]
         agent.auto_remember = bool(self.config_manager.get("remember_turns", True))
@@ -660,6 +663,7 @@ class ChatComposer(Static, can_focus=True):
         ("/trajectory", "steps, tokens and tools of the last turn (copy|save|all)"),
         ("/tracking", "save session transcripts locally (on|off)"),
         ("/effort", "reasoning effort for the model (low|medium|high|off)"),
+        ("/budget", "per-turn limits (steps N | tokens N | cost X | seconds N | off)"),
         ("/new", "start a fresh conversation"),
         ("/resume", "list or reload a saved session"),
         ("/todos", "show the agent's task list"),
@@ -3239,7 +3243,7 @@ class ChatPane(Vertical):
         if text.startswith("/tools") or text.strip() == "/help":
             await self._handle_tools_command()
             return
-        if text.split()[0] in ("/compact", "/undo", "/new", "/resume", "/todos", "/mcp", "/diff", "/jobs", "/trajectory", "/tracking", "/effort"):
+        if text.split()[0] in ("/compact", "/undo", "/new", "/resume", "/todos", "/mcp", "/diff", "/jobs", "/trajectory", "/tracking", "/effort", "/budget"):
             await self._handle_session_command(text, log)
             log.scroll_end(animate=False)
             return
@@ -3931,6 +3935,7 @@ class ChatPane(Vertical):
             "  /trajectory [copy|save|all] steps, tokens and tool results of the last turn (F10 copies the trace log)",
             "  /tracking [on|off]          save session transcripts locally (asked once at first launch)",
             "  /effort [low|medium|high|off]  how hard reasoning models think (lower = faster and cheaper)",
+            "  /budget [steps N|tokens N|cost X|seconds N|off]  stop a turn that uses more than this",
             "  /new                        start a fresh conversation",
             "  /resume [id]                list saved sessions / reload one",
             "  /todos                      show the agent's task list",
@@ -4029,6 +4034,36 @@ class ChatPane(Vertical):
 
         if cmd == "/trajectory":
             self._trajectory_command(arg, log)
+            return
+
+        if cmd == "/budget":
+            from core.budget import Budget
+
+            budget = self.state.agent.budget or Budget()
+            words = arg.lower().split()
+            fields = {"steps": ("max_steps", int), "tokens": ("max_tokens", int), "cost": ("max_cost_usd", float),
+                      "seconds": ("max_seconds", float)}
+            if words == ["off"]:
+                budget = Budget()
+            elif words:
+                if len(words) != 2 or words[0] not in fields:
+                    log.mount(SystemMessage("Usage: /budget [steps N | tokens N | cost X | seconds N | off]"))
+                    return
+                name, kind = fields[words[0]]
+                try:
+                    value = kind(words[1].lstrip("$"))
+                    if value <= 0:
+                        raise ValueError
+                except ValueError:
+                    log.mount(SystemMessage(f"Usage: /budget {words[0]} <positive number>"))
+                    return
+                setattr(budget, name, value)
+            self.state.agent.budget = budget
+            log.mount(SystemMessage(
+                f"⏱ Per-turn budget: {budget.describe()}"
+                + (" — a turn that reaches it gets one last tool-free step to answer." if budget.active else
+                   " — set one with /budget steps 12 (or tokens / cost / seconds).")
+            ))
             return
 
         if cmd == "/effort":

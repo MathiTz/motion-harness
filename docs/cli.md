@@ -76,6 +76,7 @@ automatically.
 motion -p "summarize README.md"                       # answer on stdout
 motion -p "..." --output-format json                  # one JSON object
 motion -p "..." --output-format stream-json           # NDJSON events, then the result
+motion -p "..." --max-steps 10 --max-cost 0.25 --effort low   # bound a scripted run
 motion -p "..." --plan --workspace ~/proj --verbose   # read-only, other dir, tool activity on stderr
 echo "explain this" | motion -p -                     # prompt from stdin
 git diff | motion -p "review this diff" --stdin       # stdin appended as context
@@ -94,6 +95,8 @@ The JSON result has `ok`, `result`, `error`, `provider`, `model`, `mode`, `steps
 | `/diff [on\|off]` | Show the last turn's edits in full / toggle inline diffs |
 | `/jobs [stop <id\|all>]` | List background processes; stop one or all |
 | `/trajectory [copy\|save [full]\|all]` | Steps of the last turn (or `all` the session): time, tokens, tool calls and result sizes, plus where the cost went. `copy` → clipboard, `save` → `.motion/trajectories/*.json` (`full` adds every message sent) |
+| `/budget [steps N\|tokens N\|cost X\|seconds N\|off]` | Show or set per-turn limits (session only; persist them under `budget:` in `config.yml`) |
+| `/effort [low\|medium\|high\|off]` | Set `reasoning_effort` for the current model this session |
 | `/tracking [on\|off]` | Whether session transcripts are saved to `.motion/sessions/`. No argument shows the state; use `on` if you declined the first-launch prompt |
 | `/new` | Start a fresh conversation (approvals and settings are kept) |
 | `/resume [id]` | List saved sessions, or reload one (needs interaction tracking) |
@@ -108,6 +111,11 @@ The JSON result has `ok`, `result`, `error`, `provider`, `model`, `mode`, `steps
 ## config.yml reference (optional keys)
 
 ```yaml
+budget:                      # per-turn limits, all optional
+  max_steps: 12              # model calls
+  max_tokens: 150000         # prompt + completion
+  max_cost_usd: 0.50         # needs input_mtok/output_mtok pricing on the model
+  max_seconds: 180
 sandbox: auto                # auto = OS write sandbox for shell/Python where available; off disables it
 sandbox_allow_read: []       # credential folders to make readable again, e.g. ["~/.aws"] (default: hidden)
 sandbox_deny_read: []        # extra folders to hide, e.g. ["~/.ssh"]

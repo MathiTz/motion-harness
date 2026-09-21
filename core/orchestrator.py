@@ -218,6 +218,9 @@ class TaskManager:
                 agent.permissions_config = self.permissions_config
                 from core.sandbox import sandbox_settings
 
+                from core.budget import Budget
+
+                agent.budget = Budget.from_config(self.permissions_config.get)
                 agent.sandbox_options = sandbox_settings(self.permissions_config.get)
                 agent.sandbox_mode = agent.sandbox_options["mode"]
 

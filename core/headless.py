@@ -63,6 +63,9 @@ def build_agent(provider_id: Optional[str]):
     agent.permissions_config = cm.data
     from core.sandbox import sandbox_settings
 
+    from core.budget import Budget
+
+    agent.budget = Budget.from_config(cm.get)
     agent.sandbox_options = sandbox_settings(cm.get)
     agent.sandbox_mode = agent.sandbox_options["mode"]
     # One-shot runs (often in CI) shouldn't write to the long-term memory DB
@@ -83,6 +86,7 @@ async def run_headless(
     workspace: Optional[str] = None,
     plan: bool = False,
     effort: Optional[str] = None,
+    limits: Optional[Dict[str, Any]] = None,
     output_format: str = "text",
     verbose: bool = False,
     out: Optional[TextIO] = None,
@@ -102,11 +106,16 @@ async def run_headless(
     agent = agent_factory() if agent_factory else build_agent(provider_id)
     if effort:
         agent.provider.config.options["reasoning_effort"] = effort
+    if limits:  # command-line limits override config.yml
+        from core.budget import Budget
+
+        base = getattr(agent, "budget", None) or Budget()
+        agent.budget = Budget(**{**base.__dict__, **{k: v for k, v in limits.items() if v is not None}})
     provider_cfg = getattr(agent.provider, "config", None)
     stats: Dict[str, Any] = {
         "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         "steps": 0, "tool_calls": 0, "ttft_s": None, "elapsed_s": None, "error": None,
-        "trajectory": [],
+        "trajectory": [], "budget_hit": None,
     }
 
     def event(obj: Dict[str, Any]) -> None:
@@ -136,6 +145,8 @@ async def run_headless(
             stats["steps"] = payload.get("step", stats["steps"])
             if stats["ttft_s"] is None and payload.get("ttft_ms") is not None:
                 stats["ttft_s"] = payload["ttft_ms"] / 1000
+        elif stage == "budget_hit":
+            stats["budget_hit"] = payload.get("reason")
         elif stage == "step_record":
             stats["trajectory"].append(payload["record"])
             event({"type": "step", **payload["record"]})
@@ -214,6 +225,7 @@ async def run_headless(
         "usage": usage,
         "cost_usd": cost,
         "trajectory": stats["trajectory"],
+        "budget_hit": stats["budget_hit"],
     }
     if output_format in ("json", "stream-json"):
         out.write(json.dumps(summary, ensure_ascii=False) + "\n")
@@ -245,6 +257,8 @@ def main_headless(args: Any, stdin: Optional[TextIO] = None) -> int:
             workspace=args.workspace,
             plan=args.plan,
             effort=args.effort,
+            limits={"max_steps": args.max_steps, "max_tokens": args.max_tokens,
+                    "max_cost_usd": args.max_cost, "max_seconds": args.max_seconds},
             output_format=args.output_format,
             verbose=args.verbose,
         ))

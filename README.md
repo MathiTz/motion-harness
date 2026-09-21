@@ -145,6 +145,7 @@ A high-performance terminal interface built with `Textual`, designed for daily-d
 - **Background jobs.** `job_start` runs a dev server or watcher in the background (same approvals and sandbox as commands); `job_output` returns only new lines and can wait for output; `job_stop` ends the whole process tree. `/jobs` lists them, `/jobs stop <id|all>` stops them, the status line shows how many are running, and they are stopped when the app exits.
 - **Diffs.** Edits to existing files appear inline as a colored diff; `/diff` replays the last turn's edits in full and `/diff off` (or `show_diffs: false`) hides them.
 - **Trajectory.** `/trajectory` shows every model step of the last turn: time, first-token latency, prompt/output tokens, and each tool call with its result size, followed by plain-language findings (prompt growth, the largest results, repeated calls, how much time was the model thinking). `/trajectory copy` puts it on the clipboard, `save` writes JSON under `.motion/trajectories/` (`save full` also stores the system prompt and every message sent to the model). `F10` (or Ctrl+K → Copy trace log) copies the whole trace panel as plain text. Sub-agent steps appear labelled `sub:<name>`.
+- **Budgets.** Cap a turn by model steps, tokens, cost or seconds (`budget:` in `config.yml`, `/budget steps 12`, or `--max-steps/--max-tokens/--max-cost/--max-seconds` headless). When a limit is reached the model gets one last tool-free step to answer with what it already gathered, and the reply ends with a "Stopped early" note. Sub-agent tokens count toward the lead's budget.
 - **Cost.** Per-turn and session cost are computed from real token usage and the model's pricing (`input_mtok` / `output_mtok`, USD per million tokens; the catalog has them for the Ollama Cloud models, set them in `config.yml` for others). Models without pricing show `cost n/a`; local models are free.
 
 #### 🤖 Headless mode
@@ -195,6 +196,8 @@ Everything the harness writes into your project goes under one self-ignoring fol
 | `/diff [on\|off]` | Show the last turn's edits / toggle inline diffs |
 | `/jobs [stop <id\|all>]` | Background processes the agent started |
 | `/trajectory [copy\|save [full]\|all]` | Per-step time, tokens and tool results of the last turn, with where the cost went |
+| `/budget [steps N\|tokens N\|cost X\|seconds N\|off]` | Per-turn limits; a turn that reaches one is asked to answer with what it has |
+| `/effort [low\|medium\|high\|off]` | Reasoning effort for models that support it (lower = faster and cheaper) |
 | `/tracking [on\|off]` | Save session transcripts locally (asked once at first launch; this undoes "No thanks") |
 | `/new` | Start a fresh conversation |
 | `/resume [id]` | List saved sessions / reload one |

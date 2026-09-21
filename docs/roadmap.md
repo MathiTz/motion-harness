@@ -72,7 +72,7 @@ Speed, correctness and safety work that the chat UX sits on.
 ### Still open
 - [ ] Sandbox: Windows backend; hiding *all* of $HOME (only credential stores and harness secrets are hidden today)
 - [ ] Sandbox on Linux is implemented but only exercised where bubblewrap works (CI runners often lack user namespaces)
-- [ ] User-configurable hooks (pre/post tool), per-turn token/cost/time budgets
+- [ ] User-configurable hooks (pre/post tool)
 - [ ] Multi-file patch tool; model failover; recorded-provider evals against real models
 - [ ] Live verification of the Anthropic and OpenAI wire formats (mock-tested only)
 

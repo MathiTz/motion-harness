@@ -36,6 +36,7 @@ import httpx
 
 from core.context import compact_messages, messages_tokens, trim_old_tool_results
 from core.trajectory import preview_args
+from core.budget import Budget
 from core.instructions import build_context_blocks
 from core.permissions import CommandPolicy
 from core.providers import BaseProvider, NativeToolsUnsupported, ToolCall
@@ -66,6 +67,12 @@ CONTINUE_PROMPT = "Continue the task using the tool result above."
 
 # After this many consecutive read-only steps, tell the model to answer or batch what's missing.
 # Every step re-sends the whole conversation, so open-ended exploring is what makes runs expensive.
+BUDGET_WRAPUP = (
+    "Budget reached: {reason}. Do not call any more tools. Answer now with the best result you can give from what "
+    "you have already gathered, and say plainly what you did not get to."
+)
+BUDGET_NOTE = "\n\n⚠️ Stopped early: this turn's budget was reached ({reason}). Ask me to continue, or raise the budget."
+
 EXPLORATION_NUDGE_EVERY = 6
 EXPLORATION_NUDGE = (
     "You have now spent {n} consecutive steps only reading. If you can answer well with what you already "
@@ -102,6 +109,18 @@ class Outcome:
     failed: bool = False
     nudge: Optional[str] = None
     duration_s: float = 0.0
+
+
+_MOTION_TOOL_BLOCK = re.compile(r"<motion_tool>.*?(?:</motion_tool>|$)", re.DOTALL)
+
+
+def _strip_tool_markup(text: str) -> str:
+    """Remove tool-call markup from a forced final answer (a wrap-up step must not execute or show it)."""
+    from core.workspace_tools import DIRECT_TOOL_PATTERN, DSML_TOOL_PATTERN
+
+    for pattern in (_MOTION_TOOL_BLOCK, DIRECT_TOOL_PATTERN, DSML_TOOL_PATTERN):
+        text = pattern.sub("", text)
+    return text.strip() or "(no answer could be produced within the budget)"
 
 
 class _ToolTagFilter:
@@ -215,6 +234,7 @@ class TurnRunner:
         self.turn_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         self._pending_images: List[Dict[str, str]] = []
         self.tool_call_count = 0
+        self.no_tools = False  # set for the final, budget-forced answer
         self.first_ttft: Optional[float] = None
         self.trajectory: List[Dict[str, Any]] = []
 
@@ -389,7 +409,7 @@ class TurnRunner:
             return StepResult(text=text or "", usage=usage)
 
         res = StepResult()
-        tools_arg = self.tools.tool_schemas() if self.mode == "native" else None  # type: ignore[union-attr]
+        tools_arg = self.tools.tool_schemas() if self.mode == "native" and not self.no_tools else None  # type: ignore[union-attr]
         tag_filter = _ToolTagFilter() if self.mode == "xml" else None
         started = time.monotonic()
         async for ev in provider.chat_stream(self.messages, system_prompt=self.system_prompt, tools=tools_arg):
@@ -688,10 +708,11 @@ class TurnRunner:
                 asyncio.ensure_future(self.emit(f"_tool_ ↳ [{label}] {chunk[7:]}"))
 
         def on_trace(stage: str, payload: Dict[str, Any]) -> None:
-            if stage == "usage":  # sub-agent tokens count toward the turn's usage and cost
-                asyncio.ensure_future(self.trace("usage", f"sub-agent usage ({label})", **{
-                    k: payload[k] for k in ("prompt_tokens", "completion_tokens", "total_tokens") if k in payload
-                }))
+            if stage == "usage":  # sub-agent tokens count toward the turn's usage, cost and budget
+                sub_usage = {k: payload[k] for k in ("prompt_tokens", "completion_tokens", "total_tokens") if k in payload}
+                for k in self.turn_usage:  # synchronously: the budget check must never miss it
+                    self.turn_usage[k] += int(sub_usage.get(k) or 0)
+                asyncio.ensure_future(self.trace("usage", f"sub-agent usage ({label})", **sub_usage))
             elif stage == "model_step":
                 forwarded["steps"] = payload.get("step", forwarded["steps"])
             elif stage == "step_record":
@@ -792,7 +813,19 @@ class TurnRunner:
         final_streamed = False
         empty_retries = 0
 
+        budget: Budget = getattr(agent, "budget", None) or Budget()
+        wrapping_up = False
         for tool_step in range(self.max_steps):
+            if budget.active and tool_step > 0 and not wrapping_up and self.depth == 0:
+                pcfg = getattr(self.provider, "config", None)
+                reason = budget.exceeded(
+                    steps=tool_step, usage=self.turn_usage, elapsed=time.monotonic() - t_turn,
+                    provider_type=getattr(pcfg, "provider_type", "cloud"), options=getattr(pcfg, "options", {}) or {},
+                )
+                if reason:
+                    wrapping_up, self.no_tools, budget_reason = True, True, reason
+                    self.messages.append({"role": "user", "content": BUDGET_WRAPUP.format(reason=reason)})
+                    await self.trace("budget_hit", f"Budget reached: {reason}", reason=reason)
             trim_old_tool_results(self.messages)
             if compact_messages(self.messages, self.system_prompt, window, prompt_index):
                 await self.trace("context_compacted", "Trimmed older tool steps to stay within the context window")
@@ -844,6 +877,12 @@ class TurnRunner:
             )
 
             candidate = step.text
+            if wrapping_up:
+                # the forced answer: whatever it said is the response; any tool call is ignored
+                tool_response = _strip_tool_markup(candidate) + BUDGET_NOTE.format(reason=budget_reason)
+                final_streamed = False
+                await self._record_step(tool_step + 1, step, step_secs, ctx_tokens)
+                break
             calls: List[ToolCall]
             if self.mode == "native":
                 calls = list(step.tool_calls)
