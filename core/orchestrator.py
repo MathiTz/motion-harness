@@ -216,6 +216,7 @@ class TaskManager:
                 # per-task database files).
                 agent = MotionAgent(config, memory_path=":memory:", mcp_manager=self.mcp_manager)
                 agent.permissions_config = self.permissions_config
+                agent.sandbox_mode = str(self.permissions_config.get("sandbox", "auto"))
 
                 # Record user turn
                 task.conversation.append({"role": "user", "content": request.prompt})
@@ -252,14 +253,18 @@ class TaskManager:
                 # No interactive callbacks: background tasks cannot prompt the
                 # user, so risky commands / private-network fetches / ask_user
                 # are refused rather than silently approved.
-                result = await agent.run(
-                    request.prompt,
-                    target="user",
-                    on_stream_chunk=on_stream_chunk,
-                    workspace=self.workspace_path,
-                    agent_mode="build",
-                    session=ToolSession(),
-                )
+                task_session = ToolSession()
+                try:
+                    result = await agent.run(
+                        request.prompt,
+                        target="user",
+                        on_stream_chunk=on_stream_chunk,
+                        workspace=self.workspace_path,
+                        agent_mode="build",
+                        session=task_session,
+                    )
+                finally:
+                    await task_session.jobs.stop_all()
 
                 # The return value is the authoritative final answer.
                 if result:

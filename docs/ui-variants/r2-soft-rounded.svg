@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="800" viewBox="0 0 1280 800">
+  <rect width="1280" height="800" fill="#191622"/>
+  <rect x="16" y="16" width="1248" height="40" rx="16" fill="#23212B"/>
+  <text x="34" y="42" fill="#E1E1E6" font-family="Menlo, monospace" font-size="15">R2 — Soft Rounded</text>
+  <rect x="16" y="66" width="1026" height="690" rx="18" fill="#1d1a27"/>
+  <rect x="1052" y="66" width="212" height="690" rx="18" fill="#2A2734"/>
+  <rect x="34" y="86" width="992" height="24" rx="12" fill="#2A2734"/>
+  <rect x="44" y="89" width="72" height="18" rx="9" fill="#2f2b3d" stroke="#78D1E1"/>
+  <rect x="124" y="89" width="72" height="18" rx="9" fill="#23212B"/>
+  <rect x="204" y="89" width="72" height="18" rx="9" fill="#23212B"/>
+  <rect x="40" y="126" width="740" height="540" rx="18" fill="#23212B"/>
+  <rect x="790" y="126" width="230" height="540" rx="18" fill="#262330"/>
+  <rect x="54" y="156" width="678" height="96" rx="20" fill="#2D2939"/>
+  <rect x="82" y="268" width="678" height="96" rx="20" fill="#252231"/>
+  <rect x="54" y="380" width="678" height="96" rx="20" fill="#2D2939"/>
+  <rect x="82" y="492" width="678" height="96" rx="20" fill="#252231"/>
+  <rect x="800" y="164" width="206" height="36" rx="14" fill="#23212B"/>
+  <rect x="800" y="208" width="206" height="36" rx="14" fill="#23212B"/>
+  <rect x="800" y="252" width="206" height="36" rx="14" fill="#23212B"/>
+  <rect x="40" y="684" width="980" height="58" rx="18" fill="#2A2734"/>
+  <rect x="56" y="700" width="700" height="28" rx="14" fill="#191622"/>
+  <rect x="770" y="700" width="72" height="28" rx="14" fill="#23212B"/>
+  <rect x="850" y="700" width="72" height="28" rx="14" fill="#23212B"/>
+  <rect x="930" y="700" width="72" height="28" rx="14" fill="#23212B"/>
+  <rect x="1068" y="84" width="180" height="44" rx="14" fill="#23212B"/>
+  <rect x="1068" y="136" width="180" height="72" rx="14" fill="#23212B"/>
+  <text x="34" y="784" fill="#A8A4B8" font-family="Menlo, monospace" font-size="12">Large radius, soft grouping, almost no hard lines</text>
+</svg>

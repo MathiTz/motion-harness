@@ -38,6 +38,9 @@ class MotionAgent:
         self.notes = NoteStore(self.memory)
         # `permissions:` block from config.yml (command allow/ask/deny rules).
         self.permissions_config: dict = {}
+        # "auto" = confine shell/Python writes with an OS sandbox when the
+        # platform has one; "off" disables it (config.yml: sandbox: off).
+        self.sandbox_mode = "auto"
         # Memory recall must never stall a turn: give up after this many seconds.
         self.recall_timeout = 2.0
         # Store substantive turns in memory (off by default; the TUI enables it
@@ -347,21 +350,23 @@ def cmd_auth(args) -> None:
             print(f"No stored key for {provider}.")
 
 
-if __name__ == "__main__":
-    import sys
+def build_parser():
     import argparse
-
-    # Load .env before touching ConfigManager anywhere below - the TUI launch
-    # path (the default, no-flags invocation) previously skipped this
-    # entirely, so API keys placed in .env never became visible to
-    # has_api_key()/ModelDialog and no models appeared to choose from.
-    _load_dotenv(REPO_DIR)
 
     parser = argparse.ArgumentParser(description="Motion Agent")
     parser.add_argument("--test", action="store_true", help="Run Caveman compression test (no model needed)")
     parser.add_argument("--list", action="store_true", help="List available providers")
     parser.add_argument("--provider", type=str, default=None, help="Provider to use (e.g. ollama-cloud, ollama-cloud/gemma4:31b, claude, openai)")
     parser.add_argument("--chat", action="store_true", help="Launch in chat REPL mode instead of TUI")
+    headless = parser.add_argument_group("headless (non-interactive) mode")
+    headless.add_argument("-p", "--prompt", nargs="?", const="-", default=None, metavar="PROMPT",
+                          help="Run one prompt non-interactively and print the result ('-' or no value reads the prompt from stdin)")
+    headless.add_argument("--output-format", choices=("text", "json", "stream-json"), default="text",
+                          help="Headless output: final text (default), one JSON object, or NDJSON events")
+    headless.add_argument("--plan", action="store_true", help="Headless: read-only plan mode (no writes or commands)")
+    headless.add_argument("--workspace", default=None, help="Headless: directory the agent works in (default: current directory)")
+    headless.add_argument("--stdin", action="store_true", help="Headless: append piped stdin to the prompt as context")
+    headless.add_argument("--verbose", action="store_true", help="Headless: print tool activity to stderr")
     sub = parser.add_subparsers(dest="command")
     auth_parser = sub.add_parser("auth", help="Manage provider API keys")
     auth_sub = auth_parser.add_subparsers(dest="auth_action", required=True)
@@ -370,8 +375,24 @@ if __name__ == "__main__":
     login_p.add_argument("auth_provider", nargs="?", help="Provider id (e.g. ollama-cloud)")
     logout_p = auth_sub.add_parser("logout", help="Remove a stored API key")
     logout_p.add_argument("auth_provider", nargs="?", help="Provider id (e.g. ollama-cloud)")
-    args = parser.parse_args()
+    return parser
 
+
+def main(argv=None) -> int:
+    import sys
+
+    # Load .env before touching ConfigManager anywhere below - the TUI launch
+    # path (the default, no-flags invocation) previously skipped this
+    # entirely, so API keys placed in .env never became visible to
+    # has_api_key()/ModelDialog and no models appeared to choose from.
+    _load_dotenv(REPO_DIR)
+
+    args = build_parser().parse_args(argv)
+
+    if args.prompt is not None:
+        from core.headless import main_headless
+
+        return main_headless(args)
     if args.command == "auth":
         cmd_auth(args)
     elif args.list:
@@ -399,3 +420,10 @@ if __name__ == "__main__":
             options=provider_cfg.get("options", {}),
         )
         launch_tui(model_config, provider_id=provider_id)
+    return 0
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(main())

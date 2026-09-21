@@ -1,6 +1,7 @@
 """Tests for the tool additions: grep, gitignore-aware listing, read windows,
 diffs, SSRF guard, command policy, undo, skills, sessions, instructions."""
 import asyncio
+import json
 import socket
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -273,7 +274,11 @@ def test_command_policy_config_rules_and_session_memory():
     assert policy.decide("make deploy staging")[0] == "ask"
 
 
-def test_sync_execute_still_refuses_denied_commands(tmp_path: Path):
+def test_sync_execute_still_refuses_denied_commands(tmp_path: Path, monkeypatch):
+    def boom(*a, **k):
+        raise AssertionError("a refused command reached subprocess")
+
+    monkeypatch.setattr("core.workspace_tools.subprocess.run", boom)
     with pytest.raises(WorkspaceToolError, match="refused"):
         WorkspaceTools(tmp_path).execute("run_command", {"command": "rm -rf /"})
 
@@ -382,3 +387,46 @@ def test_tool_session_shares_state_between_tools_instances(tmp_path: Path):
     WorkspaceTools(tmp_path, session=session).execute("read_file", {"path": "f.txt"})
     again = WorkspaceTools(tmp_path, session=session, enforce_read_before_write=True)
     again.execute("write_file", {"path": "f.txt", "content": "y"})  # read state persisted across instances
+
+
+# ── token budget ────────────────────────────────────────────────────────────
+
+def test_default_read_window_is_small_and_pageable(tmp_path: Path):
+    (tmp_path / "f.txt").write_text("".join(f"line number {i:04d} of the file\n" for i in range(1, 1001)))
+    tools = WorkspaceTools(tmp_path)
+    first = tools.execute("read_file", {"path": "f.txt"})
+    assert first["end_line"] == 200 and first["truncated"] and first["next_offset"] == 201
+    assert "grep" in first["hint"] and "offset" in first["hint"]
+    assert len(json.dumps(first)) < 8_500                                    # ~2k tokens, was up to ~15k
+    second = tools.execute("read_file", {"path": "f.txt", "offset": first["next_offset"]})
+    assert second["start_line"] == 201 and second["content"].startswith("line number 0201")
+
+
+def test_one_enormous_line_is_cut_not_dropped(tmp_path: Path):
+    """A minified file is a single huge line: the smaller cap must return its start, not nothing."""
+    (tmp_path / "min.js").write_text("x" * 100_000)
+    r = WorkspaceTools(tmp_path).execute("read_file", {"path": "min.js"})
+    assert len(r["content"]) == 8_000 and r["truncated"] and "line 1 alone" in r["hint"]
+
+
+def test_listing_and_search_results_are_capped_with_a_hint(tmp_path: Path):
+    for i in range(400):
+        (tmp_path / f"f{i:03d}.py").write_text("needle here\n")
+    tools = WorkspaceTools(tmp_path)
+    listing = tools.execute("list_files", {"path": "."})
+    assert len(listing["files"]) == 150 and listing["total"] == 400 and listing["truncated"] and "narrow" in listing["hint"]
+    assert len(tools.execute("glob_files", {"pattern": "*.py"})["files"]) == 150
+    found = tools.execute("grep", {"pattern": "needle"})
+    assert found["count"] == 50 and found["truncated"]
+    (tmp_path / "long.txt").write_text("needle " + "y" * 1000 + "\n")
+    assert len(tools.execute("grep", {"pattern": "needle", "path": "long.txt"})["matches"][0]["text"]) == 200
+
+
+def test_old_results_are_trimmed_sooner_and_prompt_asks_for_economy(tmp_path: Path):
+    from core.context import trim_old_tool_results
+
+    msgs = [{"role": "tool", "content": "z" * 5000} for _ in range(6)]
+    trim_old_tool_results(msgs)
+    assert [len(m["content"]) > 1500 for m in msgs] == [False, False, False, False, True, True]   # newest 2 stay whole
+    assert "BE ECONOMICAL" in WorkspaceTools(tmp_path).system_instructions(native=True)
+    assert "re-sent to the model on every later step" in WorkspaceTools(tmp_path).system_instructions(native=False)

@@ -34,10 +34,12 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 
-from core.context import compact_messages, trim_old_tool_results
+from core.context import compact_messages, messages_tokens, trim_old_tool_results
+from core.trajectory import preview_args
 from core.instructions import build_context_blocks
 from core.permissions import CommandPolicy
 from core.providers import BaseProvider, NativeToolsUnsupported, ToolCall
+from core.sandbox import Sandbox, default_protected_paths
 from core.skills import SkillLibrary
 from core.tool_specs import ALL_TOOL_NAMES, MUTATING_TOOLS
 from core.toolstate import ToolSession
@@ -58,9 +60,30 @@ logger = logging.getLogger(__name__)
 MAX_TOOL_STEPS = 150
 
 # A single tool result larger than this is cut before it enters the context.
-MAX_RESULT_CHARS = 40_000
+MAX_RESULT_CHARS = 12_000
 
 CONTINUE_PROMPT = "Continue the task using the tool result above."
+
+# After this many consecutive read-only steps, tell the model to answer or batch what's missing.
+# Every step re-sends the whole conversation, so open-ended exploring is what makes runs expensive.
+EXPLORATION_NUDGE_EVERY = 6
+EXPLORATION_NUDGE = (
+    "You have now spent {n} consecutive steps only reading. If you can answer well with what you already "
+    "have, answer now. If something specific is still missing, get all of it in ONE step (several tool "
+    "calls together) and then answer."
+)
+
+# Sub-agents (the `task` tool)
+SUBAGENT_MAX_STEPS = 40
+SUBAGENT_TIMEOUT = 600.0
+SUBAGENT_MAX_PARALLEL = 3
+SUBAGENT_REPORT_CHARS = 12_000
+SUBAGENT_PROMPT = (
+    "You are a sub-agent working for a lead agent, not talking to the user. Complete the task below "
+    "independently and finish with a concise, self-contained report: what you found or did, exact file "
+    "paths and line numbers, and anything the lead should double-check. You cannot ask questions and "
+    "cannot start other sub-agents. Do not repeat the task back."
+)
 
 
 @dataclass
@@ -78,6 +101,7 @@ class Outcome:
     text: str
     failed: bool = False
     nudge: Optional[str] = None
+    duration_s: float = 0.0
 
 
 class _ToolTagFilter:
@@ -127,6 +151,10 @@ async def _maybe_await(value: Any) -> Any:
     return await value if inspect.isawaitable(value) else value
 
 
+async def _empty() -> str:
+    return ""
+
+
 class TurnRunner:
     def __init__(
         self,
@@ -147,8 +175,14 @@ class TurnRunner:
         on_approval: Any = None,
         on_todo: Any = None,
         images: Optional[List[Dict[str, str]]] = None,
+        depth: int = 0,
+        max_steps: int = MAX_TOOL_STEPS,
+        extra_system: str = "",
     ) -> None:
         self.agent = agent
+        self.depth = depth  # 0 = the lead agent, 1 = a sub-agent
+        self.max_steps = max_steps
+        self.extra_system = extra_system
         self.prompt = prompt
         self.target = target
         self.on_stream_chunk = on_stream_chunk
@@ -182,6 +216,7 @@ class TurnRunner:
         self._pending_images: List[Dict[str, str]] = []
         self.tool_call_count = 0
         self.first_ttft: Optional[float] = None
+        self.trajectory: List[Dict[str, Any]] = []
 
     # ── plumbing ─────────────────────────────────────────────────────────
     @property
@@ -304,6 +339,8 @@ class TurnRunner:
             skills=SkillLibrary.for_workspace(self.workspace),
             notes=getattr(agent, "notes", None),
             enforce_read_before_write=True,
+            sandbox=Sandbox(self.workspace, getattr(agent, "sandbox_mode", "auto"), default_protected_paths()),
+            subagents=self.depth == 0 and isinstance(agent.provider, BaseProvider),
         )
 
     def _pick_mode(self) -> str:
@@ -315,7 +352,8 @@ class TurnRunner:
     def _compose_system_prompt(self, memory_text: str, context_blocks: str) -> str:
         instructions = self.tools.system_instructions(native=self.mode == "native")  # type: ignore[union-attr]
         extra = f"\n\n{context_blocks}" if context_blocks else ""
-        return f"You are Motion Agent.\n\n{instructions}{extra}\n\nMemory Context:\n{memory_text}"
+        sub = f"\n\n{self.extra_system}" if self.extra_system else ""
+        return f"You are Motion Agent.{sub}\n\n{instructions}{extra}\n\nMemory Context:\n{memory_text}"
 
     def _user_message(self) -> Dict[str, Any]:
         if not self.images:
@@ -423,6 +461,42 @@ class TurnRunner:
         return self._wrap(name, error=str(exc))
 
     async def _run_call(self, call: ToolCall) -> Outcome:
+        started = time.monotonic()
+        outcome = await self._run_call_inner(call)
+        outcome.duration_s = time.monotonic() - started
+        return outcome
+
+    async def _record_step(
+        self, step_no: int, step: StepResult, secs: float, ctx_tokens: int,
+        calls: Optional[List[ToolCall]] = None, outcomes: Optional[List[Outcome]] = None,
+    ) -> None:
+        """One trajectory record per model step (see core/trajectory.py)."""
+        usage = step.usage or {}
+        record = {
+            "agent": "lead" if self.depth == 0 else "sub",
+            "step": step_no,
+            "duration_s": round(secs, 3),
+            "ttft_s": round(step.ttft, 3) if step.ttft is not None else None,
+            "prompt_tokens": usage.get("prompt_tokens"),
+            "completion_tokens": usage.get("completion_tokens"),
+            "context_tokens_est": ctx_tokens,
+            "text_chars": len(step.text or ""),
+            "reasoning_chars": len(step.reasoning or ""),
+            "tools": [
+                {
+                    "name": c.name,
+                    "args": preview_args(c.arguments),
+                    "ok": not o.failed,
+                    "result_chars": len(o.text),
+                    "duration_s": round(o.duration_s, 3),
+                }
+                for c, o in zip(calls or [], outcomes or [])
+            ],
+        }
+        self.trajectory.append(record)
+        await self.trace("step_record", f"step {step_no}", record=record)
+
+    async def _run_call_inner(self, call: ToolCall) -> Outcome:
         name, arguments = call.name, call.arguments
         await self.trace("tool_start", f"Running {name}", tool=name, path=str(arguments.get("path", "")))
         if call.parse_error:
@@ -451,7 +525,10 @@ class TurnRunner:
         permission_retry_used = False
         while True:
             try:
-                result = await tools.aexecute(name, arguments, on_output=self._on_output(name))
+                if name == "task":
+                    result = await self._run_subagent(arguments)
+                else:
+                    result = await tools.aexecute(name, arguments, on_output=self._on_output(name))
             except OutOfWorkspaceError as exc:
                 if permission_retry_used or not self.on_permission_request:
                     return Outcome(await self._fail(name, exc, str(exc.path)), failed=True)
@@ -484,7 +561,11 @@ class TurnRunner:
         # Stream every tool op (not just writes) so the UI can show live
         # step-by-step progress for the whole loop, however long it runs.
         await self.emit(f"_tool_ {stream_text}")
-        await self.trace("tool_done", f"Completed {name}", tool=name, path=path, diff=result.get("_diff", ""))
+        await self.trace(
+            "tool_done", f"Completed {name}", tool=name, path=path,
+            diff=result.get("_diff", ""), created=bool(result.get("created")),
+            added=result.get("lines_added", 0), removed=result.get("lines_removed", 0),
+        )
         if name == "todo_write":
             await self.trace("todo_update", f"{result.get('completed', 0)}/{result.get('todos', 0)} done", tool=name)
 
@@ -531,6 +612,18 @@ class TurnRunner:
         if name in ("web_fetch", "web_search"):
             op = f"`{name}` -> {result.get('status', result.get('count', ''))}"
             return op, op
+        if name == "task":
+            op = f"sub-agent `{str(arguments.get('description', ''))[:50]}` finished ({result.get('tool_calls', 0)} tool calls)"
+            return op, op
+        if name == "job_start":
+            op = f"started background job `{result.get('job_id', '')}` ({str(arguments.get('command', ''))[:60]})"
+            return op, op
+        if name == "job_output":
+            op = f"read output of `{result.get('job_id', '')}` ({result.get('lines_returned', 0)} lines, {result.get('status', '')})"
+            return op, op
+        if name == "job_stop":
+            op = f"stopped job `{result.get('job_id', '')}`"
+            return op, op
         if name == "todo_write":
             op = f"updated todo list ({result.get('completed', 0)}/{result.get('todos', 0)} done)"
             return op, op
@@ -544,6 +637,88 @@ class TurnRunner:
             return op, op
         op = f"ran `{name}`"
         return op, op
+
+    def _parallel_ok(self, call: ToolCall) -> bool:
+        """Read-only tools and read-only (explore) sub-agents may run concurrently."""
+        if call.name == "task":
+            return self.agent_mode == "plan" or (call.arguments.get("mode") or "explore") == "explore"
+        return self.tools.is_parallel_safe(call.name)  # type: ignore[union-attr]
+
+    async def _run_subagent(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Run a `task` call: a fresh, isolated turn whose final text is the report."""
+        if self.depth >= 1:
+            raise WorkspaceToolError("sub-agents cannot start other sub-agents")
+        prompt = arguments.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise WorkspaceToolError("task needs a non-empty 'prompt'")
+        label = str(arguments.get("description") or "sub-agent")[:60]
+        mode = arguments.get("mode") or "explore"
+        if mode not in ("explore", "general"):
+            raise WorkspaceToolError("task mode must be 'explore' or 'general'")
+        if self.agent_mode == "plan":
+            mode = "explore"  # a read-only lead can only delegate read-only work
+
+        sem = getattr(self.agent, "_subagent_sem", None)
+        if sem is None:
+            sem = self.agent._subagent_sem = asyncio.Semaphore(SUBAGENT_MAX_PARALLEL)
+
+        # Share what the user already decided/what /undo must cover; nothing else.
+        sub_session = ToolSession(
+            allowed_paths=self.session.allowed_paths,
+            checkpoints=self.session.checkpoints,
+            read_files=self.session.read_files,
+            approved_commands=self.session.approved_commands,
+        )
+        forwarded = {"tool_calls": 0, "steps": 0}
+
+        def on_chunk(chunk: str) -> None:
+            # Only tool progress reaches the UI (marked as belonging to the
+            # sub-agent); its streamed text would corrupt the lead's live answer.
+            if chunk.startswith("_tool_ "):
+                forwarded["tool_calls"] += 1
+                asyncio.ensure_future(self.emit(f"_tool_ ↳ [{label}] {chunk[7:]}"))
+
+        def on_trace(stage: str, payload: Dict[str, Any]) -> None:
+            if stage == "usage":  # sub-agent tokens count toward the turn's usage and cost
+                asyncio.ensure_future(self.trace("usage", f"sub-agent usage ({label})", **{
+                    k: payload[k] for k in ("prompt_tokens", "completion_tokens", "total_tokens") if k in payload
+                }))
+            elif stage == "model_step":
+                forwarded["steps"] = payload.get("step", forwarded["steps"])
+            elif stage == "step_record":
+                asyncio.ensure_future(self.trace("step_record", payload.get("message", ""), record={
+                    **payload["record"], "agent": f"sub:{label}"}))
+
+        runner = TurnRunner(
+            self.agent,
+            prompt.strip(),
+            target="user",
+            on_stream_chunk=on_chunk,
+            on_trace_event=on_trace,
+            workspace=self.workspace,
+            agent_mode="plan" if mode == "explore" else "build",
+            allowed_paths=self.allowed_paths,
+            session=sub_session,
+            depth=1,
+            max_steps=SUBAGENT_MAX_STEPS,
+            extra_system=SUBAGENT_PROMPT,
+        )
+        async with sem:
+            await self.trace("subagent_start", f"Sub-agent started: {label} ({mode})")
+            try:
+                report = await asyncio.wait_for(runner.run(), timeout=SUBAGENT_TIMEOUT)
+            except asyncio.TimeoutError:
+                raise WorkspaceToolError(f"sub-agent '{label}' timed out after {SUBAGENT_TIMEOUT:.0f}s") from None
+            finally:
+                await sub_session.jobs.stop_all()
+            await self.trace("subagent_done", f"Sub-agent finished: {label}")
+        report = (report or "").strip() or "(the sub-agent returned no report)"
+        if len(report) > SUBAGENT_REPORT_CHARS:
+            report = report[:SUBAGENT_REPORT_CHARS] + "\n…[report truncated]"
+        return {
+            "description": label, "mode": mode, "report": report,
+            "tool_calls": runner.tool_call_count, "steps": forwarded["steps"],
+        }
 
     def _note_call(self, call: ToolCall) -> None:
         """Bookkeeping for stuck-loop detection and the build-mode nudge."""
@@ -577,10 +752,11 @@ class TurnRunner:
     async def run(self) -> str:
         agent = self.agent
         t_turn = time.monotonic()
-        self.session.checkpoints.begin_turn()
-        await self.trace("turn_start", "Turn started")
+        if self.depth == 0:  # a sub-agent's edits join the lead's turn so /undo covers them
+            self.session.checkpoints.begin_turn()
+            await self.trace("turn_start", "Turn started")
 
-        recall = asyncio.create_task(self._recall())
+        recall = asyncio.create_task(self._recall() if self.depth == 0 else _empty())
         ctx = asyncio.create_task(asyncio.to_thread(build_context_blocks, self.workspace))
         try:
             memory_text = await recall
@@ -594,6 +770,8 @@ class TurnRunner:
                     t.cancel()
 
         self.tools = self._build_tools()
+        if self.tools.sandbox is not None and not self.tools.read_only:
+            await self.trace("sandbox", f"Command sandbox: {self.tools.sandbox.describe()}")
         self.mode = self._pick_mode()
         self.system_prompt = self._compose_system_prompt(memory_text, context_blocks)
         self.messages = self.history + [self._user_message()]
@@ -605,11 +783,12 @@ class TurnRunner:
         final_streamed = False
         empty_retries = 0
 
-        for tool_step in range(MAX_TOOL_STEPS):
+        for tool_step in range(self.max_steps):
             trim_old_tool_results(self.messages)
             if compact_messages(self.messages, self.system_prompt, window, prompt_index):
                 await self.trace("context_compacted", "Trimmed older tool steps to stay within the context window")
 
+            ctx_tokens = messages_tokens(self.messages, self.system_prompt)
             step_started = time.monotonic()
             try:
                 step = await self._model_step(tool_step)
@@ -635,6 +814,9 @@ class TurnRunner:
             except httpx.HTTPError as exc:
                 error_msg = f"Provider {self.provider_type} request failed ({self.endpoint}): {exc}"
                 await self.trace("provider_error", error_msg, provider=self.provider_type, error=str(exc))
+                if getattr(exc, "status_code", None) in (401, 403):
+                    # The provider was reached; the credentials are the problem (the message says what to do).
+                    return f"⚠️ {error_msg}"
                 return (
                     f"⚠️ {error_msg}\n\n"
                     "I couldn't reach the model provider. Check your connection or provider status."
@@ -676,6 +858,7 @@ class TurnRunner:
                     )
                     if step.streamed:
                         await self.emit("_endstep_ ")
+                    await self._record_step(tool_step + 1, step, step_secs, ctx_tokens)
                     self.messages.extend([
                         {"role": "assistant", "content": candidate},
                         {"role": "user", "content": format_tool_result("invalid", error=error_msg)},
@@ -699,6 +882,7 @@ class TurnRunner:
             if not calls:
                 tool_response = candidate
                 final_streamed = step.streamed
+                await self._record_step(tool_step + 1, step, step_secs, ctx_tokens)
                 break
 
             # ── tool calls ───────────────────────────────────────────────
@@ -717,12 +901,13 @@ class TurnRunner:
                 self._note_call(c)
                 await self._warn_if_looping(c)
 
-            parallel = len(calls) > 1 and all(self.tools.is_parallel_safe(c.name) for c in calls)
+            parallel = len(calls) > 1 and all(self._parallel_ok(c) for c in calls)
             if parallel:
                 outcomes = list(await asyncio.gather(*(self._run_call(c) for c in calls)))
             else:
                 outcomes = [await self._run_call(c) for c in calls]
 
+            await self._record_step(tool_step + 1, step, step_secs, ctx_tokens, calls, outcomes)
             nudges: List[str] = []
             for c, out in zip(calls, outcomes):
                 if self.mode == "native":
@@ -743,6 +928,9 @@ class TurnRunner:
             for n in nudges:
                 self.messages.append({"role": "user", "content": n})
 
+            if self.inspection_only_loops and self.inspection_only_loops % EXPLORATION_NUDGE_EVERY == 0:
+                self.messages.append({"role": "user", "content": EXPLORATION_NUDGE.format(n=self.inspection_only_loops)})
+                await self.trace("exploration_nudge", f"{self.inspection_only_loops} read-only steps in a row: asked the model to wrap up")
             if (
                 self.agent_mode == "build"
                 and self.inspection_only_loops >= 2
@@ -767,20 +955,20 @@ class TurnRunner:
             # that the task was too big.
             await self.trace(
                 "step_cap_hit",
-                f"Hit the {MAX_TOOL_STEPS}-step safety cap",
-                steps=MAX_TOOL_STEPS,
+                f"Hit the {self.max_steps}-step safety cap",
+                steps=self.max_steps,
                 operations=len(self.tool_operations),
             )
             if self.tool_operations:
                 completed = "\n".join(f"- {op}" for op in self.tool_operations)
                 tool_response = (
-                    f"Hit the internal safety limit ({MAX_TOOL_STEPS} tool calls) before "
+                    f"Hit the internal safety limit ({self.max_steps} tool calls) before "
                     f"finishing - this usually means something got stuck. Progress so far:\n"
                     f"{completed}\n\nSay \"continue\" and I'll pick up from here."
                 )
             else:
                 tool_response = (
-                    f"Hit the internal safety limit ({MAX_TOOL_STEPS} tool calls) without "
+                    f"Hit the internal safety limit ({self.max_steps} tool calls) without "
                     "making any progress. Please narrow the task and try again."
                 )
 
@@ -837,20 +1025,24 @@ class TurnRunner:
 
         final_response = agent.caveman.process_outgoing(raw_response, target=self.target)
         await self.trace("finalize", "Post-processing completed", chars=len(final_response or ""))
-        await self.trace(
-            "turn_done",
-            f"Turn finished in {time.monotonic() - t_turn:.1f}s",
-            elapsed_ms=int((time.monotonic() - t_turn) * 1000),
-            tool_calls=self.tool_call_count,
-            ttft_ms=int(self.first_ttft * 1000) if self.first_ttft is not None else None,
-        )
+        if self.depth == 0:
+            await self.trace(
+                "turn_done",
+                f"Turn finished in {time.monotonic() - t_turn:.1f}s",
+                elapsed_ms=int((time.monotonic() - t_turn) * 1000),
+                tool_calls=self.tool_call_count,
+                ttft_ms=int(self.first_ttft * 1000) if self.first_ttft is not None else None,
+                # the conversation as sent to the model, plus the final answer it produced
+                transcript=[*self.messages, {"role": "assistant", "content": final_response or ""}],
+                system_prompt=self.system_prompt,
+            )
 
         # Remember substantive turns so later sessions can recall them.
-        if getattr(agent, "auto_remember", False) and raw_response and (self.used_tool or len(raw_response) > 200):
+        if self.depth == 0 and getattr(agent, "auto_remember", False) and raw_response and (self.used_tool or len(raw_response) > 200):
             agent.schedule_remember(self.prompt, raw_response, self.tool_operations)
 
         # Skill crystallization (manual-first: disabled by default)
-        if agent.auto_skill_synthesis:
+        if self.depth == 0 and agent.auto_skill_synthesis:
             from core.learning import Trajectory
 
             try:

@@ -439,11 +439,11 @@ class BaseProvider(ABC):
                         body = (await resp.aread()).decode("utf-8", "replace")[:2000]
                         if resp.status_code in RETRYABLE_STATUS and attempt < self.max_retries:
                             raise _Retry(self._retry_delay(resp, attempt))
-                        raise ProviderError(
-                            f"HTTP {resp.status_code} from {urlparse(url).netloc}: {body[:300]}",
-                            status_code=resp.status_code,
-                            body=body,
-                        )
+                        host = urlparse(url).netloc
+                        message = f"HTTP {resp.status_code} from {host}: {body[:300]}"
+                        if resp.status_code in (401, 403):
+                            message += "\n" + _auth_hint(url, sent_key=bool((headers or {}).get("Authorization") or (headers or {}).get("x-api-key")))
+                        raise ProviderError(message, status_code=resp.status_code, body=body)
                     async for line in resp.aiter_lines():
                         started = True
                         yield line
@@ -684,12 +684,46 @@ _HOST_KEY_ENV = (
 )
 
 
+def _env_var_for(endpoint: str) -> str:
+    host = urlparse(endpoint).netloc.lower()
+    for suffix, env in _HOST_KEY_ENV:
+        if host.endswith(suffix):
+            return env
+    return "MOTION_API_KEY"
+
+
+def _key_fix(endpoint: str) -> str:
+    return f"Add a valid key: `motion auth login` (or Ctrl+A in the app), or set {_env_var_for(endpoint)}."
+
+
+def _auth_hint(endpoint: str, sent_key: bool) -> str:
+    """What to do about a 401/403, phrased for the person at the keyboard."""
+    host = urlparse(endpoint).netloc
+    if not sent_key:
+        return f"No API key was sent to {host}. {_key_fix(endpoint)}"
+    return f"{host} rejected the API key (it may be expired, revoked or for another account). {_key_fix(endpoint)}"
+
+
+def _missing_key_error(endpoint: str) -> Optional["ProviderError"]:
+    """A clear error for hosts that always need a key, so we don't send a doomed request."""
+    host = urlparse(endpoint).netloc.lower()
+    if any(host.endswith(suffix) for suffix, _ in _HOST_KEY_ENV):
+        return ProviderError(f"No API key configured for {host}. {_key_fix(endpoint)}", status_code=401)
+    return None
+
+
 def _env_key_for(endpoint: str) -> str:
     host = urlparse(endpoint).netloc.lower()
     for suffix, env in _HOST_KEY_ENV:
         if host.endswith(suffix):
             return os.environ.get(env, "")
     return os.environ.get("MOTION_API_KEY", "")
+
+
+async def _raise_stream(exc: Exception) -> AsyncIterator[StreamEvent]:
+    """An async iterator that fails on first use (matches how real streams surface errors)."""
+    raise exc
+    yield  # pragma: no cover  (makes this an async generator)
 
 
 class CloudProvider(_OpenAICompatMixin, BaseProvider):
@@ -703,6 +737,10 @@ class CloudProvider(_OpenAICompatMixin, BaseProvider):
         return "anthropic" in self.config.endpoint
 
     def chat_stream(self, messages, system_prompt="", tools=None, **kwargs) -> AsyncIterator[StreamEvent]:
+        if not self._api_key():
+            missing = _missing_key_error(self.config.endpoint)
+            if missing is not None:
+                return _raise_stream(missing)
         if self.is_anthropic:
             return self._anthropic_stream(messages, system_prompt, tools)
         base = self.config.endpoint.rstrip("/")

@@ -333,3 +333,68 @@ def test_vision_and_context_window_capabilities():
     assert mk(model="deepseek-v4-flash", vision=True).supports_vision
     assert mk(context_window=200000).context_window == 200000
     assert mk().context_window == 32768
+
+
+# ── missing / rejected API keys ─────────────────────────────────────────────
+
+def _keyless(endpoint, handler, monkeypatch):
+    for var in ("OLLAMA_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "MOTION_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    p = CloudProvider(ModelConfig(name="t", endpoint=endpoint, api_key=None, provider_type="cloud", options={"model": "m"}))
+    p._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    return p
+
+
+@pytest.mark.parametrize("endpoint,env", [
+    ("https://ollama.com/v1", "OLLAMA_API_KEY"),
+    ("https://api.openai.com/v1", "OPENAI_API_KEY"),
+    ("https://api.anthropic.com", "ANTHROPIC_API_KEY"),
+])
+async def test_a_missing_key_fails_fast_with_instructions_and_sends_nothing(endpoint, env, monkeypatch):
+    sent = []
+    p = _keyless(endpoint, lambda request: sent.append(request) or httpx.Response(200), monkeypatch)
+    with pytest.raises(ProviderError) as exc:
+        await _collect(p, [{"role": "user", "content": "x"}])
+    assert sent == []                                            # no doomed request went out
+    msg = str(exc.value)
+    assert "No API key configured" in msg and "motion auth login" in msg and env in msg
+    assert exc.value.status_code == 401
+
+
+async def test_env_var_or_config_key_still_works(monkeypatch):
+    seen = []
+
+    def handler(request):
+        seen.append(request.headers.get("authorization"))
+        return httpx.Response(200, text=_sse({"choices": [{"delta": {"content": "ok"}}]}))
+
+    p = _keyless("https://ollama.com/v1", handler, monkeypatch)
+    monkeypatch.setenv("OLLAMA_API_KEY", "from-env")
+    assert (await _collect(p, [{"role": "user", "content": "x"}])).text == "ok" and seen == ["Bearer from-env"]
+
+
+async def test_keyless_custom_endpoints_are_not_blocked(monkeypatch):
+    """A self-hosted gateway may need no key: only the well-known hosts are refused up front."""
+    p = _keyless("https://gateway.internal/v1", lambda r: httpx.Response(200, text=_sse({"choices": [{"delta": {"content": "hi"}}]})), monkeypatch)
+    assert (await _collect(p, [{"role": "user", "content": "x"}])).text == "hi"
+
+
+async def test_a_rejected_key_says_so_and_how_to_fix_it():
+    def handler(request):
+        return httpx.Response(401, text='{"error":"Unauthorized"}')
+
+    with pytest.raises(ProviderError) as exc:
+        await _collect(_provider(CloudProvider, handler, endpoint="https://ollama.com/v1"), [{"role": "user", "content": "x"}])
+    msg = str(exc.value)
+    assert "HTTP 401 from ollama.com" in msg and "rejected the API key" in msg and "OLLAMA_API_KEY" in msg
+
+
+async def test_the_agent_does_not_blame_the_network_for_a_credentials_problem(tmp_path, monkeypatch):
+    from tests.test_agent_loop import make_agent, run
+
+    for var in ("OLLAMA_API_KEY", "MOTION_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    provider = CloudProvider(ModelConfig(name="t", endpoint="https://ollama.com/v1", api_key=None, provider_type="cloud", options={"model": "m"}))
+    resp, _, _ = await run(make_agent(provider), "hi", workspace=str(tmp_path))
+    assert "No API key configured for ollama.com" in resp and "motion auth login" in resp
+    assert "check your connection" not in resp.lower()

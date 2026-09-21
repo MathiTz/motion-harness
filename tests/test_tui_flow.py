@@ -459,3 +459,79 @@ async def test_permission_rules_from_config_yml_are_honoured(tmp_path, monkeypat
         await send(app, pilot, "clean")
         await wait_idle(app, pilot)  # never blocks on an approval modal
         assert not (tmp_path / "d").exists()
+
+
+# ── diffs ───────────────────────────────────────────────────────────────────
+
+def diff_widgets(app):
+    return list(app.screen.query(tui.DiffMessage))
+
+
+async def test_edits_are_shown_as_diffs_but_new_files_are_not(tmp_path, monkeypatch):
+    (tmp_path / "a.py").write_text("x = 1\ny = 2\n")
+    steps = [
+        call("1", "read_file", path="a.py"),
+        call("2", "replace_in_file", path="a.py", old="x = 1", new="x = 100"),
+        call("3", "write_file", path="new.py", content="print('hi')\n"),
+        call("4", "write_file", path="a.py", content="x = 100\ny = 3\nz = 4\n"),
+        text("done"),
+    ]
+    async with tui_app(tmp_path, monkeypatch, steps) as (app, pilot):
+        await send(app, pilot, "edit things")
+        await wait_idle(app, pilot)
+        widgets = diff_widgets(app)
+        assert [w.path for w in widgets] == ["a.py", "a.py"]        # two edits; the new file has no diff
+        assert "-x = 1" in widgets[0].diff_text and "+x = 100" in widgets[0].diff_text
+        assert "-y = 2" in widgets[1].diff_text and "+z = 4" in widgets[1].diff_text
+        assert len(app.state.turn_diffs) == 2 and app.state.turn_diffs[0][2:] == (1, 1)
+
+
+async def test_diff_command_replays_the_last_turns_edits_and_toggles_inline(tmp_path, monkeypatch):
+    (tmp_path / "a.py").write_text("one\ntwo\n")
+    steps = [call("1", "read_file", path="a.py"), call("2", "replace_in_file", path="a.py", old="one", new="uno"), text("done"),
+             call("3", "read_file", path="a.py"), call("4", "replace_in_file", path="a.py", old="uno", new="eins"), text("again")]
+    async with tui_app(tmp_path, monkeypatch, steps) as (app, pilot):
+        await send(app, pilot, "first")
+        await wait_idle(app, pilot)
+        assert len(diff_widgets(app)) == 1
+        await send(app, pilot, "/diff")
+        await pilot.pause(0.1)
+        assert len(diff_widgets(app)) == 2                              # replayed
+        await send(app, pilot, "/diff off")
+        await pilot.pause(0.1)
+        assert app.state.show_diffs is False
+        await send(app, pilot, "second")
+        await wait_idle(app, pilot)
+        assert len(diff_widgets(app)) == 2                              # nothing new inline...
+        assert app.state.turn_diffs and "+eins" in app.state.turn_diffs[0][1]   # ...but still recorded for /diff
+        await send(app, pilot, "/diff")
+        await pilot.pause(0.1)
+        assert len(diff_widgets(app)) == 3
+
+
+async def test_diff_command_with_no_edits_says_so_and_config_can_disable_inline(tmp_path, monkeypatch):
+    async with tui_app(tmp_path, monkeypatch, [text("hi")], extra_cfg="show_diffs: false\n") as (app, pilot):
+        assert app.state.show_diffs is False
+        await send(app, pilot, "/diff")
+        await pilot.pause(0.1)
+        assert any("No file edits" in t for t in system_lines(app))
+
+
+async def test_long_diffs_are_truncated_inline_but_complete_in_the_command(tmp_path, monkeypatch):
+    (tmp_path / "big.txt").write_text("".join(f"line {i}\n" for i in range(60)))
+    new = "".join(f"LINE {i}\n" for i in range(60))
+    steps = [call("1", "read_file", path="big.txt"), call("2", "write_file", path="big.txt", content=new), text("done")]
+    async with tui_app(tmp_path, monkeypatch, steps) as (app, pilot):
+        await send(app, pilot, "rewrite")
+        await wait_idle(app, pilot)
+        inline = diff_widgets(app)[0]
+        assert "more line(s)" in _text_of_group(inline)
+        assert inline.diff_text.count("\n") > 24                        # the full text is kept
+
+
+def _text_of_group(widget) -> str:
+    from rich.console import Console
+
+    console = Console(width=120, record=True, file=open(os.devnull, "w"))
+    console.print(widget.renderable if hasattr(widget, "renderable") else widget.content)
+    return console.export_text()

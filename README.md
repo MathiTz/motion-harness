@@ -83,6 +83,8 @@ motion --provider ollama-cloud/glm-5.2    # TUI with specific provider/model
 motion --chat                             # Legacy REPL mode
 motion --list                             # List available providers/models
 motion --test                             # Run Caveman compression test
+motion -p "review main.py"                # Headless one-shot: print the answer and exit
+motion -p "..." --output-format json      # ...or a JSON result / stream-json events for scripts
 motion auth login <provider>              # Store an API key
 motion auth logout <provider>             # Remove a stored API key
 motion auth list                          # List stored API keys
@@ -125,7 +127,7 @@ A high-performance terminal interface built with `Textual`, designed for daily-d
 
 **Real token usage**: when the active provider reports usage, the session footer and per-turn metadata show real prompt/completion/total token counts instead of a character-based estimate; the estimate is used only as a fallback when a provider doesn't return usage data.
 
-**Agent tools**: the agent can `list_files`, `glob_files`, `grep`, `read_file` (windowed: `offset`/`limit`), `read_image`, `web_fetch`, `web_search`, `todo_write`, `ask_user`, `use_skill`, `memory_save`/`memory_get` (persisted in the memory DB) and any tool exposed by a connected MCP server — in both modes. In `build` mode it can also `write_file`, `replace_in_file`, `run_command`, `run_script` and `run_python`. `list_files`/`glob_files`/`grep` skip `.git`, virtualenvs, `node_modules` and anything in your `.gitignore`. Tool calls that target a path outside the workspace prompt you to **allow once**, **allow for the session**, or **deny**.
+**Agent tools**: the agent can `list_files`, `glob_files`, `grep`, `read_file` (windowed: `offset`/`limit`), `read_image`, `web_fetch`, `web_search`, `todo_write`, `ask_user`, `use_skill`, `memory_save`/`memory_get` (persisted in the memory DB), `job_output`/`job_list`, `task` (read-only sub-agents) and any tool exposed by a connected MCP server — in both modes. In `build` mode it can also `write_file`, `replace_in_file`, `run_command`, `run_script`, `run_python`, `job_start`/`job_stop` and general-purpose sub-agents. `list_files`/`glob_files`/`grep` skip `.git`, virtualenvs, `node_modules` and anything in your `.gitignore`. Tool calls that target a path outside the workspace prompt you to **allow once**, **allow for the session**, or **deny**.
 
 #### ⚡ Speed & responsiveness
 
@@ -137,9 +139,23 @@ A high-performance terminal interface built with `Textual`, designed for daily-d
 - **Context stays small.** Old tool output is trimmed, oversized conversations drop the oldest tool exchanges, and history is summarized (`/compact`, or automatically at 60% of the model's window). Attachments are sent once with the message they belong to.
 - **Resilient transport.** 429/5xx and connection errors retry with backoff (`max_retries`, default 3; honors `Retry-After`); the connect timeout is 10 s and the idle-read timeout defaults to 120 s (`timeout` per model).
 
+#### 🧩 Sub-agents, background jobs, diffs and cost
+
+- **Sub-agents.** The model can hand a self-contained task (`task`) to a sub-agent with its own fresh context; only its final report comes back, so broad exploration doesn't fill the main conversation. Read-only ("explore") sub-agents run in parallel, up to 3. General ones can edit and run commands but are sequential, cannot ask you questions or use your approval prompts, and can't spawn further sub-agents. They have a step cap and a timeout, and one `/undo` reverts their edits too.
+- **Background jobs.** `job_start` runs a dev server or watcher in the background (same approvals and sandbox as commands); `job_output` returns only new lines and can wait for output; `job_stop` ends the whole process tree. `/jobs` lists them, `/jobs stop <id|all>` stops them, the status line shows how many are running, and they are stopped when the app exits.
+- **Diffs.** Edits to existing files appear inline as a colored diff; `/diff` replays the last turn's edits in full and `/diff off` (or `show_diffs: false`) hides them.
+- **Trajectory.** `/trajectory` shows every model step of the last turn: time, first-token latency, prompt/output tokens, and each tool call with its result size, followed by plain-language findings (prompt growth, the largest results, repeated calls, how much time was the model thinking). `/trajectory copy` puts it on the clipboard, `save` writes JSON under `.motion/trajectories/` (`save full` also stores the system prompt and every message sent to the model). `F10` (or Ctrl+K → Copy trace log) copies the whole trace panel as plain text. Sub-agent steps appear labelled `sub:<name>`.
+- **Cost.** Per-turn and session cost are computed from real token usage and the model's pricing (`input_mtok` / `output_mtok`, USD per million tokens; the catalog has them for the Ollama Cloud models, set them in `config.yml` for others). Models without pricing show `cost n/a`; local models are free.
+
+#### 🤖 Headless mode
+
+`motion -p "prompt"` runs one turn with no UI, for scripts and CI. `--output-format text` (default) prints the answer; `json` prints one result object (answer, usage, cost, steps, timing and a per-step `trajectory`); `stream-json` prints events as they happen and ends with that result. `--plan` is read-only, `--workspace DIR` picks the directory, `--verbose` prints tool activity to stderr, `-p -` reads the prompt from stdin and `--stdin` appends piped input as context (`git diff | motion -p "review this" --stdin`). Nothing can be approved interactively, so risky commands are refused unless pre-approved in `permissions.commands.allow`. Exit codes: 0 ok, 1 the turn failed, 2 usage error, 130 interrupted.
+
 #### 🔐 Safety & permissions
 
 - **Risky commands ask first.** `rm -r/-f`, `sudo`, `git push/reset --hard/clean`, `curl | sh`, `chmod -R`, credential-file access and similar prompt for **allow once / for this session / deny**. Catastrophic commands (`rm -rf /`, `mkfs`, fork bombs) are always refused. Tune it in `config.yml` (`permissions.commands.allow|ask|deny`, shell-style globs).
+- **Shell and Python run in an OS write sandbox.** On macOS (Seatbelt) and Linux (bubblewrap, if installed and usable) commands can only write inside the workspace, paths you approved, temp and tool-cache directories, so a command or script that slips past the pattern checks still cannot modify anything else. The harness's own auth store and `.env` are unreadable to commands. Where no sandbox works (Windows, nested sandboxes) the status is reported at the start of a turn and only the policy checks apply. Reads and network are not restricted. `sandbox: off` in `config.yml` disables it.
+- **Python is checked too.** `run_python`/`run_script` code that deletes files or spawns subprocesses asks first, like the shell equivalents; catastrophic patterns are refused even inside code.
 - **Non-interactive contexts never auto-approve.** Background `/parallel` tasks refuse anything that would need a prompt.
 - **Secrets stay out of child processes.** Provider API keys are stripped from the environment of commands the agent runs and of MCP servers.
 - **Web content is untrusted.** `web_fetch`/`web_search`/MCP results are flagged as data, never instructions. `web_fetch` refuses loopback/private/link-local addresses (including via redirects) unless you approve.
@@ -176,6 +192,10 @@ Everything the harness writes into your project goes under one self-ignoring fol
 | `/skill list` · `show <name>` · `save <name>` · `delete <name>` | Manage reusable skills |
 | `/compact` | Summarize the conversation to free context |
 | `/undo` | Revert the file changes of the last turn |
+| `/diff [on\|off]` | Show the last turn's edits / toggle inline diffs |
+| `/jobs [stop <id\|all>]` | Background processes the agent started |
+| `/trajectory [copy\|save [full]\|all]` | Per-step time, tokens and tool results of the last turn, with where the cost went |
+| `/tracking [on\|off]` | Save session transcripts locally (asked once at first launch; this undoes "No thanks") |
 | `/new` | Start a fresh conversation |
 | `/resume [id]` | List saved sessions / reload one |
 | `/todos` | Show the agent's task list |

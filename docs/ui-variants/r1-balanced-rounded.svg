@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="800" viewBox="0 0 1280 800">
+  <rect width="1280" height="800" fill="#191622"/>
+  <rect x="16" y="16" width="1248" height="40" rx="12" fill="#23212B"/>
+  <text x="34" y="42" fill="#E1E1E6" font-family="Menlo, monospace" font-size="15">R1 — Balanced Rounded</text>
+  <rect x="16" y="66" width="1026" height="690" rx="14" fill="#1d1a27"/>
+  <rect x="1052" y="66" width="212" height="690" rx="14" fill="#2A2734"/>
+  <rect x="32" y="84" width="994" height="28" rx="10" fill="#2A2734"/>
+  <rect x="44" y="90" width="80" height="16" rx="8" fill="#23212B"/>
+  <rect x="132" y="90" width="84" height="16" rx="8" fill="#23212B"/>
+  <rect x="224" y="90" width="84" height="16" rx="8" fill="#23212B"/>
+  <rect x="44" y="90" width="80" height="16" rx="8" fill="#2f2b3d" stroke="#78D1E1"/>
+  <rect x="40" y="126" width="730" height="540" rx="12" fill="#23212B"/>
+  <rect x="780" y="126" width="240" height="540" rx="12" fill="#262330"/>
+  <rect x="58" y="160" width="660" height="94" rx="14" fill="#2E2A3A"/>
+  <rect x="92" y="270" width="660" height="94" rx="14" fill="#252231"/>
+  <rect x="58" y="380" width="660" height="94" rx="14" fill="#2E2A3A"/>
+  <rect x="92" y="490" width="660" height="94" rx="14" fill="#252231"/>
+  <rect x="794" y="158" width="212" height="30" rx="10" fill="#23212B"/>
+  <rect x="794" y="196" width="212" height="30" rx="10" fill="#23212B"/>
+  <rect x="794" y="234" width="212" height="30" rx="10" fill="#23212B"/>
+  <rect x="40" y="684" width="980" height="58" rx="12" fill="#2A2734"/>
+  <rect x="56" y="700" width="700" height="28" rx="10" fill="#191622"/>
+  <rect x="770" y="700" width="72" height="28" rx="10" fill="#23212B"/>
+  <rect x="850" y="700" width="72" height="28" rx="10" fill="#23212B"/>
+  <rect x="930" y="700" width="72" height="28" rx="10" fill="#23212B"/>
+  <rect x="1068" y="84" width="180" height="44" rx="12" fill="#23212B"/>
+  <rect x="1068" y="136" width="180" height="72" rx="12" fill="#23212B"/>
+  <text x="34" y="784" fill="#A8A4B8" font-family="Menlo, monospace" font-size="12">Medium radius, clean bubbles, minimal separators</text>
+</svg>

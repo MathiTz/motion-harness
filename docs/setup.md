@@ -69,3 +69,31 @@ brew install sqlite
 
 ### TUI Rendering Issues
 If the interface looks distorted, ensure your terminal is set to a compatible font (e.g., Nerd Fonts) and that the window size is at least 80x24.
+
+---
+
+## 🐚 Shell integration (`install.sh`)
+
+The installer adds a `motion` command for **the shell you ran it from** (not merely your login shell: `$SHELL` is only the login shell, so a fish session started from a bash login used to get the alias in the wrong file). It prints which shell it chose and why.
+
+| Shell | What is written |
+| :-- | :-- |
+| fish | a `motion` function in `~/.config/fish/config.fish` (honors `XDG_CONFIG_HOME`) |
+| zsh | an alias in `~/.zshrc` (honors `ZDOTDIR`) |
+| bash | an alias in `~/.bashrc` (`~/.bash_profile` on macOS) |
+| ksh / mksh | an alias in `~/.kshrc` (or `$ENV`) |
+| tcsh / csh | an alias in `~/.tcshrc` (falls back to `~/.cshrc`) |
+| sh / dash, nushell, elvish, xonsh, PowerShell, anything else | a symlink `~/.local/bin/motion` (works in every shell) plus the exact PATH line for that shell if the directory isn't on `PATH` yet |
+
+```bash
+./install.sh                    # auto-detect
+./install.sh --shell fish       # choose explicitly (fish zsh bash ksh tcsh csh sh dash nu elvish xonsh pwsh)
+./install.sh --link             # also add the PATH symlink, whatever the shell
+./install.sh --shell-only       # re-create just the launcher + shell integration (no venv / pip)
+./install.sh --no-shell         # everything except the shell integration
+./install.sh --uninstall        # remove the blocks and the symlink this installer added
+```
+
+Blocks sit between `# motion-harness-start` and `# motion-harness-end`. Re-running replaces the block (never duplicates it), your own lines are left untouched, a config that is a symlink into a dotfiles repo stays a symlink, and a file with unbalanced markers is refused rather than edited. The symlink is never placed over something that isn't ours, and `--uninstall` only removes a link that points at this launcher. Paths with spaces or quotes are quoted correctly for each shell (csh/tcsh can't quote every character, so they use the symlink for such paths). Don't `source` a bash config from fish: fish can't parse it; use `source ~/.config/fish/config.fish` or open a new terminal.
+
+Windows: use WSL or Git Bash (the installer is a bash script); native PowerShell isn't supported yet.

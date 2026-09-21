@@ -62,6 +62,19 @@ Speed, correctness and safety work that the chat UX sits on.
 - [x] `/parallel` results reported in chat; tasks isolated and non-interactive
 - [x] Harness state consolidated under `<workspace>/.motion/`
 - [x] CI on Python 3.11 + 3.14 with lint; provider/loop/MCP/TUI test suites
+- [x] OS write sandbox for shell/Python (Seatbelt / bubblewrap) + code-aware policy
+- [x] Headless mode (`motion -p`, text / json / stream-json, exit codes)
+- [x] Cost tracking from real usage and per-model pricing
+- [x] Inline colored diffs and `/diff`
+- [x] Background jobs (`job_start` / `job_output` / `job_stop`, `/jobs`)
+- [x] Sub-agents (`task` tool): isolated context, parallel read-only, guarded general mode
+
+### Still open
+- [ ] Sandbox: Windows backend; network / read confinement (currently writes only)
+- [ ] Sandbox on Linux is implemented but only exercised where bubblewrap works (CI runners often lack user namespaces)
+- [ ] User-configurable hooks (pre/post tool), per-turn token/cost/time budgets
+- [ ] Multi-file patch tool; model failover; recorded-provider evals against real models
+- [ ] Live verification of the Anthropic and OpenAI wire formats (mock-tested only)
 
 ## Phase 2 — Document & File Ingestion (in progress)
 
