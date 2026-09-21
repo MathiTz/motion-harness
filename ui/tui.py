@@ -525,11 +525,95 @@ class ChatComposer(Static, can_focus=True):
         # Maps a "[LINES N]" placeholder literally embedded in self.value to
         # the real pasted text it stands in for. Expanded back on submit.
         self._pasted_blocks: dict[str, str] = {}
+        # Slash-command + skill completions shown while typing a "/".
+        self._suggestions: list[str] = []
+        self._suggestion_index: int = 0
+
+    # Slash commands offered during "/" completion.
+    SLASH_COMMANDS = [
+        ("/attach", "attach a file (path or browse)"),
+        ("/clear", "drop all attached files"),
+        ("/auth", "manage provider API keys"),
+        ("/skill", "save/delete a reusable skill"),
+        ("/synthesize", "toggle auto skill crystallization"),
+        ("/parallel", "run sub-tasks on background workers"),
+        ("/tools", "list available agent tools"),
+        ("/help", "show commands + tools"),
+    ]
 
     def set_meta(self, markup: str) -> None:
         """Update the second (meta) row."""
         self.meta_markup = markup
         self.refresh()
+
+    def _update_suggestions(self) -> None:
+        """Rebuild the completion list for slash-commands and saved skills."""
+        self._suggestions = []
+        self._suggestion_index = 0
+        if not self.value.startswith("/"):
+            return
+        token = self.value[1:]  # everything after "/"
+        for cmd, desc in self.SLASH_COMMANDS:
+            if cmd[1:].startswith(token):
+                self._suggestions.append(f"{cmd} — {desc}")
+        # Saved skills (from the skills/ dir) also autocomplete.
+        try:
+            sd = _skills_dir()
+            if sd.is_dir():
+                # Match against the token after "/skill " so "/skill calcu"
+                # suggests the calculator skills.
+                skill_query = ""
+                if self.value.startswith("/skill"):
+                    skill_query = self.value[len("/skill"):].strip()
+                elif self.value == "/skill":
+                    skill_query = ""
+                else:
+                    skill_query = self.value[1:].split()[0] if len(self.value) > 1 else ""
+                for f in sorted(sd.glob("*.md")):
+                    name = f.stem
+                    if name.lower().startswith(skill_query.lower()):
+                        self._suggestions.append(f"/skill {name}")
+        except Exception:
+            pass
+
+    def _current_suggestion(self) -> str:
+        if self._suggestions:
+            return self._suggestions[self._suggestion_index % len(self._suggestions)]
+        return ""
+
+    def _apply_suggestion(self) -> None:
+        self._update_suggestions()
+        if not self._suggestions:
+            return
+        text = self._current_suggestion()
+        # Use just the "/command" part (strip the description).
+        suggestion = text.split("—")[0].strip()
+        # If the user is typing "/skill ..." and a named skill completes, fill
+        # the full "/skill <name>" so args aren't clobbered or left dangling.
+        if suggestion.startswith("/skill ") and len(suggestion) > len("/skill "):
+            self.value = suggestion
+        elif suggestion.startswith("/skill"):
+            self.value = "/skill "
+        else:
+            token = suggestion.split()[0]
+            self.value = token
+        self.cursor_position = len(self.value)
+        self._invalidate_layout()
+
+    def _suggestions_markup(self) -> str:
+        if not self._suggestions:
+            return ""
+        lines = [self._current_suggestion()]
+        # dim trailing hints for the other suggestions (max a few)
+        for i, s in enumerate(self._suggestions):
+            if i == self._suggestion_index % len(self._suggestions):
+                continue
+            if len(lines) >= 5:
+                break
+            title = s.split("—")[0].strip()
+            lines.append("[dim]" + title + "[/dim]")
+        return "[blue]" + lines[0] + "[/]" + ("\n" + "\n".join(lines[1:]) if len(lines) > 1 else "")
+
 
     def _wrap_value(self) -> list[str]:
         """Soft-wrap the input value to the available content width."""
@@ -592,7 +676,14 @@ class ChatComposer(Static, can_focus=True):
         result = lines[0]
         for extra in lines[1:]:
             result = Text.assemble(result, "\n", extra)
-        return Text.assemble(result, "\n\n", line1)
+        result = Text.assemble(result, "\n\n", line1)
+        # Render slash-command / skill suggestions as a popup when typing "/".
+        if self.value.startswith("/"):
+            self._update_suggestions()
+        if self._suggestions:
+            popup = Text.from_markup(self._suggestions_markup())
+            result = Text.assemble(result, "\n", popup)
+        return result
 
     def _invalidate_layout(self) -> None:
         # Invalidate the cached content height so the panel re-sizes with the
@@ -659,12 +750,25 @@ class ChatComposer(Static, can_focus=True):
         return text
 
     def on_key(self, event) -> None:
-        if event.key == "enter" or event.key == "ctrl+s":
+        self._update_suggestions()
+        if event.key == "tab" and self._suggestion_active():
             event.prevent_default()
+            self._next_suggestion()
+            return
+        if event.key in ("up", "down") and self._suggestion_active():
+            event.prevent_default()
+            self._cycle_suggestion(1 if event.key == "down" else -1)
+            return
+        if (event.key == "enter" or event.key == "ctrl+s"):
+            event.prevent_default()
+            if self._suggestion_active():
+                self._apply_suggestion()
+                return
             expanded = self._expand_pasted_placeholders(self.value)
             self._pasted_blocks.clear()
             self.post_message(ComposerSubmitted(expanded))
-        elif event.key == "up":
+            return
+        if event.key == "up":
             event.prevent_default()
             self.value = self._state.history_previous(self.value)
             self.cursor_position = len(self.value)
@@ -699,6 +803,20 @@ class ChatComposer(Static, can_focus=True):
         elif event.character is not None and event.is_printable:
             event.prevent_default()
             self._insert(event.character)
+        self._update_suggestions()
+
+    def _suggestion_active(self) -> bool:
+        return bool(self._suggestions)
+
+    def _next_suggestion(self) -> None:
+        if self._suggestions:
+            self._suggestion_index = (self._suggestion_index + 1) % len(self._suggestions)
+            self._invalidate_layout()
+
+    def _cycle_suggestion(self, delta: int) -> None:
+        if self._suggestions:
+            self._suggestion_index = (self._suggestion_index + delta) % len(self._suggestions)
+            self._invalidate_layout()
 
 class ProviderOption(ListItem):
     """A selectable provider row on the startup screen."""
@@ -1538,6 +1656,137 @@ class ModelOption(ListItem):
     def __init__(self, label: str, full_id: str, **kwargs) -> None:
         self.full_id = full_id
         super().__init__(Label(label), **kwargs)
+
+
+class FileEntry(ListItem):
+    """A file/directory row in the file picker."""
+
+    def __init__(self, path: Path, is_dir: bool, **kwargs) -> None:
+        self.path = path
+        self.is_dir = is_dir
+        icon = "📁 " if is_dir else "📄 "
+        label = f"{icon}{path.name}"
+        if is_dir:
+            label += "/"
+        super().__init__(Label(label), **kwargs)
+
+
+class FilePickerScreen(Screen):
+    """Interactive file browser for attaching files.
+
+    Navigate directories with ↑/↓ + Enter, go up with backspace, select a
+    file with Enter to attach it (dismisses with the selected path).
+    """
+
+    CSS = """
+    FilePickerScreen {
+        align: center middle;
+    }
+    #picker_box {
+        width: 80;
+        height: 70%;
+        border: round $border;
+        background: $surface;
+        padding: 1 2;
+    }
+    #picker_title {
+        color: $text;
+        text-style: bold;
+        text-align: center;
+        margin-bottom: 1;
+    }
+    #picker_path {
+        color: $text-muted;
+        margin-bottom: 1;
+    }
+    #picker_list {
+        height: 1fr;
+        border: solid $border;
+        padding: 0 1;
+        background: $surface;
+    }
+    #picker_hint {
+        color: $text-muted;
+        text-align: center;
+        margin-top: 1;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel", priority=True),
+        Binding("backspace", "go_up", "Up dir", show=False),
+        Binding("up", "nav_up", "Up", show=False),
+        Binding("down", "nav_down", "Down", show=False),
+        Binding("enter", "choose", "Select", show=False),
+    ]
+
+    def __init__(self, start_dir: Path = None, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._cwd = (start_dir or Path.cwd()).expanduser()
+        if not self._cwd.is_dir():
+            self._cwd = Path.cwd()
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll(id="picker_box"):
+            yield Label("Attach a file", id="picker_title")
+            yield Label("", id="picker_path")
+            yield ListView(id="picker_list")
+            yield Label("↑↓ navigate · Enter select · backspace up · Esc cancel", id="picker_hint")
+
+    def on_mount(self) -> None:
+        self._reload()
+
+    def _reload(self) -> None:
+        title = self.query_one("#picker_title", Label)
+        path_label = self.query_one("#picker_path", Label)
+        path_label.update(str(self._cwd))
+        lv = self.query_one("#picker_list", ListView)
+        lv.clear()
+        items = []
+        try:
+            children = sorted(self._cwd.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+        except Exception:
+            children = []
+        for child in children:
+            try:
+                if child.is_dir():
+                    items.append(FileEntry(child, True))
+                elif child.is_file():
+                    items.append(FileEntry(child, False))
+            except Exception:
+                continue
+        for it in items:
+            lv.append(it)
+        if len(self._cwd.parts) > 1:
+            self._up_entry = FileEntry(self._cwd.parent, True)
+        lv.index = 0
+        lv.focus()
+
+    def action_nav_up(self) -> None:
+        self.query_one("#picker_list", ListView).action_cursor_up()
+
+    def action_nav_down(self) -> None:
+        self.query_one("#picker_list", ListView).action_cursor_down()
+
+    def action_go_up(self) -> None:
+        parent = self._cwd.parent
+        if parent and parent.is_dir() and parent != self._cwd:
+            self._cwd = parent
+            self._reload()
+
+    def action_choose(self) -> None:
+        lv = self.query_one("#picker_list", ListView)
+        item = lv.highlighted_child
+        if not isinstance(item, FileEntry):
+            return
+        if item.is_dir:
+            self._cwd = item.path
+            self._reload()
+        else:
+            self.dismiss(item.path)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
 
 
 class AddModelScreen(Screen):
@@ -2598,6 +2847,13 @@ class ChatPane(Vertical):
             await self._handle_tools_command()
             return
         if text.startswith("/attach") or text.startswith("/clear"):
+            if text.startswith("/attach") and ("/attach" == text.strip()):
+                # No path given -> open the interactive file picker.
+                picked = await self.app.push_screen_wait(FilePickerScreen(Path(WORKSPACE)))
+                log.scroll_end(animate=False)
+                if picked is not None:
+                    await self._handle_attach_command(f"/attach {picked}", log)
+                return
             await self._handle_attach_command(text, log)
             log.scroll_end(animate=False)
             return
@@ -2643,16 +2899,20 @@ class ChatPane(Vertical):
             return text
         blocks = []
         for att in self.state.attachments:
-            name = Path(att.get("path", "?")).name
+            path = att.get("path", "")
+            name = Path(path).name if path else "?"
             if att.get("type") == "text" and att.get("content"):
-                blocks.append(f"[Attached file: {name}]\n{att['content']}")
+                blocks.append(f"[Attached file: {path}]\n{att['content']}")
             elif att.get("type") == "image":
                 blocks.append(
-                    f"[Attached image: {name}] {att.get('summary','')}\n"
+                    f"[Attached image: {name}]\n"
+                    f"Absolute path: {path}\n"
+                    f"Use the `read_image` tool with this exact path to inspect it, or use the "
+                    f"data_url below if you can process base64 images.\n"
                     f"data_url={att.get('data_url','')}"
                 )
             else:
-                blocks.append(f"[Attached file: {name}] ({att.get('summary','')})")
+                blocks.append(f"[Attached file: {name}] ({path}) ({att.get('summary','')})")
         header = "<attachments>\n" + "\n\n".join(blocks) + "\n</attachments>\n\n"
         return header + text
 
@@ -3039,7 +3299,13 @@ class ChatPane(Vertical):
             log.mount(SystemMessage("Usage: /attach <path>   (or /clear to drop attachments)"))
             return
         path_str = parts[1].strip()
-        path = Path(path_str).expanduser()
+        # Resolve relative paths against the workspace (not the process CWD)
+        # and store the absolute path so downstream read_image/read_file calls
+        # find the real file regardless of where the agent runs.
+        candidate = Path(path_str).expanduser()
+        if not candidate.is_absolute():
+            candidate = Path(WORKSPACE) / candidate
+        path = candidate.resolve()
         if not path.is_file():
             log.mount(SystemMessage(f"⚠ File not found: {path_str}"))
             return
@@ -3048,6 +3314,7 @@ class ChatPane(Vertical):
         except Exception as e:
             log.mount(SystemMessage(f"⚠ Could not read attachment: {e}"))
             return
+        info["path"] = str(path)  # absolute path for agent tool use
         self.state.attachments.append(info)
         label = info.get("summary", path.name)
         log.mount(SystemMessage(f"📎 Attached [{len(self.state.attachments)}]: {label}"))
