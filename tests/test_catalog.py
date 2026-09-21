@@ -12,7 +12,18 @@ def test_catalog_has_expected_providers():
 def test_catalog_ollama_has_models():
     models = BUILTIN_CATALOG["ollama-cloud"]["models"]
     assert "deepseek-v4-flash" in models
-    assert "qwen3-coder:480b" in models
+    assert "deepseek-v4.1-flash" in models
+    assert "glm-5.3" in models
+    assert "nemotron-3-ultra" in models
+
+
+def test_catalog_ollama_models_have_metadata():
+    models = BUILTIN_CATALOG["ollama-cloud"]["models"]
+    # New curated models carry context-window and pricing metadata for the UI.
+    for mid in ("deepseek-v4-flash", "glm-5.3", "kimi-k2.7-code"):
+        assert "context_window" in models[mid]
+        assert "input_mtok" in models[mid]
+        assert "output_mtok" in models[mid]
 
 
 def test_catalog_claude_has_many_models():

@@ -31,6 +31,7 @@ Launch:  python main.py              → TUI (default)
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -62,7 +63,7 @@ from textual.widgets import (
 )
 
 from core.config import ConfigManager
-from core.orchestrator import TaskManager
+from core.orchestrator import TaskManager, TaskRequest
 from core.providers import ModelConfig
 from core import auth
 from main import MotionAgent
@@ -95,6 +96,7 @@ class AppState:
         self.agent: Optional[MotionAgent] = None
         self.task_manager: Optional[TaskManager] = None
         self.config_manager: ConfigManager = ConfigManager()
+        self.mcp_manager = self._build_mcp_manager()
         self.current_provider_id: str = ""
         self.current_theme: str = "opencode"
         self.caveman_enabled: bool = True
@@ -138,6 +140,9 @@ class AppState:
         self.session_context: str = ""  # rolling, bounded summary of the session
         self._context_turns: list[tuple[str, str]] = []  # recent turns used to build context
         self.conversation_turns: list[tuple[str, str]] = []  # (prompt, response)
+        # Files attached via `/attach <path>`; their extracted text / base64
+        # is injected into the next prompt so the model can see the content.
+        self.attachments: list[dict] = []
         self.last_turn_metrics: dict = {}
         self.session_metrics: dict = {
             "turns": 0,
@@ -146,6 +151,20 @@ class AppState:
             "total_tokens_est": 0,
             "estimated_cost_usd": 0.0,
         }
+
+    def _build_mcp_manager(self):
+        """Build an MCP manager from config.yml's optional `mcp:` block."""
+        try:
+            from core.mcp import MCPManager
+        except Exception:
+            return None
+        servers_cfg = self.config_manager.get("mcp", {}).get("servers", {})
+        if not servers_cfg:
+            return None
+        try:
+            return MCPManager(servers_cfg)
+        except Exception:
+            return None
 
     def reconnect(self, provider_id: str) -> None:
         """Re-create the agent and task manager for a new provider/model."""
@@ -163,7 +182,7 @@ class AppState:
                 self.agent.memory.close()
             except Exception:
                 pass
-        self.agent = MotionAgent(model_config)
+        self.agent = MotionAgent(model_config, mcp_manager=self.mcp_manager)
         self.agent.auto_skill_synthesis = self.auto_synthesis_enabled
         self.task_manager = TaskManager(model_config, WORKSPACE)
         self.current_provider_id = provider_id
@@ -506,11 +525,95 @@ class ChatComposer(Static, can_focus=True):
         # Maps a "[LINES N]" placeholder literally embedded in self.value to
         # the real pasted text it stands in for. Expanded back on submit.
         self._pasted_blocks: dict[str, str] = {}
+        # Slash-command + skill completions shown while typing a "/".
+        self._suggestions: list[str] = []
+        self._suggestion_index: int = 0
+
+    # Slash commands offered during "/" completion.
+    SLASH_COMMANDS = [
+        ("/attach", "attach a file (path or browse)"),
+        ("/clear", "drop all attached files"),
+        ("/auth", "manage provider API keys"),
+        ("/skill", "save/delete a reusable skill"),
+        ("/synthesize", "toggle auto skill crystallization"),
+        ("/parallel", "run sub-tasks on background workers"),
+        ("/tools", "list available agent tools"),
+        ("/help", "show commands + tools"),
+    ]
 
     def set_meta(self, markup: str) -> None:
         """Update the second (meta) row."""
         self.meta_markup = markup
         self.refresh()
+
+    def _update_suggestions(self) -> None:
+        """Rebuild the completion list for slash-commands and saved skills."""
+        self._suggestions = []
+        self._suggestion_index = 0
+        if not self.value.startswith("/"):
+            return
+        token = self.value[1:]  # everything after "/"
+        for cmd, desc in self.SLASH_COMMANDS:
+            if cmd[1:].startswith(token):
+                self._suggestions.append(f"{cmd} — {desc}")
+        # Saved skills (from the skills/ dir) also autocomplete.
+        try:
+            sd = _skills_dir()
+            if sd.is_dir():
+                # Match against the token after "/skill " so "/skill calcu"
+                # suggests the calculator skills.
+                skill_query = ""
+                if self.value.startswith("/skill"):
+                    skill_query = self.value[len("/skill"):].strip()
+                elif self.value == "/skill":
+                    skill_query = ""
+                else:
+                    skill_query = self.value[1:].split()[0] if len(self.value) > 1 else ""
+                for f in sorted(sd.glob("*.md")):
+                    name = f.stem
+                    if name.lower().startswith(skill_query.lower()):
+                        self._suggestions.append(f"/skill {name}")
+        except Exception:
+            pass
+
+    def _current_suggestion(self) -> str:
+        if self._suggestions:
+            return self._suggestions[self._suggestion_index % len(self._suggestions)]
+        return ""
+
+    def _apply_suggestion(self) -> None:
+        self._update_suggestions()
+        if not self._suggestions:
+            return
+        text = self._current_suggestion()
+        # Use just the "/command" part (strip the description).
+        suggestion = text.split("—")[0].strip()
+        # If the user is typing "/skill ..." and a named skill completes, fill
+        # the full "/skill <name>" so args aren't clobbered or left dangling.
+        if suggestion.startswith("/skill ") and len(suggestion) > len("/skill "):
+            self.value = suggestion
+        elif suggestion.startswith("/skill"):
+            self.value = "/skill "
+        else:
+            token = suggestion.split()[0]
+            self.value = token
+        self.cursor_position = len(self.value)
+        self._invalidate_layout()
+
+    def _suggestions_markup(self) -> str:
+        if not self._suggestions:
+            return ""
+        lines = [self._current_suggestion()]
+        # dim trailing hints for the other suggestions (max a few)
+        for i, s in enumerate(self._suggestions):
+            if i == self._suggestion_index % len(self._suggestions):
+                continue
+            if len(lines) >= 5:
+                break
+            title = s.split("—")[0].strip()
+            lines.append("[dim]" + title + "[/dim]")
+        return "[blue]" + lines[0] + "[/]" + ("\n" + "\n".join(lines[1:]) if len(lines) > 1 else "")
+
 
     def _wrap_value(self) -> list[str]:
         """Soft-wrap the input value to the available content width."""
@@ -573,7 +676,14 @@ class ChatComposer(Static, can_focus=True):
         result = lines[0]
         for extra in lines[1:]:
             result = Text.assemble(result, "\n", extra)
-        return Text.assemble(result, "\n\n", line1)
+        result = Text.assemble(result, "\n\n", line1)
+        # Render slash-command / skill suggestions as a popup when typing "/".
+        if self.value.startswith("/"):
+            self._update_suggestions()
+        if self._suggestions:
+            popup = Text.from_markup(self._suggestions_markup())
+            result = Text.assemble(result, "\n", popup)
+        return result
 
     def _invalidate_layout(self) -> None:
         # Invalidate the cached content height so the panel re-sizes with the
@@ -640,12 +750,25 @@ class ChatComposer(Static, can_focus=True):
         return text
 
     def on_key(self, event) -> None:
-        if event.key == "enter" or event.key == "ctrl+s":
+        self._update_suggestions()
+        if event.key == "tab" and self._suggestion_active():
             event.prevent_default()
+            self._next_suggestion()
+            return
+        if event.key in ("up", "down") and self._suggestion_active():
+            event.prevent_default()
+            self._cycle_suggestion(1 if event.key == "down" else -1)
+            return
+        if (event.key == "enter" or event.key == "ctrl+s"):
+            event.prevent_default()
+            if self._suggestion_active():
+                self._apply_suggestion()
+                return
             expanded = self._expand_pasted_placeholders(self.value)
             self._pasted_blocks.clear()
             self.post_message(ComposerSubmitted(expanded))
-        elif event.key == "up":
+            return
+        if event.key == "up":
             event.prevent_default()
             self.value = self._state.history_previous(self.value)
             self.cursor_position = len(self.value)
@@ -680,6 +803,20 @@ class ChatComposer(Static, can_focus=True):
         elif event.character is not None and event.is_printable:
             event.prevent_default()
             self._insert(event.character)
+        self._update_suggestions()
+
+    def _suggestion_active(self) -> bool:
+        return bool(self._suggestions)
+
+    def _next_suggestion(self) -> None:
+        if self._suggestions:
+            self._suggestion_index = (self._suggestion_index + 1) % len(self._suggestions)
+            self._invalidate_layout()
+
+    def _cycle_suggestion(self, delta: int) -> None:
+        if self._suggestions:
+            self._suggestion_index = (self._suggestion_index + delta) % len(self._suggestions)
+            self._invalidate_layout()
 
 class ProviderOption(ListItem):
     """A selectable provider row on the startup screen."""
@@ -1417,15 +1554,25 @@ class ModelDialog(Screen):
 
     def _collect_entries(self) -> list[tuple[str, str]]:
         entries: list[tuple[str, str]] = []
+        providers_cfg = (self.state.config_manager.get("providers") or {})
         for pid, name, models, is_default, has_key in AppState.build_all_provider_info():
             if not has_key:
                 continue
+            cfg = providers_cfg.get(pid, {}) or {}
+            cfg_models = cfg.get("models", {}) or {}
             if models:
                 for m in models:
                     full = f"{pid}/{m}"
-                    entries.append((f"{name} → {m}", full))
+                    meta = cfg_models.get(m, {}) or {}
+                    label = f"{name} → {m}"
+                    if meta.get("context_window"):
+                        ctx = meta["context_window"]
+                        label += f" · {ctx//1000}k ctx"
+                    if meta.get("input_mtok") is not None and meta.get("output_mtok") is not None:
+                        label += f" · ${meta['input_mtok']}/${meta['output_mtok']}/M"
+                    entries.append((label, full))
             else:
-                entries.append((name, pid))
+                entries.append((f"{name}", pid))
         return entries
 
     def on_input_changed(self, event: Input.Changed) -> None:
@@ -1509,6 +1656,137 @@ class ModelOption(ListItem):
     def __init__(self, label: str, full_id: str, **kwargs) -> None:
         self.full_id = full_id
         super().__init__(Label(label), **kwargs)
+
+
+class FileEntry(ListItem):
+    """A file/directory row in the file picker."""
+
+    def __init__(self, path: Path, is_dir: bool, **kwargs) -> None:
+        self.path = path
+        self.is_dir = is_dir
+        icon = "📁 " if is_dir else "📄 "
+        label = f"{icon}{path.name}"
+        if is_dir:
+            label += "/"
+        super().__init__(Label(label), **kwargs)
+
+
+class FilePickerScreen(Screen):
+    """Interactive file browser for attaching files.
+
+    Navigate directories with ↑/↓ + Enter, go up with backspace, select a
+    file with Enter to attach it (dismisses with the selected path).
+    """
+
+    CSS = """
+    FilePickerScreen {
+        align: center middle;
+    }
+    #picker_box {
+        width: 80;
+        height: 70%;
+        border: round $border;
+        background: $surface;
+        padding: 1 2;
+    }
+    #picker_title {
+        color: $text;
+        text-style: bold;
+        text-align: center;
+        margin-bottom: 1;
+    }
+    #picker_path {
+        color: $text-muted;
+        margin-bottom: 1;
+    }
+    #picker_list {
+        height: 1fr;
+        border: solid $border;
+        padding: 0 1;
+        background: $surface;
+    }
+    #picker_hint {
+        color: $text-muted;
+        text-align: center;
+        margin-top: 1;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel", priority=True),
+        Binding("backspace", "go_up", "Up dir", show=False),
+        Binding("up", "nav_up", "Up", show=False),
+        Binding("down", "nav_down", "Down", show=False),
+        Binding("enter", "choose", "Select", show=False),
+    ]
+
+    def __init__(self, start_dir: Path = None, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._cwd = (start_dir or Path.cwd()).expanduser()
+        if not self._cwd.is_dir():
+            self._cwd = Path.cwd()
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll(id="picker_box"):
+            yield Label("Attach a file", id="picker_title")
+            yield Label("", id="picker_path")
+            yield ListView(id="picker_list")
+            yield Label("↑↓ navigate · Enter select · backspace up · Esc cancel", id="picker_hint")
+
+    def on_mount(self) -> None:
+        self._reload()
+
+    def _reload(self) -> None:
+        title = self.query_one("#picker_title", Label)
+        path_label = self.query_one("#picker_path", Label)
+        path_label.update(str(self._cwd))
+        lv = self.query_one("#picker_list", ListView)
+        lv.clear()
+        items = []
+        try:
+            children = sorted(self._cwd.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+        except Exception:
+            children = []
+        for child in children:
+            try:
+                if child.is_dir():
+                    items.append(FileEntry(child, True))
+                elif child.is_file():
+                    items.append(FileEntry(child, False))
+            except Exception:
+                continue
+        for it in items:
+            lv.append(it)
+        if len(self._cwd.parts) > 1:
+            self._up_entry = FileEntry(self._cwd.parent, True)
+        lv.index = 0
+        lv.focus()
+
+    def action_nav_up(self) -> None:
+        self.query_one("#picker_list", ListView).action_cursor_up()
+
+    def action_nav_down(self) -> None:
+        self.query_one("#picker_list", ListView).action_cursor_down()
+
+    def action_go_up(self) -> None:
+        parent = self._cwd.parent
+        if parent and parent.is_dir() and parent != self._cwd:
+            self._cwd = parent
+            self._reload()
+
+    def action_choose(self) -> None:
+        lv = self.query_one("#picker_list", ListView)
+        item = lv.highlighted_child
+        if not isinstance(item, FileEntry):
+            return
+        if item.is_dir:
+            self._cwd = item.path
+            self._reload()
+        else:
+            self.dismiss(item.path)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
 
 
 class AddModelScreen(Screen):
@@ -2565,6 +2843,28 @@ class ChatPane(Vertical):
             await self._handle_auth_command(text, log)
             log.scroll_end(animate=False)
             return
+        if text.startswith("/tools") or text.strip() == "/help":
+            await self._handle_tools_command()
+            return
+        if text.startswith("/attach") or text.startswith("/clear"):
+            if text.startswith("/attach") and ("/attach" == text.strip()):
+                # No path given -> open the interactive file picker.
+                picked = await self.app.push_screen_wait(FilePickerScreen(Path(WORKSPACE)))
+                log.scroll_end(animate=False)
+                if picked is not None:
+                    await self._handle_attach_command(f"/attach {picked}", log)
+                return
+            await self._handle_attach_command(text, log)
+            log.scroll_end(animate=False)
+            return
+        if text.startswith("/synthesize"):
+            await self._handle_synthesize_command(text, log)
+            log.scroll_end(animate=False)
+            return
+        if text.startswith("/parallel"):
+            await self._handle_parallel_command(text, log)
+            log.scroll_end(animate=False)
+            return
         if self.state.agent_mode == "plan" and _is_build_trigger(text):
             self.state.agent_mode = "build"
             self._refresh_meta()
@@ -2590,7 +2890,31 @@ class ChatPane(Vertical):
         live_response = AgentMessage("")
         log.mount(live_response)
         log.scroll_end(animate=False)
-        self._run_agent(text, live_response)
+        prompt_for_agent = self._attach_context(text)
+        self._run_agent(prompt_for_agent, live_response)
+
+    def _attach_context(self, text: str) -> str:
+        """Prepend any attached file contents to the prompt handed to the agent."""
+        if not self.state.attachments:
+            return text
+        blocks = []
+        for att in self.state.attachments:
+            path = att.get("path", "")
+            name = Path(path).name if path else "?"
+            if att.get("type") == "text" and att.get("content"):
+                blocks.append(f"[Attached file: {path}]\n{att['content']}")
+            elif att.get("type") == "image":
+                blocks.append(
+                    f"[Attached image: {name}]\n"
+                    f"Absolute path: {path}\n"
+                    f"Use the `read_image` tool with this exact path to inspect it, or use the "
+                    f"data_url below if you can process base64 images.\n"
+                    f"data_url={att.get('data_url','')}"
+                )
+            else:
+                blocks.append(f"[Attached file: {name}] ({path}) ({att.get('summary','')})")
+        header = "<attachments>\n" + "\n\n".join(blocks) + "\n</attachments>\n\n"
+        return header + text
 
     def _append_trace(self, event_type: str, detail: str = "", **extra) -> None:
         trace_log = self.query_one("#trace_log", VerticalScroll)
@@ -2942,6 +3266,184 @@ class ChatPane(Vertical):
                 ))
             return False
 
+    async def _handle_tools_command(self) -> None:
+        """Show the available tools and commands (opencode-style /tools | /help)."""
+        log = self.query_one("#chat_log", VerticalScroll)
+        lines = [
+            "Available agent tools (XML <motion_tool> envelopes):",
+            "  list_files · glob_files · read_file · write_file · replace_in_file",
+            "  run_command · run_script · run_python · read_image",
+            "  web_fetch · web_search · memory_save · memory_get · env_var",
+            "",
+            "Slash commands:",
+            "  /skill save|delete <name>   persist the last reply as a reusable skill",
+            "  /synthesize on|off          toggle auto-crystallization into skills",
+            "  /parallel <subtask>, ...    run sub-tasks on background workers",
+            "  /tools | /help              show this help",
+            "  /auth list|login|logout     manage provider API keys",
+            "",
+            "Read tools also work in Plan mode; write/run tools need Build (Tab).",
+        ]
+        for line in lines:
+            log.mount(SystemMessage(line))
+        log.scroll_end(animate=False)
+
+    async def _handle_attach_command(self, text: str, log: VerticalScroll) -> None:
+        parts = text.split(maxsplit=1)
+        cmd = parts[0]
+        if cmd == "/clear":
+            self.state.attachments.clear()
+            log.mount(SystemMessage(f"🗑 Cleared {len(self.state.attachments)} attached file(s)."))
+            return
+        if len(parts) < 2 or not parts[1].strip():
+            log.mount(SystemMessage("Usage: /attach <path>   (or /clear to drop attachments)"))
+            return
+        path_str = parts[1].strip()
+        # Resolve relative paths against the workspace (not the process CWD)
+        # and store the absolute path so downstream read_image/read_file calls
+        # find the real file regardless of where the agent runs.
+        candidate = Path(path_str).expanduser()
+        if not candidate.is_absolute():
+            candidate = Path(WORKSPACE) / candidate
+        path = candidate.resolve()
+        if not path.is_file():
+            log.mount(SystemMessage(f"⚠ File not found: {path_str}"))
+            return
+        try:
+            info = self._extract_attachment(path)
+        except Exception as e:
+            log.mount(SystemMessage(f"⚠ Could not read attachment: {e}"))
+            return
+        info["path"] = str(path)  # absolute path for agent tool use
+        self.state.attachments.append(info)
+        label = info.get("summary", path.name)
+        log.mount(SystemMessage(f"📎 Attached [{len(self.state.attachments)}]: {label}"))
+        self.notify(f"Attached {path.name}")
+
+    def _extract_attachment(self, path: Path) -> dict:
+        """Return attachment content for one file: base64 data-url for images,
+        extracted text for doc/xlsx/pdf, plain text otherwise."""
+        mime, _ = Path(path.name).suffix.lower().lstrip("."), None
+        suffix = path.suffix.lower().lstrip(".")
+        text_content = None
+        if suffix in {"txt", "md", "csv", "json", "py", "yml", "yaml", "toml"}:
+            text_content = path.read_text(encoding="utf-8", errors="replace")[:200_000]
+        elif suffix in {"docx"}:
+            text_content = self._extract_docx(path)
+        elif suffix in {"xlsx"}:
+            text_content = self._extract_xlsx(path)
+        elif suffix in {"pdf"}:
+            text_content = self._extract_pdf(path)
+        elif suffix in {"png", "jpg", "jpeg", "gif", "webp"}:
+            raw = path.read_bytes()
+            b64 = base64.b64encode(raw).decode("ascii")
+            mime_t = {
+                "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+                "gif": "image/gif", "webp": "image/webp",
+            }.get(suffix, "image/png")
+            return {
+                "path": str(path), "type": "image", "mime": mime_t,
+                "data_url": f"data:{mime_t};base64,{b64[:300_000]}",
+                "summary": f"{path.name} (image {len(raw) // 1024}k)",
+            }
+        else:
+            # Fallback: read bytes, describe size since text decoding is unsafe.
+            raw = path.read_bytes()
+            return {
+                "path": str(path), "type": "binary",
+                "summary": f"{path.name} (binary {len(raw) // 1024}k, text extraction unsupported)",
+            }
+        return {
+            "path": str(path), "type": "text", "content": text_content or "",
+            "summary": f"{path.name} ({len(text_content or '') // 1024}k extracted text)",
+        }
+
+    def _extract_docx(self, path: Path) -> str:
+        try:
+            from docx import Document
+        except ImportError:
+            return f"[docx text extraction requires python-docx; raw file at {path}]"
+        doc = Document(str(path))
+        blocks = [p.text for p in doc.paragraphs if p.text.strip()]
+        for table in doc.tables:
+            for row in table.rows:
+                blocks.append(" | ".join(c.text for c in row.cells))
+        return "\n".join(blocks)[:200_000]
+
+    def _extract_xlsx(self, path: Path) -> str:
+        try:
+            import openpyxl
+        except ImportError:
+            return f"[xlsx text extraction requires openpyxl; raw file at {path}]"
+        wb = openpyxl.load_workbook(str(path), read_only=True, data_only=True)
+        out = []
+        for sheet in wb.sheetnames:
+            ws = wb[sheet]
+            rows = []
+            for row in ws.iter_rows(values_only=True):
+                cells = [("" if c is None else str(c)) for c in row]
+                if any(cells):
+                    rows.append(" | ".join(cells))
+            out.append(f"# Sheet: {sheet}\n" + "\n".join(rows))
+        return "\n\n".join(out)[:200_000]
+
+    def _extract_pdf(self, path: Path) -> str:
+        try:
+            import pypdf
+        except ImportError:
+            try:
+                import PyPDF2 as pypdf
+            except ImportError:
+                return f"[pdf text extraction requires pypdf; raw file at {path}]"
+        reader = pypdf.PdfFileReader(str(path))
+        text = []
+        for i in range(reader.getNumPages()):
+            text.append(reader.getPage(i).extract_text())
+        return "\n".join(t for t in text if t)[:200_000]
+
+    async def _handle_synthesize_command(self, text: str, log: VerticalScroll) -> None:
+        parts = text.split(maxsplit=1)
+        arg = parts[1].strip().lower() if len(parts) > 1 else ""
+        if arg == "on":
+            self.state.auto_synthesis_enabled = True
+            if self.state.agent:
+                self.state.agent.auto_skill_synthesis = True
+            log.mount(SystemMessage("🎓 Auto skill synthesis ENABLED — successful tasks will crystallize into skills."))
+        elif arg == "off":
+            self.state.auto_synthesis_enabled = False
+            if self.state.agent:
+                self.state.agent.auto_skill_synthesis = False
+            log.mount(SystemMessage("🎓 Auto skill synthesis DISABLED."))
+        else:
+            state = "on" if self.state.auto_synthesis_enabled else "off"
+            log.mount(SystemMessage(f"🎓 Auto skill synthesis is currently {state}. Usage: /synthesize on|off"))
+
+    async def _handle_parallel_command(self, text: str, log: VerticalScroll) -> None:
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            log.mount(SystemMessage("Usage: /parallel <subtask 1> ; <subtask 2> ; ..."))
+            return
+        subtasks = [p.strip() for p in parts[1].split(";") if p.strip()]
+        if len(subtasks) < 2:
+            log.mount(SystemMessage("Provide at least two sub-tasks separated by ';' to run in parallel."))
+            return
+        if not self.state.agent:
+            log.mount(SystemMessage("No active agent to parallelize on."))
+            return
+        tm = self.state.task_manager
+        if tm is None:
+            log.mount(SystemMessage("Task manager unavailable."))
+            return
+        log.mount(SystemMessage(f"⚡ Spawning {len(subtasks)} parallel sub-tasks…"))
+        log.scroll_end(animate=False)
+        for prompt in subtasks:
+            req = TaskRequest(prompt=prompt, model_id=self.state.current_provider_id or None)
+            task_id = await tm.spawn_task(req)
+            log.mount(SystemMessage(f"  › {task_id}: {prompt[:80]}"))
+            log.scroll_end(animate=False)
+        log.mount(SystemMessage("Results are saved under tasks/. Parallel status shows here as they complete."))
+        log.scroll_end(animate=False)
+
     async def _handle_skill_command(self, text: str, log: VerticalScroll) -> None:
         parts = text.split(maxsplit=2)
         if len(parts) < 2:
@@ -3078,7 +3580,7 @@ class MotionTUI(App):
         self.set_class(self.state.ui_mode == "experimental", "experimental-ui")
 
         if self._model_config:
-            self.state.agent = MotionAgent(self._model_config)
+            self.state.agent = MotionAgent(self._model_config, mcp_manager=self.state.mcp_manager)
             self.state.task_manager = TaskManager(self._model_config, self._workspace)
             if self._provider_id:
                 self.state.current_provider_id = self._provider_id

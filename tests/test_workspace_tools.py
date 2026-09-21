@@ -1,4 +1,5 @@
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -48,11 +49,22 @@ def test_plan_mode_instructions_do_not_demand_writes(tmp_path: Path) -> None:
     assert "MUST actually write files" not in instructions
     assert "DISABLED" in instructions
     assert "PLAN" in instructions
+    # Plan mode must still advertise the read/search tools it can use.
+    assert "read_file" in instructions
+    assert "web_fetch" in instructions
+    # Mutation/run tools are NOT advertised as available; they're gated.
+    assert "- run_command:" not in instructions
 
 
 def test_build_mode_instructions_still_demand_writes(tmp_path: Path) -> None:
     instructions = WorkspaceTools(tmp_path, read_only=False).instructions
-    assert "MUST actually write files" in instructions
+    assert "write_file" in instructions
+    assert "run_script" in instructions
+    assert "run_python" in instructions
+    assert "web_fetch" in instructions
+    assert "web_search" in instructions
+    # Advertises execution so the model doesn't punt on user scripts.
+    assert "run_script" in instructions or "run_python" in instructions
 
 
 def test_parse_tool_call() -> None:
@@ -435,3 +447,175 @@ async def test_agent_continues_after_tool_execution_error(tmp_path: Path) -> Non
     assert "Created out.txt after retrying." in response
     assert (tmp_path / "out.txt").read_text() == "second\n"
     assert agent.provider.calls == 3
+
+
+# ── New toolset: run_script / run_python / read_image / memory / env ─────────
+
+def test_run_script_executes_file(tmp_path: Path) -> None:
+    script = tmp_path / "hello.py"
+    script.write_text("import sys; print('hi', sys.argv[1])")
+    tools = WorkspaceTools(tmp_path, read_only=False)
+    result = tools.execute("run_script", {"path": "hello.py", "args": ["there"]})
+    assert result["exit_code"] == 0
+    assert "hi there" in result["stdout"]
+
+
+def test_run_script_missing_file(tmp_path: Path) -> None:
+    tools = WorkspaceTools(tmp_path, read_only=False)
+    with pytest.raises(WorkspaceToolError):
+        tools.execute("run_script", {"path": "nope.py"})
+
+def test_run_script_denied_in_plan_mode(tmp_path: Path) -> None:
+    tools = WorkspaceTools(tmp_path, read_only=True)
+    with pytest.raises(WorkspaceToolError):
+        tools.execute("run_script", {"path": "hello.py", "args": []})
+
+
+def test_run_python_executes_snippet(tmp_path: Path) -> None:
+    tools = WorkspaceTools(tmp_path, read_only=False)
+    result = tools.execute("run_python", {"code": "print(6*7)"})
+    assert result["exit_code"] == 0
+    assert "42" in result["stdout"]
+
+
+def test_glob_files_finds_matches(tmp_path: Path) -> None:
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "a.py").write_text("")
+    (tmp_path / "src" / "b.txt").write_text("")
+    tools = WorkspaceTools(tmp_path, read_only=False)
+    result = tools.execute("glob_files", {"pattern": "src/*.py"})
+    assert "src/a.py" in result["files"]
+
+
+def test_read_image_returns_base64(tmp_path: Path) -> None:
+    png = tmp_path / "x.png"
+    png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 20)
+    tools = WorkspaceTools(tmp_path, read_only=False)
+    result = tools.execute("read_image", {"path": "x.png"})
+    assert result["format"] == "png"
+    assert result["mime"] == "image/png"
+    assert result["data_url"].startswith("data:image/png;base64,")
+
+
+def test_memory_save_get(tmp_path: Path) -> None:
+    tools = WorkspaceTools(tmp_path, read_only=False)
+    tools.execute("memory_save", {"key": "k", "text": "hello world"})
+    got = tools.execute("memory_get", {"key": "k"})
+    assert got["found"] is True
+    assert got["text"] == "hello world"
+
+
+def test_env_var_whitelist(tmp_path: Path) -> None:
+    tools = WorkspaceTools(tmp_path, read_only=False)
+    import os
+    os.environ["PYTHONPATH"] = "/some/path"
+    result = tools.execute("env_var", {"name": "PYTHONPATH"})
+    assert result["value"] == "/some/path"
+    with pytest.raises(WorkspaceToolError):
+        tools.execute("env_var", {"name": "API_CLAUDE_KEY"})
+
+
+def test_web_fetch(tmp_path: Path) -> None:
+    tools = WorkspaceTools(tmp_path, read_only=False)
+    with patch("core.workspace_tools.httpx.get") as mock_get:
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.text = "<html><body>Hello world</body></html>"
+        resp.headers = {"content-type": "text/html"}
+        mock_get.return_value = resp
+        result = tools.execute("web_fetch", {"url": "https://example.com"})
+    assert result["status"] == 200
+    assert "Hello world" in result["text"]
+
+
+def test_web_search_ddg(tmp_path: Path) -> None:
+    tools = WorkspaceTools(tmp_path, read_only=False)
+    with patch("core.workspace_tools.httpx.get") as mock_get:
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.raise_for_status.return_value = None
+        resp.text = (
+            '<a class="result__a" href="https://example.com">Example</a>'
+        )
+        mock_get.return_value = resp
+        result = tools.execute("web_search", {"query": "python docs"})
+    assert result["count"] >= 1
+    assert result["results"][0]["title"] == "Example"
+
+
+class _ScriptRunnerProvider:
+    """Model: call run_script, then produce a final answer citing the output."""
+    class _Config:
+        provider_type = "local"
+    def __init__(self) -> None:
+        self.config = self._Config()
+        self.calls = 0
+    async def complete(self, prompt, system_prompt="", history=None, **kwargs):
+        self.calls += 1
+        if self.calls == 1:
+            assert "run_script" in system_prompt
+            return (
+                '<motion_tool>{"name":"run_script","arguments":'
+                '{"path":"hello.py","args":["world"]}}</motion_tool>'
+            )
+        assert history
+        last = history[-1]["content"]
+        assert "motion_tool_result" in last
+        assert "hello world" in last  # real captured stdout propagated back
+        return "The script ran and printed its output."
+    async def close(self):
+        pass
+
+
+async def test_agent_runs_user_script_tool(tmp_path: Path) -> None:
+    """End-to-end: the agent must actually run a user script (not hand code
+    back) and receive the captured output — the bug this feature fixes."""
+    (tmp_path / "hello.py").write_text("import sys; print('hello', sys.argv[1])\n")
+    agent = MotionAgent(
+        ModelConfig(name="test", endpoint="http://localhost", provider_type="local"),
+        memory_path=":memory:",
+    )
+    agent.provider = _ScriptRunnerProvider()
+    agent.retriever = _EmptyRetriever()
+
+    response = await agent.run(
+        "Run hello.py with arg 'world'",
+        workspace=str(tmp_path),
+        agent_mode="build",
+    )
+    assert "ran and printed" in response
+    assert agent.provider.calls == 2
+
+
+class _RunPythonProvider:
+    class _Config:
+        provider_type = "local"
+    def __init__(self) -> None:
+        self.config = self._Config()
+        self.calls = 0
+    async def complete(self, prompt, system_prompt="", history=None, **kwargs):
+        self.calls += 1
+        if self.calls == 1:
+            return (
+                '<motion_tool>{"name":"run_python","arguments":'
+                '{"code":"print(6*7)"}}</motion_tool>'
+            )
+        assert history
+        last = history[-1]["content"]
+        assert "motion_tool_result" in last
+        assert "42" in last
+        return "Six times seven is 42."
+    async def close(self):
+        pass
+
+
+async def test_agent_runs_python_snippet(tmp_path: Path) -> None:
+    agent = MotionAgent(
+        ModelConfig(name="test", endpoint="http://localhost", provider_type="local"),
+        memory_path=":memory:",
+    )
+    agent.provider = _RunPythonProvider()
+    agent.retriever = _EmptyRetriever()
+    response = await agent.run("compute 6*7", workspace=str(tmp_path), agent_mode="build")
+    assert "42" in response
+    assert agent.provider.calls == 2
