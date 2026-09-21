@@ -814,6 +814,9 @@ class TurnRunner:
             except httpx.HTTPError as exc:
                 error_msg = f"Provider {self.provider_type} request failed ({self.endpoint}): {exc}"
                 await self.trace("provider_error", error_msg, provider=self.provider_type, error=str(exc))
+                if getattr(exc, "status_code", None) in (401, 403):
+                    # The provider was reached; the credentials are the problem (the message says what to do).
+                    return f"⚠️ {error_msg}"
                 return (
                     f"⚠️ {error_msg}\n\n"
                     "I couldn't reach the model provider. Check your connection or provider status."
