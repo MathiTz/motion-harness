@@ -225,7 +225,10 @@ class AppState:
         agent = MotionAgent(model_config, mcp_manager=self.mcp_manager)
         agent.auto_skill_synthesis = self.auto_synthesis_enabled
         agent.permissions_config = self.config_manager.data
-        agent.sandbox_mode = str(self.config_manager.get("sandbox", "auto"))
+        from core.sandbox import sandbox_settings
+
+        agent.sandbox_options = sandbox_settings(self.config_manager.get)
+        agent.sandbox_mode = agent.sandbox_options["mode"]
         agent.auto_remember = bool(self.config_manager.get("remember_turns", True))
         try:
             agent.recall_timeout = float(self.config_manager.get("recall_timeout", 2.0))

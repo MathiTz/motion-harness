@@ -109,6 +109,9 @@ The JSON result has `ok`, `result`, `error`, `provider`, `model`, `mode`, `steps
 
 ```yaml
 sandbox: auto                # auto = OS write sandbox for shell/Python where available; off disables it
+sandbox_allow_read: []       # credential folders to make readable again, e.g. ["~/.aws"] (default: hidden)
+sandbox_deny_read: []        # extra folders to hide, e.g. ["~/.ssh"]
+sandbox_network: allow       # deny = commands get no network at all
 show_diffs: true             # show edits inline as colored diffs (/diff off toggles per session)
 remember_turns_headless: false  # let `motion -p` runs write to long-term memory
 default_agent_mode: plan     # plan (discuss first, read-only) | build (can write/run; risky commands still ask)

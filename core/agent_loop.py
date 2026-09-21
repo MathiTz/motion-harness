@@ -339,7 +339,7 @@ class TurnRunner:
             skills=SkillLibrary.for_workspace(self.workspace),
             notes=getattr(agent, "notes", None),
             enforce_read_before_write=True,
-            sandbox=Sandbox(self.workspace, getattr(agent, "sandbox_mode", "auto"), default_protected_paths()),
+            sandbox=self._make_sandbox(),
             subagents=self.depth == 0 and isinstance(agent.provider, BaseProvider),
         )
 
@@ -637,6 +637,15 @@ class TurnRunner:
             return op, op
         op = f"ran `{name}`"
         return op, op
+
+    def _make_sandbox(self) -> Sandbox:
+        opts = getattr(self.agent, "sandbox_options", None) or {}
+        return Sandbox(
+            self.workspace,
+            opts.get("mode", getattr(self.agent, "sandbox_mode", "auto")),
+            default_protected_paths(opts.get("allow_read", ()), opts.get("deny_read", ())),
+            network=opts.get("network", True),
+        )
 
     def _parallel_ok(self, call: ToolCall) -> bool:
         """Read-only tools and read-only (explore) sub-agents may run concurrently."""

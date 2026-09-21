@@ -41,6 +41,7 @@ class MotionAgent:
         # "auto" = confine shell/Python writes with an OS sandbox when the
         # platform has one; "off" disables it (config.yml: sandbox: off).
         self.sandbox_mode = "auto"
+        self.sandbox_options: dict = {}  # allow_read / deny_read / network (see core/sandbox.py)
         # Memory recall must never stall a turn: give up after this many seconds.
         self.recall_timeout = 2.0
         # Store substantive turns in memory (off by default; the TUI enables it

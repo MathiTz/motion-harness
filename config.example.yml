@@ -67,6 +67,9 @@ embedding:
 
 # ── Optional behaviour (all keys below are optional) ─────────────────────────
 # sandbox: auto                # OS write sandbox for shell/Python (auto | off)
+# sandbox_allow_read: []       # e.g. ["~/.aws"] to let commands read AWS credentials again
+# sandbox_deny_read: []        # e.g. ["~/.ssh"] to hide more folders
+# sandbox_network: allow       # deny = no network for commands
 # show_diffs: true             # inline colored diffs for edits
 # remember_turns_headless: false
 # default_agent_mode: plan     # plan (discuss first) | build (writes/runs; risky commands still ask)
