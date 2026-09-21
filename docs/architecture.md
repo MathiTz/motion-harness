@@ -28,5 +28,11 @@ A small reversible filter that strips stock filler phrases from output handed to
 ### 4. Tools, permissions and safety
 Tools are declared once in `core/tool_specs.py`; that registry generates both the native tool schemas and the text-protocol prompt. `core/workspace_tools.py` implements them (async, process-tree kill on cancel). `core/permissions.py` classifies shell commands (allow / ask / deny); `core/toolstate.py` holds cross-turn session state (approvals, undo checkpoints, read tracking, todos). MCP servers (`core/mcp.py`) are connected once, their tools discovered with `tools/list` and exposed as `mcp__<server>__<tool>`.
 
-### 5. Parallel Orchestration
+### 5. Sandbox, jobs and sub-agents
+- **Sandbox** (`core/sandbox.py`): shell, script and Python execution is wrapped in macOS Seatbelt or Linux bubblewrap so writes are limited to the workspace, approved paths, temp and cache directories, and the harness's own secrets are unreadable. Each backend is probed for real at first use and degrades to "policy only" when unavailable. `core/permissions.py` is the UX layer above it (patterns for commands and Python code); the sandbox is the enforcement.
+- **Jobs** (`core/jobs.py`): background processes with a bounded merged output buffer, incremental reads, process-group termination, held in the session so they outlive a turn.
+- **Sub-agents** (`task` tool, in `core/agent_loop.py`): a nested `TurnRunner` at depth 1 with fresh history, no recall, a read-only or build toolset, no approval callbacks, no further `task` tool, its own step cap and a timeout. Explore-mode runs execute in parallel behind a semaphore; edits share the lead's checkpoints so `/undo` covers them.
+- **Headless** (`core/headless.py`) is the same loop driven without a UI; **pricing** (`core/pricing.py`) turns real token usage into cost.
+
+### 6. Parallel Orchestration
 `TaskManager` (`core/orchestrator.py`) runs background agents behind an `asyncio` semaphore sized from the CPU count, exposed in the TUI as `/parallel a ; b`. Each task gets a private in-memory store and **no interactive callbacks**, so anything that would need a prompt is refused. Transcripts are saved under `<workspace>/.motion/tasks/`; completion is reported in the chat.
