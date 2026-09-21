@@ -264,6 +264,7 @@ class WorkspaceTools:
         notes: Any = None,
         enforce_read_before_write: bool = False,
         sandbox: "Sandbox | None" = None,
+        subagents: bool = False,
     ) -> None:
         self.root = Path(workspace).expanduser().resolve()
         self.read_only = read_only
@@ -288,6 +289,8 @@ class WorkspaceTools:
         self.enforce_read_before_write = enforce_read_before_write
         # OS-level write confinement for run_command/run_script/run_python.
         self.sandbox = sandbox
+        # Whether the `task` (sub-agent) tool is offered; off inside sub-agents.
+        self.subagents = subagents
         self._approved_hosts: set[str] = set()
         self._ignore = IgnoreMatcher(self.root)
         # Fallback scratch memory when no persistent note store is supplied.
@@ -300,7 +303,10 @@ class WorkspaceTools:
 
     # ── prompt / schema generation ───────────────────────────────────────
     def available_specs(self) -> list:
-        return [s for s in TOOL_SPECS if not (self.read_only and s.name in MUTATING_TOOLS)]
+        return [
+            s for s in TOOL_SPECS
+            if not (self.read_only and s.name in MUTATING_TOOLS) and (self.subagents or s.name != "task")
+        ]
 
     def tool_schemas(self) -> list[dict[str, Any]]:
         """Native tool-calling schemas for the tools available in this mode."""
@@ -518,6 +524,8 @@ answer that follow-up directly.
             raise WorkspaceToolError("ask_user needs an interactive session")
         if name.startswith("job_"):
             raise WorkspaceToolError(f"{name} runs through the async agent loop")
+        if name == "task":
+            raise WorkspaceToolError("task (sub-agents) runs through the agent loop")
         raise WorkspaceToolError(f"unknown tool: {name}")
 
     # ── asynchronous dispatch (used by the agent loop) ───────────────────

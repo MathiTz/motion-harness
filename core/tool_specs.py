@@ -174,6 +174,24 @@ TOOL_SPECS: List[ToolSpec] = [
         "exec",
     ),
     ToolSpec(
+        "task",
+        "Delegate a self-contained task to a sub-agent that works with its OWN fresh context and returns only "
+        "a final report - use it for broad codebase exploration or independent side work so this conversation "
+        "stays small. Several task calls in one turn run in parallel. mode 'explore' (default) is read-only; "
+        "'general' can edit files and run commands but cannot ask the user or start more sub-agents. "
+        "Write the prompt as if briefing a colleague who has seen none of this conversation.",
+        _obj(
+            {
+                "description": _s("3-6 word label"),
+                "prompt": _s("complete, self-contained instructions, including what the report should contain"),
+                "mode": {"type": "string", "enum": ["explore", "general"]},
+            },
+            ["description", "prompt"],
+        ),
+        '{"description": "find auth entry points", "prompt": "Locate where requests are authenticated and report file paths and functions.", "mode": "explore"}',
+        "agent",
+    ),
+    ToolSpec(
         "job_start",
         "Start a long-running process in the background (dev server, watcher, slow build) and return "
         "immediately with a job_id. Read its logs with job_output and stop it with job_stop. Use this "

@@ -3205,6 +3205,8 @@ class ChatPane(Vertical):
         "native_tools_disabled": "🔁 native_tools.disabled",
         "todo_update": "☑ todo.update",
         "sandbox": "🧱 sandbox",
+        "subagent_start": "🧩 subagent.start",
+        "subagent_done": "🧩 subagent.done",
     }
     TRACE_BUFFER_MAX = 400
     TRACE_WIDGET_MAX = 250
