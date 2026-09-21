@@ -98,10 +98,7 @@ motion auth list                          # List stored API keys
 Combines the nuance of vector embeddings with the precision of SQLite FTS5. Whether you need a "concept" or a "specific variable name," Motion finds it instantly.
 
 ### 🦴 Caveman Protocol
-A bidirectional compression layer that strips conversational fluff. 
-- **Input**: Natural language $\rightarrow$ Compressed tokens.
-- **Output**: Compressed tokens $\rightarrow$ Natural language.
-- **Result**: $\sim 50\%$ reduction in token overhead without loss of intent.
+An optional output filter that strips a fixed set of stock filler phrases ("Certainly!", "I hope this helps.", …) when a response is handed to another agent rather than to you. It is reversible (`CavemanCompressor.expand`) and is **not** applied to the model's input or to replies shown to you, so it does not meaningfully change token cost — treat it as a small utility, not a compression layer. (`motion --test` demonstrates it.)
 
 ### 🎓 Self-Learning Synthesis
 When a complex task is solved, the harness doesn't just forget. It analyzes the trajectory and "crystallizes" the steps into a `.md` skill, allowing the agent to execute the same complex workflow in the future with a single reference.
@@ -128,11 +125,33 @@ A high-performance terminal interface built with `Textual`, designed for daily-d
 
 **Real token usage**: when the active provider reports usage, the session footer and per-turn metadata show real prompt/completion/total token counts instead of a character-based estimate; the estimate is used only as a fallback when a provider doesn't return usage data.
 
-**Agent tools**: in `build` mode the agent can call `read_file`, `write_file`, `replace_in_file`, `list_files`, and `run_command` (arbitrary shell commands in the workspace, with a timeout and truncated output) against the workspace. Tool calls that target a path outside the workspace no longer fail outright — you're prompted to **allow once**, **allow for the session**, or **deny**.
+**Agent tools**: the agent can `list_files`, `glob_files`, `grep`, `read_file` (windowed: `offset`/`limit`), `read_image`, `web_fetch`, `web_search`, `todo_write`, `ask_user`, `use_skill`, `memory_save`/`memory_get` (persisted in the memory DB) and any tool exposed by a connected MCP server — in both modes. In `build` mode it can also `write_file`, `replace_in_file`, `run_command`, `run_script` and `run_python`. `list_files`/`glob_files`/`grep` skip `.git`, virtualenvs, `node_modules` and anything in your `.gitignore`. Tool calls that target a path outside the workspace prompt you to **allow once**, **allow for the session**, or **deny**.
+
+#### ⚡ Speed & responsiveness
+
+- **Everything streams.** Answer text, model reasoning ("thinking") and tool progress appear as they are produced, including inside the tool loop. Providers with a native tool-calling API (OpenAI-compatible, Anthropic, Ollama) use it; models without one fall back to a streamed text protocol automatically.
+- **Independent tool calls run in parallel.** When the model asks to read several files (or search and fetch) in one step, they execute concurrently in one round trip.
+- **The UI never blocks.** Commands, network calls and file walks run off the event loop; `Esc` cancels immediately and kills the child process tree.
+- **Live status line.** While a turn runs you see the phase (`thinking`, `running run_command`, `waiting for you`), elapsed time, step count, time-to-first-token, token count and the latest line of command output. Afterwards it shows the last turn's time. Reasoning collapses to `thought for 4.2s` (`F7` expands it).
+- **Memory recall is off the critical path**: bounded by `recall_timeout` (default 2 s), skipped when memory is empty, embeddings are cached, and a failing recall never fails a turn.
+- **Context stays small.** Old tool output is trimmed, oversized conversations drop the oldest tool exchanges, and history is summarized (`/compact`, or automatically at 60% of the model's window). Attachments are sent once with the message they belong to.
+- **Resilient transport.** 429/5xx and connection errors retry with backoff (`max_retries`, default 3; honors `Retry-After`); the connect timeout is 10 s and the idle-read timeout defaults to 120 s (`timeout` per model).
+
+#### 🔐 Safety & permissions
+
+- **Risky commands ask first.** `rm -r/-f`, `sudo`, `git push/reset --hard/clean`, `curl | sh`, `chmod -R`, credential-file access and similar prompt for **allow once / for this session / deny**. Catastrophic commands (`rm -rf /`, `mkfs`, fork bombs) are always refused. Tune it in `config.yml` (`permissions.commands.allow|ask|deny`, shell-style globs).
+- **Non-interactive contexts never auto-approve.** Background `/parallel` tasks refuse anything that would need a prompt.
+- **Secrets stay out of child processes.** Provider API keys are stripped from the environment of commands the agent runs and of MCP servers.
+- **Web content is untrusted.** `web_fetch`/`web_search`/MCP results are flagged as data, never instructions. `web_fetch` refuses loopback/private/link-local addresses (including via redirects) unless you approve.
+- **Undo.** Every file the agent writes is snapshotted first; `/undo` restores the whole last turn (deleting files it created). Overwriting an existing file the agent hasn't read is refused.
+
+#### 🗂️ Where state lives
+
+Everything the harness writes into your project goes under one self-ignoring folder, `<workspace>/.motion/` (`tasks/`, `sessions/`, `skills/`); the harness's own log, memory DB and config stay in the install directory. Session transcripts (for `/resume`) are only written if you opted into interaction tracking.
 
 **Model persistence**: switching models via `Ctrl+O` (or the startup provider picker) saves your choice as `last_provider` in `config.yml`, so the next `motion` launch reconnects to the same provider/model instead of resetting to the catalog default. An explicit `motion --provider ...` flag always overrides this for that one run and is not persisted.
 
-**Resilient tool loop**: malformed tool calls and individual tool errors are treated as context rather than immediately stopping the agent. Only `Esc` (or an explicit `tool_error`/`Esc` stop signal) halts the loop, and the UI removes stale "Queued" notices as soon as a queued prompt starts running. Provider HTTP calls time out after 30s so cancellation feels responsive.
+**Resilient tool loop**: malformed tool calls and individual tool errors are treated as context rather than immediately stopping the agent. Only `Esc` (or an explicit `tool_error`/`Esc` stop signal) halts the loop, and the UI removes stale "Queued" notices as soon as a queued prompt starts running. Cancelling (`Esc` / `Ctrl+C`) stops the request and kills any command the agent is running.
 
 **Keyboard shortcuts**:
 | Key | Action |
@@ -154,7 +173,15 @@ A high-performance terminal interface built with `Textual`, designed for daily-d
 | `Enter` (chat input) | Send message |
 | `Shift+Enter` (chat input) | New line |
 | `↑` / `↓` (chat input) | Prompt history |
-| `/skill save <name>` | Save last reply as a skill |
+| `/skill list` · `show <name>` · `save <name>` · `delete <name>` | Manage reusable skills |
+| `/compact` | Summarize the conversation to free context |
+| `/undo` | Revert the file changes of the last turn |
+| `/new` | Start a fresh conversation |
+| `/resume [id]` | List saved sessions / reload one |
+| `/todos` | Show the agent's task list |
+| `/mcp` | Connected MCP servers and their tools |
+| `/attach [path]` | Attach a file (or browse) to the next message |
+| `/parallel a ; b` | Run sub-tasks on background workers; results appear in chat |
 | `/auth list` | List stored API keys |
 | `/auth login <provider>` | Store an API key for a provider |
 | `/auth logout <provider>` | Remove a stored API key |
@@ -177,8 +204,9 @@ A high-performance terminal interface built with `Textual`, designed for daily-d
 - Trace persistence is per-session (not yet written to disk).
 - Theme contrast validation is manual; the bundled themes are tuned for readability but very-low-contrast combinations are not auto-corrected.
 - Clipboard copy falls back to inserting the response into the input box when the terminal lacks clipboard support.
-- Conversation history sent to the model is capped at the most recent 8 turns; earlier context is summarized, not verbatim.
-- File/document ingestion (image / PDF / DOCX / XLSX) is on the roadmap — see [Roadmap](docs/roadmap.md).
+- Conversation history sent to the model is capped at the most recent 8 turns; older context is condensed by `/compact` (or automatically near the context window).
+- Attached PDFs/DOCX/XLSX are extracted to text (no native PDF modality yet); images are sent as real image parts to vision-capable models. See [Roadmap](docs/roadmap.md).
+- Semantic memory search needs a real embedding model (a local Ollama model, or `embed_model` on an OpenAI-compatible provider); otherwise recall is keyword-only.
 
 ---
 
@@ -246,10 +274,13 @@ Motion Harness is in **Active Beta**. We welcome contributions to help us reach 
 4. **Wait for Review**: Changes will be merged into `beta` for testing before being curated into `main`.
 
 ### 🧪 Testing
-Ensure all changes are validated against the integration suite:
+Install the dev dependencies and run the whole suite (CI runs it on Python 3.11 and 3.14):
 ```bash
-pytest tests/test_integration.py
+pip install -r requirements-dev.txt
+PYTHONPATH=. pytest tests/
+ruff check --select E9,F63,F7,F82 main.py core memory ui tests   # syntax errors / undefined names
 ```
+The suite includes headless end-to-end TUI tests (streaming, approvals, `/undo`, `/resume`, cancellation) driven by a scripted provider — no API key or network needed.
 
 **Visual + TUI smoke checks** (headless, no terminal required):
 ```bash

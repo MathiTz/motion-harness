@@ -45,3 +45,12 @@ Users can also manually create skills to "teach" the agent specific preferences 
 ```
 
 Adding a file following this template to your workspace will immediately expand the agent's capabilities.
+## Where skills live and how the agent uses them
+
+Skills are markdown files, looked up in this order (first match wins):
+
+1. `<workspace>/.motion/skills/` — project skills (`/skill save <name>` writes here)
+2. `<workspace>/skills/` — legacy location, still read
+3. `<harness>/skills/` — auto-synthesized skills shared across projects
+
+The agent sees an index of available skills (name + first line) in its system prompt and loads one on demand with the `use_skill` tool. Manage them with `/skill list`, `/skill show <name>`, `/skill save <name>` (saves the last reply) and `/skill delete <name>`.

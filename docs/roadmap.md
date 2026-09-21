@@ -34,7 +34,36 @@ operate.
 > there's no UI to spawn parallel tasks or toggle auto-synthesis. Manual skills
 > work via `/skill save <name>`. Parallel orchestration is tracked in Phase 4.
 
-## Phase 2 — Document & File Ingestion (next)
+## Phase 1.5 — Harness fundamentals (done)
+
+Speed, correctness and safety work that the chat UX sits on.
+
+- [x] Streaming everywhere (answer, reasoning, tool progress), incl. Anthropic SSE
+- [x] Native tool calling (OpenAI-compatible / Anthropic / Ollama) with automatic
+      fallback to the text protocol; independent tool calls run in parallel
+- [x] Tools run off the event loop; `Esc` cancels and kills the process tree
+      (the old Esc/Ctrl+C handler silently never worked)
+- [x] The original request stays in the conversation across tool steps
+- [x] Retries/backoff, split connect/idle timeouts, real usage on streams,
+      configurable Anthropic endpoint + prompt caching
+- [x] Live status line (phase, elapsed, first-token time), "thought for Ns",
+      throttled rendering, buffered trace panel
+- [x] Context hygiene: tool-result trimming, windowed `read_file`, compaction
+      (`/compact` + automatic), attachments sent once
+- [x] New tools: `grep`, `todo_write`, `ask_user`, `use_skill`, persistent
+      `memory_save`; `.gitignore`-aware listing; diffs; read-before-overwrite
+- [x] Command permission policy (allow/ask/deny), catastrophic-command block,
+      secret-free child environment, SSRF guard, untrusted web/MCP content
+- [x] `/undo` (per-turn file checkpoints), `/new`, `/resume`, `/todos`, `/mcp`
+- [x] MCP: real persistent stdio + HTTP client, discovered tools with schemas
+- [x] Memory: natural-language keyword search, rank fusion, embedding cache,
+      dimension adaptation, keyword-only mode without a real embedder
+- [x] Project instructions (`AGENTS.md`), environment block, saved-skill index
+- [x] `/parallel` results reported in chat; tasks isolated and non-interactive
+- [x] Harness state consolidated under `<workspace>/.motion/`
+- [x] CI on Python 3.11 + 3.14 with lint; provider/loop/MCP/TUI test suites
+
+## Phase 2 — Document & File Ingestion (in progress)
 
 Adopts the opencode model of **base64 data-URL content parts** with **capability
 gating**, rather than blind OCR/text extraction. The model either reads the file
@@ -44,23 +73,23 @@ natively or the harness says it can't and tells the user why.
 without hallucinating or faking content.
 
 - [ ] **Image support (vision)**
-  - [ ] Convert attached images to base64 `data:<mime>;base64,...` content parts
-  - [ ] Detect a vision-capable model (`capabilities.input.image`)
-  - [ ] If unsupported, degrade gracefully: replace with
-        `ERROR: Cannot read image (this model does not support image input)`
-  - [ ] Empty / corrupt image guard before sending
+  - [x] Convert attached images to base64 image content parts (all providers)
+  - [x] Detect a vision-capable model (heuristic; override with `vision:` per model)
+  - [x] If unsupported, degrade gracefully and tell the user/model
+  - [x] Empty / oversized (>5 MB) image guard before sending
 - [ ] **PDF support**
   - [ ] Treat `application/pdf` as its own modality (`pdf`)
+  - [x] Text extraction with pypdf (fixed: the old code used a removed API)
   - [ ] Pass natively to models that accept PDFs; capability-gate otherwise
 - [ ] **DOC / DOCX support**
-  - [ ] Text extraction via `python-docx` (paragraphs + tables) when the model
+  - [x] Text extraction via `python-docx` (paragraphs + tables) when the model
         cannot ingest DOCX natively
   - [ ] Chunk + embed extracted text into `MemoryDB` for Hybrid Recall
 - [ ] **XLSX (Excel) support**
-  - [ ] Sheet → CSV-like text via `openpyxl`
+  - [x] Sheet → CSV-like text via `openpyxl`
   - [ ] Chunk + embed into `MemoryDB` for Hybrid Recall
 - [ ] **Unified attachment pipeline**
-  - [ ] `/attach <path>` (or drag-in) in the composer
+  - [x] `/attach <path>` (or browse) in the composer
   - [ ] Route by MIME: image → vision part; pdf → pdf part; doc/docx/xlsx → text
         extraction → memory
   - [ ] Capability gating mirrors opencode (`mimeToModality` + `input[modality]`)
@@ -68,7 +97,7 @@ without hallucinating or faking content.
 
 ## Phase 3 — Provider & Model Enhancements
 
-- [ ] Multimodal payload support in `core/providers.py` (image/pdf content parts)
+- [x] Multimodal payload support in `core/providers.py` (image content parts; pdf pending)
 - [ ] Per-model capability manifest (`input.image`, `input.pdf`, …)
 - [ ] Model switching preserves attachments (re-attach on provider change)
 - [ ] Optional vision-model fallback path for non-vision models (OCR for scanned
@@ -77,8 +106,8 @@ without hallucinating or faking content.
 ## Phase 4 — Memory & Orchestration
 
 - [ ] Document-level memory (per-file retrieval namespaces)
-- [ ] Auto-compact conversation context under configurable token thresholds
-- [ ] Persistent multi-session context across restarts
+- [x] Auto-compact conversation context (summarizes at 60% of the model window)
+- [x] Persistent multi-session context across restarts (`/resume`, opt-in tracking)
 - [ ] Parallel orchestration with attachment-aware task scheduling
 
 ---
