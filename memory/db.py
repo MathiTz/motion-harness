@@ -1,3 +1,4 @@
+import re
 import sqlite3
 import json
 import struct
@@ -6,6 +7,34 @@ from typing import List, Tuple, Optional, Dict, Any
 from dataclasses import dataclass
 
 EMBEDDING_DIM = 128
+
+# Words that carry no retrieval signal. Removing them keeps natural-language
+# questions ("how do we deploy to staging?") from needing every word to match.
+_STOPWORDS = frozenset(
+    "a an and are as at be but by can could did do does for from had has have how i if in into is it its "
+    "me my of on or our should so than that the their them then there these they this to up us was we were "
+    "what when where which who why will with would you your please about just like want need make get use "
+    "using help show tell give let lets can't don't isn't".split()
+)
+
+
+def fts_query(text: str, max_terms: int = 16) -> str:
+    """Turn free text into an FTS5 OR-query of quoted terms ("" if nothing useful).
+
+    The previous implementation searched the entire prompt as ONE exact phrase,
+    which matches essentially never for a natural-language question.
+    """
+    seen = set()
+    terms = []
+    for tok in re.findall(r"[A-Za-z0-9_]{2,}", text or ""):
+        low = tok.lower()
+        if low in _STOPWORDS or low in seen:
+            continue
+        seen.add(low)
+        terms.append(f'"{tok}"')
+        if len(terms) >= max_terms:
+            break
+    return " OR ".join(terms)
 
 @dataclass
 class MemoryChunk:
@@ -88,13 +117,49 @@ class MemoryDB:
         self.conn.commit()
 
     def keyword_search(self, query: str, limit: int = 5) -> List[Tuple[float, str]]:
-        if not query:
+        match = fts_query(query)
+        if not match:
             return []
-        escaped_query = query.replace('"', '""')
-        phrase_query = f'"{escaped_query}"'
         sql = "SELECT rank, content FROM memories_fts WHERE memories_fts MATCH ? ORDER BY rank LIMIT ?"
-        cursor = self.conn.execute(sql, (phrase_query, limit))
-        return cursor.fetchall()
+        try:
+            return self.conn.execute(sql, (match, limit)).fetchall()
+        except sqlite3.OperationalError:
+            return []
+
+    def count(self) -> int:
+        return self.conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+
+    def delete_memory(self, mem_id: int) -> None:
+        self.conn.execute("DELETE FROM memories WHERE id = ?", (mem_id,))
+        self.conn.execute("DELETE FROM memories_fts WHERE rowid = ?", (mem_id,))
+        if self._vec_available:
+            self.conn.execute("DELETE FROM memories_vec WHERE rowid = ?", (mem_id,))
+        self.conn.commit()
+
+    # ── notes (memory_save / memory_get tools) ───────────────────────────
+    def save_note(self, key: str, text: str) -> None:
+        """Persist a keyed note. Notes are findable by keyword recall; they get
+        a zero vector (no semantic signal), which semantic search skips."""
+        for (mem_id,) in self.conn.execute(
+            "SELECT id FROM memories WHERE mem_type = 'NOTE' AND json_extract(metadata, '$.note_key') = ?", (key,)
+        ).fetchall():
+            self.delete_memory(mem_id)
+        self.add_memory(MemoryChunk(
+            content=f"[note:{key}] {text}",
+            embedding=[0.0] * EMBEDDING_DIM,
+            metadata={"note_key": key},
+            mem_type="NOTE",
+        ))
+
+    def get_note(self, key: str) -> Optional[str]:
+        row = self.conn.execute(
+            "SELECT content FROM memories WHERE mem_type = 'NOTE' AND json_extract(metadata, '$.note_key') = ? "
+            "ORDER BY id DESC LIMIT 1", (key,)
+        ).fetchone()
+        if not row:
+            return None
+        prefix = f"[note:{key}] "
+        return row[0][len(prefix):] if row[0].startswith(prefix) else row[0]
 
     def semantic_search(self, query_embedding: List[float], limit: int = 5) -> List[Tuple[float, str]]:
         query_blob = self._serialize_embedding(query_embedding)
@@ -145,3 +210,16 @@ class MemoryDB:
 
     def close(self):
         self.conn.close()
+
+
+class NoteStore:
+    """Adapter giving WorkspaceTools a persistent memory_save/memory_get backend."""
+
+    def __init__(self, db: MemoryDB) -> None:
+        self.db = db
+
+    def save(self, key: str, text: str) -> None:
+        self.db.save_note(key, text)
+
+    def get(self, key: str) -> Optional[str]:
+        return self.db.get_note(key)

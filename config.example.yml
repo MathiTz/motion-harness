@@ -64,3 +64,22 @@ providers:
 embedding:
   provider: "local-llama"
   dimension: 128
+
+# ── Optional behaviour (all keys below are optional) ─────────────────────────
+# default_agent_mode: plan     # plan (discuss first) | build (writes/runs; risky commands still ask)
+# remember_turns: true         # store substantive turns in memory for later recall
+# recall_timeout: 2.0          # seconds a memory lookup may delay a turn
+#
+# permissions:
+#   commands:                  # shell-style globs matched against the whole command
+#     allow: ["git push origin feature/*"]
+#     ask:   ["make deploy*"]
+#     deny:  ["curl *"]
+#
+# mcp:
+#   servers:
+#     files: { command: "npx", args: ["-y", "@modelcontextprotocol/server-filesystem", "."] }
+#
+# Per-model options (under providers.<id>.models.<model>): timeout, max_retries,
+# native_tools, vision, context_window, thinking_budget, reasoning_effort,
+# embed_model. See docs/cli.md for what each does.

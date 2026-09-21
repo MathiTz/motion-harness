@@ -6,13 +6,15 @@ Motion Harness is designed as a **Cognitive Infrastructure**, moving away from s
 
 The core of the system is a unidirectional loop that ensures every single interaction is grounded in memory and optimized for cost.
 
-`User Input` $\rightarrow$ `Hybrid Recall` $\rightarrow$ `Model Execution` $\rightarrow$ `Caveman Compression` $\rightarrow$ `TUI Output`
+`User Input` → `Hybrid Recall` (bounded, in parallel with context loading) → `Model step` (streamed) → `Tool calls` (parallel when independent) → … → `Final answer`
+
+A turn is implemented in `core/agent_loop.py`. It talks to the model in one of three ways, chosen per provider: **native** tool calling (streamed; preferred), a streamed **text/XML** tool protocol (automatic fallback when an endpoint rejects `tools`), or plain `complete()` for simple/custom providers. Live output reaches the UI as marker-prefixed chunks (`_delta_`, `_think_`, `_endstep_`, `_tool_`, `_out_`) documented at the top of that module.
 
 ### 1. Hybrid Recall (The Memory Layer)
-Instead of relying solely on vector embeddings (which can be imprecise for specific technical terms), Motion uses a dual-track retrieval system:
-- **Semantic Track**: Uses `sqlite-vec` for concept-based retrieval (e.g., "How does the auth system work?").
-- **Keyword Track**: Uses SQLite `FTS5` for exact match retrieval (e.g., "Find the `AUTH_TOKEN_SESS` variable").
-- **Fusion**: The results are merged and ranked, providing the LLM with a high-precision context window.
+Two retrievers fused with reciprocal-rank fusion:
+- **Keyword track**: SQLite `FTS5`. The query is the significant terms of the prompt joined with `OR` (BM25-ranked), not the whole prompt as one exact phrase.
+- **Semantic track**: `sqlite-vec` cosine search, used **only when a real embedding model is available** (local Ollama, or `embed_model` on an OpenAI-compatible provider). Without one, the hash-based fallback vectors carry no meaning, so semantic search is skipped rather than returning unrelated memories.
+- Recall is bounded by `recall_timeout`, skipped for an empty DB, and never fails a turn. Substantive turns are stored back (`remember_turns`), and `memory_save` notes persist here too.
 
 ### 2. Model Execution (The Provider Layer)
 The harness uses a provider abstraction that allows for seamless routing:
@@ -20,14 +22,11 @@ The harness uses a provider abstraction that allows for seamless routing:
 - **Cloud**: Claude/GPT for high-reasoning tasks.
 - **Proxy**: Custom endpoints for specialized model lairs.
 
-### 3. Caveman Compression (The Efficiency Layer)
-To combat token bloat in long agent-to-agent trajectories, the harness applies a **Bidirectional Compression Protocol**.
+### 3. Caveman Filter (optional)
+A small reversible filter that strips stock filler phrases from output handed to another agent. It is not applied to model input or to replies shown to the user; see the README for the honest scope.
 
-- **Noise Reduction**: Strips common conversational fluff ("I understand," "Based on the context provided," etc.).
-- **Semantic Preservation**: Maintains the core logic, constraints, and variables.
-- **Symmetry**: The compression is reversible, meaning the TUI can "decompress" the output back into natural language for the user, while the internal agents communicate in a dense, token-efficient format.
+### 4. Tools, permissions and safety
+Tools are declared once in `core/tool_specs.py`; that registry generates both the native tool schemas and the text-protocol prompt. `core/workspace_tools.py` implements them (async, process-tree kill on cancel). `core/permissions.py` classifies shell commands (allow / ask / deny); `core/toolstate.py` holds cross-turn session state (approvals, undo checkpoints, read tracking, todos). MCP servers (`core/mcp.py`) are connected once, their tools discovered with `tools/list` and exposed as `mcp__<server>__<tool>`.
 
-### 4. Parallel Orchestration
-The orchestrator (`core/orchestrator.py`) manages task concurrency using an `asyncio` semaphore gated by the system's CPU core count. This prevents system lockup during massive parallel research tasks while maximizing throughput.
-
-> **Status:** the `TaskManager` is instantiated at startup but not yet exposed through the TUI — there is no UI to spawn parallel tasks yet. This is on the [Roadmap](roadmap.md).
+### 5. Parallel Orchestration
+`TaskManager` (`core/orchestrator.py`) runs background agents behind an `asyncio` semaphore sized from the CPU count, exposed in the TUI as `/parallel a ; b`. Each task gets a private in-memory store and **no interactive callbacks**, so anything that would need a prompt is refused. Transcripts are saved under `<workspace>/.motion/tasks/`; completion is reported in the chat.

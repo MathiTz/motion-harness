@@ -38,7 +38,8 @@ python3 -m venv venv
 source venv/bin/activate
 
 # Install dependencies
-pip install -r requirements.txt
+pip install -r requirements.txt      # runtime
+# pip install -r requirements-dev.txt  # + pytest/ruff to run the tests
 
 # Launch
 python main.py
@@ -49,20 +50,9 @@ python main.py
 ## ⚙️ Configuration
 
 ### Provider Setup
-Motion Harness supports multiple LLM backends. Edit `config.yaml` or create a `.env` file to define your providers:
+Keys go in the auth store (`motion auth login <provider>`), the environment (`OLLAMA_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`; a `.env` in the install directory is loaded automatically), or — least preferred — `config.yml`. Providers and models come from a built-in catalog merged with your `config.yml`; see [CLI & Auth](cli.md) for adding your own and for every optional setting.
 
-```yaml
-providers:
-  openai:
-    api_key: "sk-..."
-    model: "gpt-4o"
-  anthropic:
-    api_key: "sk-ant-..."
-    model: "claude-3-5-sonnet"
-  ollama:
-    base_url: "http://localhost:11434"
-    model: "llama3"
-```
+Each vendor's key is only ever sent to that vendor's endpoint.
 
 ### Workspace Management
 The agent operates within a defined workspace. When using the `motion` alias, the current directory is automatically passed as the workspace. 

@@ -36,6 +36,7 @@ import json
 import logging
 import os
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
@@ -63,10 +64,14 @@ from textual.widgets import (
 )
 
 from core.config import ConfigManager
+from core.context import estimate_tokens
 from core.orchestrator import TaskManager, TaskRequest
 from core.providers import ModelConfig
+from core.session import SessionStore, state_dir
+from core.skills import SkillLibrary, slugify
+from core.toolstate import ToolSession
 from core import auth
-from main import MotionAgent
+from main import MotionAgent, REPO_DIR
 from ui.themes import ThemeRegistry
 
 WORKSPACE = os.getenv("MOTION_WORKSPACE", os.getcwd())
@@ -77,7 +82,8 @@ logger = logging.getLogger(__name__)
 def _suppress_logging() -> None:
     """Redirect root logging to a file so it doesn't bleed into the TUI."""
     import logging
-    log_path = os.path.join(WORKSPACE, "motion.log")
+    # The harness's own log lives with the harness, not in the user's project.
+    log_path = os.path.join(REPO_DIR, "motion.log")
     handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
     handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
     root = logging.getLogger()
@@ -117,6 +123,11 @@ class AppState:
         # gains write access ("build") once the user explicitly confirms via
         # a build-trigger phrase (see _is_build_trigger) or the Tab toggle.
         self.agent_mode: str = "plan"
+        # Start mode: config `default_agent_mode: build` skips the discuss-first
+        # plan step (risky commands still ask for approval either way).
+        _configured_mode = self.config_manager.get("default_agent_mode")
+        if _configured_mode in ("plan", "build"):
+            self.agent_mode = _configured_mode
         self.busy: bool = False  # True while an agent response is streaming
         # Prompts submitted while busy are queued here instead of cancelling
         # the in-flight agent worker (which @work(exclusive=True) would
@@ -131,12 +142,16 @@ class AppState:
         # WorkspaceTools compares against) and is passed to
         # MotionAgent.run() on every turn so approvals persist without
         # re-prompting.
-        self.allowed_workspace_paths: set[Path] = set()
+        # Approvals, undo checkpoints, read-tracking and todos that must
+        # survive across turns. allowed_workspace_paths aliases the shared set.
+        self.tool_session = ToolSession()
+        self.allowed_workspace_paths: set[Path] = self.tool_session.allowed_paths
         # Per-session JSONL transcript path (prompt + full response per
         # turn), created lazily on first write. Only used when the user has
         # opted in via track_interactions in config.yml (asked once, at
         # first launch - see TrackingConsentScreen).
-        self._interaction_log_path: Optional[Path] = None
+        self._session_store: Optional[SessionStore] = None
+        self.todos: list[dict] = []
         self.session_context: str = ""  # rolling, bounded summary of the session
         self._context_turns: list[tuple[str, str]] = []  # recent turns used to build context
         self.conversation_turns: list[tuple[str, str]] = []  # (prompt, response)
@@ -158,7 +173,7 @@ class AppState:
             from core.mcp import MCPManager
         except Exception:
             return None
-        servers_cfg = self.config_manager.get("mcp", {}).get("servers", {})
+        servers_cfg = (self.config_manager.get("mcp") or {}).get("servers") or {}
         if not servers_cfg:
             return None
         try:
@@ -179,13 +194,72 @@ class AppState:
         # Close old connections if any
         if self.agent:
             try:
+                asyncio.get_running_loop().create_task(self.agent.provider.close())
+            except RuntimeError:
+                pass
+            try:
                 self.agent.memory.close()
             except Exception:
                 pass
-        self.agent = MotionAgent(model_config, mcp_manager=self.mcp_manager)
-        self.agent.auto_skill_synthesis = self.auto_synthesis_enabled
-        self.task_manager = TaskManager(model_config, WORKSPACE)
+        self.agent = self.make_agent(model_config)
+        self.task_manager = TaskManager(model_config, WORKSPACE, self.mcp_manager, self.config_manager.data)
         self.current_provider_id = provider_id
+
+    def make_agent(self, model_config: ModelConfig) -> MotionAgent:
+        """Build an agent wired to this session's config (permissions, memory,
+        MCP)."""
+        agent = MotionAgent(model_config, mcp_manager=self.mcp_manager)
+        agent.auto_skill_synthesis = self.auto_synthesis_enabled
+        agent.permissions_config = self.config_manager.data
+        agent.auto_remember = bool(self.config_manager.get("remember_turns", True))
+        try:
+            agent.recall_timeout = float(self.config_manager.get("recall_timeout", 2.0))
+        except (TypeError, ValueError):
+            pass
+        return agent
+
+    @property
+    def context_window(self) -> int:
+        return int(getattr(getattr(self.agent, "provider", None), "context_window", 32768) or 32768)
+
+    def history_tokens(self) -> int:
+        """Rough token size of the conversation history sent with each turn."""
+        return sum(estimate_tokens(p) + estimate_tokens(r) for p, r in self.conversation_turns[-8:])
+
+    def needs_compaction(self, threshold: float = 0.6) -> bool:
+        return self.history_tokens() >= self.context_window * threshold
+
+    async def compact_with_model(self) -> str:
+        """Replace the running conversation with a model-written summary.
+        Returns the summary ("" if there was nothing to compact)."""
+        if not self.conversation_turns or self.agent is None:
+            return ""
+        summary = await self.agent.summarize(self.conversation_turns)
+        if not summary:
+            return ""
+        self.conversation_turns = [("[Summary of the conversation so far]", summary)]
+        self._context_turns = list(self.conversation_turns)
+        self.session_context = "[Compacted context]\n"
+        self.session_metrics["total_tokens_est"] = 0
+        self.session_metrics["prompt_tokens_est"] = 0
+        self.session_metrics["output_tokens_est"] = 0
+        return summary
+
+    def new_session(self) -> None:
+        """Start a fresh conversation (keeps provider, approvals and config)."""
+        self.conversation_turns = []
+        self._context_turns = []
+        self.session_context = ""
+        self.attachments.clear()
+        self.todos = []
+        self.last_agent_response = ""
+        self.message_queue.clear()
+        self.tool_session.todos = []
+        self.tool_session.read_files.clear()
+        self.tool_session.checkpoints.entries.clear()
+        self._session_store = None
+        for k in self.session_metrics:
+            self.session_metrics[k] = 0.0 if k == "estimated_cost_usd" else 0
 
     @staticmethod
     def build_provider_options() -> list[tuple[str, str]]:
@@ -305,39 +379,29 @@ class AppState:
 
     def log_interaction(self, prompt: str, response: str) -> None:
         """Append one turn (prompt + full response) to this session's JSONL
-        transcript, if the user has opted into tracking.
-
-        A no-op when track_interactions is unset/False. One file per app
-        run, created lazily under <workspace>/sessions/ on the first logged
-        turn, named by the session's start timestamp.
-        """
+        transcript under <workspace>/.motion/sessions/, if the user has opted
+        into tracking. The same transcript powers /resume."""
         if not self.config_manager.get("track_interactions"):
             return
         try:
-            if self._interaction_log_path is None:
-                sessions_dir = Path(WORKSPACE) / "sessions"
-                sessions_dir.mkdir(parents=True, exist_ok=True)
-                ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-                self._interaction_log_path = sessions_dir / f"{ts}.jsonl"
-            record = {
-                "timestamp": datetime.now().isoformat(),
+            if self._session_store is None:
+                self._session_store = SessionStore(WORKSPACE)
+            self._session_store.append({
                 "provider": self.current_provider_id,
                 "prompt": prompt,
                 "response": response,
-            }
-            with open(self._interaction_log_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            })
         except Exception:
             pass
 
 
 def _slugify_name(name: str) -> str:
-    value = name.strip().lower().replace(" ", "_")
-    return re.sub(r"[^a-z0-9_-]+", "", value)
+    return slugify(name)
 
 
 def _skills_dir() -> Path:
-    return Path(WORKSPACE) / "skills"
+    """Where /skill save writes: project-local, under the self-ignoring .motion/."""
+    return Path(WORKSPACE) / ".motion" / "skills"
 
 
 # Phrases that count as an explicit go-ahead to start creating/editing files.
@@ -369,8 +433,11 @@ def _is_build_trigger(text: str) -> bool:
     return any(pattern.search(text) for pattern in _BUILD_TRIGGER_PATTERNS)
 
 
-def _extract_reasoning_and_answer(text: str) -> tuple[str, str]:
-    """Extract <think>...</think> blocks if present; return (reasoning, answer)."""
+def _extract_reasoning_and_answer(text: str, streaming: bool = False) -> tuple[str, str]:
+    """Extract <think>...</think> blocks if present; return (reasoning, answer).
+
+    With ``streaming=True`` an unclosed trailing <think> (the model is still
+    thinking) counts as reasoning instead of leaking into the answer."""
     if "<think>" not in text:
         return "", text
     reasoning_parts: list[str] = []
@@ -384,6 +451,12 @@ def _extract_reasoning_and_answer(text: str) -> tuple[str, str]:
         if chunk:
             reasoning_parts.append(chunk)
         answer = (answer[:start] + answer[end + len("</think>"):]).strip()
+    if streaming and "<think>" in answer:
+        idx = answer.find("<think>")
+        pending = answer[idx + len("<think>"):].strip()
+        if pending:
+            reasoning_parts.append(pending)
+        answer = answer[:idx].strip()
     return "\n\n".join(reasoning_parts).strip(), answer.strip()
 
 
@@ -534,7 +607,13 @@ class ChatComposer(Static, can_focus=True):
         ("/attach", "attach a file (path or browse)"),
         ("/clear", "drop all attached files"),
         ("/auth", "manage provider API keys"),
-        ("/skill", "save/delete a reusable skill"),
+        ("/skill", "list/show/save/delete reusable skills"),
+        ("/compact", "summarize the conversation to free context"),
+        ("/undo", "revert the file changes of the last turn"),
+        ("/new", "start a fresh conversation"),
+        ("/resume", "list or reload a saved session"),
+        ("/todos", "show the agent's task list"),
+        ("/mcp", "show connected MCP servers and tools"),
         ("/synthesize", "toggle auto skill crystallization"),
         ("/parallel", "run sub-tasks on background workers"),
         ("/tools", "list available agent tools"),
@@ -556,22 +635,12 @@ class ChatComposer(Static, can_focus=True):
         for cmd, desc in self.SLASH_COMMANDS:
             if cmd[1:].startswith(token):
                 self._suggestions.append(f"{cmd} — {desc}")
-        # Saved skills (from the skills/ dir) also autocomplete.
+        # Saved skills (project + global) also autocomplete after "/skill ".
         try:
-            sd = _skills_dir()
-            if sd.is_dir():
-                # Match against the token after "/skill " so "/skill calcu"
-                # suggests the calculator skills.
-                skill_query = ""
-                if self.value.startswith("/skill"):
-                    skill_query = self.value[len("/skill"):].strip()
-                elif self.value == "/skill":
-                    skill_query = ""
-                else:
-                    skill_query = self.value[1:].split()[0] if len(self.value) > 1 else ""
-                for f in sorted(sd.glob("*.md")):
-                    name = f.stem
-                    if name.lower().startswith(skill_query.lower()):
+            if self.value.startswith("/skill "):
+                query = self.value[len("/skill "):].strip().lower()
+                for name, _desc in SkillLibrary.for_workspace(WORKSPACE).index():
+                    if name.lower().startswith(query):
                         self._suggestions.append(f"/skill {name}")
         except Exception:
             pass
@@ -761,7 +830,10 @@ class ChatComposer(Static, can_focus=True):
             return
         if (event.key == "enter" or event.key == "ctrl+s"):
             event.prevent_default()
-            if self._suggestion_active():
+            # Enter completes a partially typed command, but a command that is
+            # already fully typed (e.g. "/help") must submit - otherwise it would
+            # re-apply the same suggestion forever and never run.
+            if self._suggestion_active() and self.value.strip() != self._current_suggestion().split("—")[0].strip():
                 self._apply_suggestion()
                 return
             expanded = self._expand_pasted_placeholders(self.value)
@@ -1045,10 +1117,37 @@ class ContextPanel(Vertical):
         else:
             container.mount(Static(text, id="current_steps_block", classes="context_turn"), before=0)
 
+    def update_todos(self, todos: list) -> None:
+        """Show the model's todo_write checklist (kept at the top of the panel)."""
+        try:
+            container = self.query_one("#context_body", VerticalScroll)
+        except Exception:
+            return
+        try:
+            existing = self.query_one("#todos_block", Static)
+        except Exception:
+            existing = None
+        if not todos:
+            if existing is not None:
+                existing.remove()
+            return
+        marks = {"completed": "[green]✓[/]", "in_progress": "[yellow]▶[/]", "pending": "[dim]○[/]"}
+        lines = [
+            f"{marks.get(t.get('status'), '○')} {str(t.get('content', '')).replace('[', chr(92) + '[')[:60]}"
+            for t in todos[:12]
+        ]
+        text = "[bold]Todo[/]\n" + "\n".join(lines)
+        if existing is not None:
+            existing.update(text)
+        else:
+            container.mount(Static(text, id="todos_block", classes="context_turn"), before=0)
+
     def refresh_context(self) -> None:
         container = self.query_one("#context_body", VerticalScroll)
         for child in list(container.children):
             child.remove()
+        if getattr(self.state, "todos", None):
+            self.update_todos(self.state.todos)
 
         summary = self.state.context_summary()
         container.mount(Static(f"[dim]session · {summary}[/]", classes="context_turn"))
@@ -1917,14 +2016,20 @@ class PermissionScreen(Screen):
         Binding("escape", "deny", "Deny", priority=True),
     ]
 
-    def __init__(self, path: str, **kwargs) -> None:
+    def __init__(self, path: str, title: str = "⚠ Out-of-workspace access requested", detail: str = "", **kwargs) -> None:
         super().__init__(**kwargs)
         self.path = path
+        self.title_text = title
+        self.detail = detail
 
     def compose(self) -> ComposeResult:
         with Container(id="permission_box"):
-            yield Label("⚠ Out-of-workspace access requested", id="permission_title")
-            yield Static(f"[dim]{self.path}[/]", id="permission_path")
+            yield Label(self.title_text, id="permission_title")
+            safe = self.path.replace("[", "\\[")
+            body = f"[dim]{safe}[/]"
+            if self.detail:
+                body += f"\n[dim italic]{self.detail.replace('[', chr(92) + '[')}[/]"
+            yield Static(body, id="permission_path")
             yield ListView(id="permission_list")
             yield Label("Enter to choose · Esc to deny", id="permission_hint")
 
@@ -1942,6 +2047,60 @@ class PermissionScreen(Screen):
 
     def action_deny(self) -> None:
         self.dismiss("deny")
+
+
+class AskUserScreen(Screen):
+    """Modal for the model's ``ask_user`` tool: pick a suggested answer or type
+    one. Dismisses with the answer string (None if cancelled)."""
+
+    CSS = """
+    AskUserScreen { align: center middle; }
+    #ask_box { width: 80; max-height: 80%; border: round $primary; background: $surface; padding: 1 2; }
+    #ask_title { color: $primary; text-style: bold; margin-bottom: 1; }
+    #ask_question { color: $text; margin-bottom: 1; }
+    #ask_list { height: auto; max-height: 10; border: blank; padding: 0 1; }
+    #ask_input { margin-top: 1; border: solid $border; }
+    #ask_hint { color: $text-muted; text-align: center; margin-top: 1; }
+    """
+
+    BINDINGS = [Binding("escape", "cancel", "Skip", priority=True)]
+
+    def __init__(self, question: str, options: list[str], **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.question = question
+        self.options = options
+
+    def compose(self) -> ComposeResult:
+        with Container(id="ask_box"):
+            yield Label("❓ The agent has a question", id="ask_title")
+            yield Static(self.question.replace("[", "\\["), id="ask_question")
+            if self.options:
+                yield ListView(id="ask_list")
+            yield Input(placeholder="Type an answer and press Enter…", id="ask_input")
+            yield Label("Enter to answer · Esc to skip", id="ask_hint")
+
+    def on_mount(self) -> None:
+        if self.options:
+            lv = self.query_one("#ask_list", ListView)
+            for opt in self.options:
+                item = ListItem(Label(opt))
+                item.answer = opt  # type: ignore[attr-defined]
+                lv.append(item)
+            lv.index = 0
+            lv.focus()
+        else:
+            self.query_one("#ask_input", Input).focus()
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        self.dismiss(getattr(event.item, "answer", None))
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        value = event.value.strip()
+        if value:
+            self.dismiss(value)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
 
 
 class TrackingOption(ListItem):
@@ -2482,6 +2641,12 @@ class ChatPane(Vertical):
         # mounted for each queued prompt, so it can be removed once that
         # prompt is dequeued and starts running (or discarded on cancel).
         self._queued_notices: list[SystemMessage] = []
+        # Trace lines are buffered; widgets are only mounted while the panel is
+        # visible (mounting one widget per event was a measurable UI cost).
+        self._trace_lines: list[str] = []
+        self._trace_count = 0
+        # Live view of the running turn, read by the status-line timer.
+        self._turn: dict = {}
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="chat_body"):
@@ -2534,6 +2699,8 @@ class ChatPane(Vertical):
         panel.styles.display = "block" if visible else "none"
         chip = self.query_one("#trace_summary_chip", Label)
         chip.styles.display = "none" if visible else "block"
+        if visible:
+            self._rebuild_trace_panel()
         self._refresh_trace_chip()
         self.notify("Trace panel shown" if visible else "Trace panel hidden")
         # Preserve composer focus: expanding the trace panel must never steal focus
@@ -2545,11 +2712,10 @@ class ChatPane(Vertical):
 
     def _refresh_trace_chip(self) -> None:
         try:
-            trace_log = self.query_one("#trace_log", VerticalScroll)
             chip = self.query_one("#trace_summary_chip", Label)
         except Exception:
             return
-        count = len(trace_log.children)
+        count = self._trace_count
         last_stage = self._last_trace_stage
         chip.update(f" trace · {count} events · {last_stage} " if last_stage else f" trace · {count} events ")
 
@@ -2781,8 +2947,17 @@ class ChatPane(Vertical):
         composer = self.query_one("#chat_input", ChatComposer)
         composer.styles.border_left = ("solid", hex_color)
 
+    @staticmethod
+    def _fmt_tokens(n: int) -> str:
+        return f"{n / 1000:.1f}k" if n >= 1000 else str(n)
+
     def _refresh_status(self) -> None:
-        """Update the status row below the composer (spinner + token/cost)."""
+        """Update the status row below the composer.
+
+        While a turn runs this is a live readout - phase, elapsed time, step,
+        time-to-first-token, the latest command output line - so waiting on the
+        model is never silent. Idle, it shows the last turn's timing and totals.
+        """
         try:
             status_text = self.query_one("#chat_status_text", Label)
             spinner = self.query_one("#chat_status_spinner", LoadingIndicator)
@@ -2795,24 +2970,39 @@ class ChatPane(Vertical):
         turns = s.get("turns", 0)
         cost = s.get("estimated_cost_usd", 0.0)
         if isinstance(cost, (int, float)) and cost > 0:
-            cost_color = "$warning"
-            cost_part = f"  [dim]·[/]  [{cost_color}]${cost:.4f}[/]"
+            cost_part = f"  [dim]·[/]  [$warning]${cost:.4f}[/]"
         else:
             cost_part = ""
         if self.state.busy:
             spinner.set_class(True, "busy")
-            status_text.update(
-                f"[dim]Working…[/]  "
-                f"[dim]turns[/] {turns}  [dim]·[/]  "
-                f"[dim]last[/] {last_total} tok  [dim]·[/]  "
-                f"[dim]session[/] {session_total} tok{cost_part}"
-            )
+            t = self._turn or {}
+            elapsed = time.monotonic() - t.get("started", time.monotonic())
+            bits = [f"[bold]{t.get('phase', 'working')}[/] {elapsed:.1f}s"]
+            if t.get("step"):
+                bits.append(f"step {t['step']}")
+            if t.get("ttft") is not None:
+                bits.append(f"first token {t['ttft']:.1f}s")
+            if t.get("tokens"):
+                bits.append(f"{self._fmt_tokens(t['tokens'])} tok")
+            if self.state.message_queue:
+                bits.append(f"{len(self.state.message_queue)} queued")
+            out = (t.get("out") or "").replace("[", "\\[").replace("]", "\\]")
+            if out:
+                bits.append(f"[dim]{out[:70]}[/]")
+            status_text.update("  [dim]·[/]  ".join(bits) + "   [dim]Esc cancels[/]")
         else:
             spinner.set_class(False, "busy")
+            timing = ""
+            if m.get("elapsed_s") is not None:
+                timing = f"[dim]last turn[/] {m['elapsed_s']:.1f}s"
+                if m.get("ttft_s") is not None:
+                    timing += f" [dim](first token {m['ttft_s']:.1f}s)[/]"
+                timing += "  [dim]·[/]  "
             status_text.update(
+                f"{timing}"
                 f"[dim]turns[/] {turns}  [dim]·[/]  "
-                f"[dim]last[/] {last_total} tok  [dim]·[/]  "
-                f"[dim]session[/] {session_total} tok{cost_part}"
+                f"[dim]last[/] {self._fmt_tokens(last_total)} tok  [dim]·[/]  "
+                f"[dim]session[/] {self._fmt_tokens(session_total)} tok{cost_part}"
             )
 
     async def on_composer_submitted(self, event: ComposerSubmitted) -> None:
@@ -2845,6 +3035,10 @@ class ChatPane(Vertical):
             return
         if text.startswith("/tools") or text.strip() == "/help":
             await self._handle_tools_command()
+            return
+        if text.split()[0] in ("/compact", "/undo", "/new", "/resume", "/todos", "/mcp"):
+            await self._handle_session_command(text, log)
+            log.scroll_end(animate=False)
             return
         if text.startswith("/attach") or text.startswith("/clear"):
             if text.startswith("/attach") and ("/attach" == text.strip()):
@@ -2890,60 +3084,87 @@ class ChatPane(Vertical):
         live_response = AgentMessage("")
         log.mount(live_response)
         log.scroll_end(animate=False)
-        prompt_for_agent = self._attach_context(text)
-        self._run_agent(prompt_for_agent, live_response)
+        prompt_for_agent, images, display_prompt = self._consume_attachments(text)
+        self._run_agent(prompt_for_agent, live_response, display_prompt, images)
 
-    def _attach_context(self, text: str) -> str:
-        """Prepend any attached file contents to the prompt handed to the agent."""
-        if not self.state.attachments:
-            return text
-        blocks = []
-        for att in self.state.attachments:
+    MAX_ATTACHED_TEXT_CHARS = 60_000
+
+    def _consume_attachments(self, text: str) -> tuple[str, list[dict], str]:
+        """Turn pending attachments into (prompt, images, display_prompt) for
+        ONE turn, then clear them.
+
+        Attachments used to be re-sent with every later message (including
+        hundreds of KB of base64), inflating every request for the rest of the
+        session. Now they go with the message they were attached to; the
+        conversation history keeps only a short note about them.
+        """
+        atts, self.state.attachments = self.state.attachments, []
+        if not atts:
+            return text, [], text
+        blocks: list[str] = []
+        images: list[dict] = []
+        names: list[str] = []
+        budget = self.MAX_ATTACHED_TEXT_CHARS
+        for att in atts:
             path = att.get("path", "")
             name = Path(path).name if path else "?"
+            names.append(name)
             if att.get("type") == "text" and att.get("content"):
-                blocks.append(f"[Attached file: {path}]\n{att['content']}")
+                content = att["content"][:budget]
+                budget = max(0, budget - len(content))
+                note = " (truncated)" if len(att["content"]) > len(content) else ""
+                blocks.append(f"[Attached file: {path}{note}]\n{content}")
             elif att.get("type") == "image":
-                blocks.append(
-                    f"[Attached image: {name}]\n"
-                    f"Absolute path: {path}\n"
-                    f"Use the `read_image` tool with this exact path to inspect it, or use the "
-                    f"data_url below if you can process base64 images.\n"
-                    f"data_url={att.get('data_url','')}"
-                )
+                blocks.append(f"[Attached image: {name}] (absolute path: {path})")
+                if att.get("data"):
+                    images.append({"name": name, "mime": att.get("mime", "image/png"), "data": att["data"]})
             else:
                 blocks.append(f"[Attached file: {name}] ({path}) ({att.get('summary','')})")
         header = "<attachments>\n" + "\n\n".join(blocks) + "\n</attachments>\n\n"
-        return header + text
+        return header + text, images, f"{text}\n[attached: {', '.join(names)}]"
+
+    def _attach_context(self, text: str) -> str:
+        """Prompt text with attachments included (kept for callers/tests)."""
+        return self._consume_attachments(text)[0]
+
+    _TRACE_LABELS = {
+        "memory_recall_start": "🧠 memory.recall.start",
+        "memory_recall_done": "🧠 memory.recall.done",
+        "memory_recall_timeout": "🧠 memory.recall.timeout",
+        "model_start": "🤖 model.start",
+        "model_step": "⏱ model.step",
+        "model_done": "🤖 model.done",
+        "turn_start": "▶ turn.start",
+        "turn_done": "🏁 turn.done",
+        "finalize": "✅ finalize",
+        "skill_synthesis_start": "🎓 skill.synthesis.start",
+        "skill_synthesis_done": "🎓 skill.synthesis.done",
+        "skill_synthesis_error": "🎓 skill.synthesis.error",
+        "session_start": "⚡ session.start",
+        "interaction_start": "▶ interaction.start",
+        "interaction_error": "❌ interaction.error",
+        "interaction_cancelled": "⏹ interaction.cancelled",
+        "tool_start": "🔧 about to run",
+        "tool_done": "✅ finished",
+        "tool_error": "❌ failed",
+        "tool_progress": "📶 tool.progress",
+        "provider_error": "⛔ provider.error",
+        "usage": "🧮 usage",
+        "step_cap_hit": "⚠️ step_cap.hit",
+        "loop_warning": "⚠️ loop.warning",
+        "permission_request": "🔐 permission",
+        "context_compacted": "🗜 context.compacted",
+        "native_tools_disabled": "🔁 native_tools.disabled",
+        "todo_update": "☑ todo.update",
+    }
+    TRACE_BUFFER_MAX = 400
+    TRACE_WIDGET_MAX = 250
 
     def _append_trace(self, event_type: str, detail: str = "", **extra) -> None:
-        trace_log = self.query_one("#trace_log", VerticalScroll)
+        if event_type == "stream_chunk":  # one per token: pure noise
+            return
         ts = datetime.now().strftime("%H:%M:%S")
-        label_map = {
-            "memory_recall_start": "🧠 memory.recall.start",
-            "memory_recall_done": "🧠 memory.recall.done",
-            "model_start": "🤖 model.start",
-            "stream_chunk": "🌊 stream.chunk",
-            "model_done": "🤖 model.done",
-            "finalize": "✅ finalize",
-            "skill_synthesis_start": "🎓 skill.synthesis.start",
-            "skill_synthesis_done": "🎓 skill.synthesis.done",
-            "skill_synthesis_error": "🎓 skill.synthesis.error",
-            "session_start": "⚡ session.start",
-            "interaction_start": "▶ interaction.start",
-            "interaction_error": "❌ interaction.error",
-            "interaction_cancelled": "⏹ interaction.cancelled",
-            "tool_start": "🔧 about to run",
-            "tool_done": "✅ finished",
-            "tool_error": "❌ failed",
-            "tool_progress": "📶 tool.progress",
-            "provider_error": "⛔ provider.error",
-            "usage": "🧮 usage",
-            "step_cap_hit": "⚠️ step_cap.hit",
-            "loop_warning": "⚠️ loop.warning",
-            "permission_request": "🔐 permission",
-        }
-        label = label_map.get(event_type, event_type)
+        label = self._TRACE_LABELS.get(event_type, event_type)
         safe_detail = (detail or "").replace("[", "\\[").replace("]", "\\]")
         line = f"[dim]{ts}[/] {label}"
         if safe_detail:
@@ -2960,15 +3181,48 @@ class ChatPane(Vertical):
             if context_parts:
                 line += " [dim]" + " ".join(context_parts) + "[/]"
         self._last_trace_stage = f"{label}"
-        trace_log.mount(SystemMessage(line))
-        trace_log.scroll_end(animate=False)
-        self.query_one("#trace_header", Label).update(
-            f"Interaction Trace ({len(trace_log.children)})"
-        )
+        self._trace_count += 1
+        self._trace_lines.append(line)
+        if len(self._trace_lines) > self.TRACE_BUFFER_MAX:
+            del self._trace_lines[: -self.TRACE_BUFFER_MAX]
+        if self.state.show_trace_panel:
+            self._mount_trace_line(line)
+        else:
+            self._refresh_trace_chip()
+
+    def _mount_trace_line(self, line: str) -> None:
+        try:
+            trace_log = self.query_one("#trace_log", VerticalScroll)
+            trace_log.mount(SystemMessage(line))
+            children = list(trace_log.children)
+            for old in children[: -self.TRACE_WIDGET_MAX]:
+                old.remove()
+            trace_log.scroll_end(animate=False)
+            self.query_one("#trace_header", Label).update(f"Interaction Trace ({self._trace_count})")
+        except Exception:
+            pass
         self._refresh_trace_chip()
 
+    def _rebuild_trace_panel(self) -> None:
+        try:
+            trace_log = self.query_one("#trace_log", VerticalScroll)
+            for child in list(trace_log.children):
+                child.remove()
+            for line in self._trace_lines[-self.TRACE_WIDGET_MAX:]:
+                trace_log.mount(SystemMessage(line))
+            trace_log.scroll_end(animate=False)
+            self.query_one("#trace_header", Label).update(f"Interaction Trace ({self._trace_count})")
+        except Exception:
+            pass
+
     @work(exclusive=True, name="agent_chat")
-    async def _run_agent(self, prompt: str, live_response: AgentMessage) -> None:
+    async def _run_agent(
+        self,
+        prompt: str,
+        live_response: AgentMessage,
+        display_prompt: Optional[str] = None,
+        images: Optional[list] = None,
+    ) -> None:
         """Run one turn, then drain any prompts queued while it was busy.
 
         Looping here (rather than re-invoking this @work(exclusive=True)
@@ -2980,7 +3234,8 @@ class ChatPane(Vertical):
         self._refresh_status()
         try:
             while True:
-                cancelled = await self._run_agent_turn(prompt, live_response, log)
+                cancelled = await self._run_agent_turn(prompt, live_response, log, display_prompt, images)
+                display_prompt, images = None, None
                 if cancelled:
                     if self.state.message_queue:
                         dropped = len(self.state.message_queue)
@@ -3005,24 +3260,65 @@ class ChatPane(Vertical):
             self._refresh_status()
             log.scroll_end(animate=False)
 
+    async def _maybe_auto_compact(self, log: VerticalScroll) -> None:
+        """Summarize older turns when the history nears the model's window,
+        instead of letting every request grow until the provider rejects it."""
+        if not self.state.needs_compaction():
+            return
+        log.mount(SystemMessage(
+            f"🗜 Context is filling up (~{self._fmt_tokens(self.state.history_tokens())} tok of "
+            f"{self._fmt_tokens(self.state.context_window)}) — summarizing earlier turns…"
+        ))
+        try:
+            summary = await self.state.compact_with_model()
+        except Exception as e:
+            log.mount(SystemMessage(f"⚠ Auto-compact failed ({e}); continuing without it."))
+            return
+        if summary:
+            log.mount(SystemMessage("✓ Conversation compacted into a summary."))
+            self._refresh_context_panel_safe()
+
+    def _refresh_context_panel_safe(self) -> None:
+        try:
+            main_screen = self.screen
+            if isinstance(main_screen, MainScreen):
+                main_screen.refresh_context_panel()
+        except Exception:
+            pass
+
     async def _run_agent_turn(
-        self, prompt: str, live_response: AgentMessage, log: VerticalScroll
+        self,
+        prompt: str,
+        live_response: AgentMessage,
+        log: VerticalScroll,
+        display_prompt: Optional[str] = None,
+        images: Optional[list] = None,
     ) -> bool:
         """Run a single agent turn. Returns True if it was cancelled."""
-        chunks: list[str] = []
         header_ts = datetime.now().strftime("%H:%M:%S")
+        st = self._turn = {
+            "started": time.monotonic(), "phase": "thinking", "step": 0, "tool": "",
+            "out": "", "ttft": None, "tokens": 0,
+        }
+        # Live output buffers. `committed` is final-answer text delivered as a
+        # plain chunk (legacy providers); `step_buf` is the current model
+        # step's streamed text, discarded from the answer if tool calls follow.
+        committed: list[str] = []
+        step_buf = ""
+        think_buf = ""
+        think_t0: Optional[float] = None
+        think_last = 0.0
+        dirty = False
         reasoning_widget: Optional[ReasoningMessage] = None
         thinking_widget: Optional[ThinkingMessage] = None
         thinking_steps: list[str] = []
         steps_widget: Optional[StepsMessage] = None
         step_lines: list[str] = []
-        current_raw = ""
         # Real provider-reported usage accumulated across every request made
-        # during this turn (each tool-loop step + the final completion), so
-        # "44 requests" reconciles with the displayed token count instead of
-        # showing a char-based estimate of only the final prompt/answer.
+        # during this turn (each tool-loop step + the final completion).
         turn_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         has_real_usage = False
+        summary_info: dict = {}
         if not self.state.seen_first_turn_hint:
             self.state.seen_first_turn_hint = True
             self.notify(
@@ -3033,34 +3329,94 @@ class ChatPane(Vertical):
             )
         self._append_trace("interaction_start", prompt[:120])
 
-        async def on_stream_chunk(chunk: str) -> None:
+        def render_live(answer: str):
+            # Re-parsing a long Markdown document on every token is quadratic;
+            # past a few KB show plain text until the final render.
+            if len(answer) > 5000:
+                return Text(answer)
+            return self._render_agent_markdown(header_ts, answer or "")
+
+        def show_thinking_step(text: str) -> None:
+            nonlocal thinking_widget
+            text = text.strip()
+            if not text:
+                return
+            thinking_steps.append(text)
+            if self.state.show_thinking:
+                if thinking_widget is None:
+                    thinking_widget = ThinkingMessage("")
+                    log.mount(thinking_widget, before=live_response)
+                preview = "\n\n".join(f"› {s}" for s in thinking_steps[-6:])
+                thinking_widget.update(Text(preview[:3000], style="dim italic"))
+
+        def flush() -> None:
+            nonlocal dirty, reasoning_widget
+            dirty = False
+            raw = "".join(committed) + step_buf
+            inline_reasoning, answer = _extract_reasoning_and_answer(raw, streaming=True)
+            reasoning = think_buf
+            if inline_reasoning:
+                reasoning = f"{think_buf}\n\n{inline_reasoning}" if think_buf else inline_reasoning
+            if reasoning:
+                if reasoning_widget is None:
+                    reasoning_widget = ReasoningMessage("")
+                    log.mount(reasoning_widget, before=live_response)
+                reasoning_widget.update(Text(reasoning[-1500:], style="dim italic"))
+            live_response.update(render_live(answer))
+            log.scroll_end(animate=False)
+
+        async def renderer() -> None:
+            # Coalesce token-rate updates into ~12 renders/second.
+            try:
+                while True:
+                    await asyncio.sleep(0.08)
+                    if dirty:
+                        flush()
+            except asyncio.CancelledError:
+                pass
+
+        def on_stream_chunk(chunk: str) -> None:
+            nonlocal step_buf, think_buf, dirty, think_t0, think_last, steps_widget
             if not chunk:
                 return
-
-            # Internal progress markers come from the tool loop (e.g. "_step_",
-            # "_tool_"). "_tool_" (concrete tool operations like "wrote x.py")
-            # is always shown inline so long tasks show live progress instead
-            # of a blank chat. "_step_" (the model's free-form intermediate
-            # text) stays opt-in (F7 / "Toggle agent thinking") since it can
-            # be noisy/repetitive.
+            if chunk.startswith("_delta_ "):
+                step_buf += chunk[8:]
+                st["phase"] = "answering"
+                dirty = True
+                return
+            if chunk.startswith("_endstep_"):
+                show_thinking_step(step_buf)
+                step_buf = ""
+                st["phase"] = "running tools"
+                dirty = True
+                return
+            if chunk.startswith("_think_ "):
+                think_buf += chunk[8:]
+                now = time.monotonic()
+                if think_t0 is None:
+                    think_t0 = now
+                think_last = now
+                st["phase"] = "thinking"
+                dirty = True
+                return
+            if chunk.startswith("_out_ "):
+                st["out"] = chunk[6:]
+                return
+            # Internal progress markers from the tool loop. "_tool_" (concrete
+            # operations like "wrote x.py") is always shown inline so long tasks
+            # show live progress; "_step_" (legacy providers' free-form step
+            # text) stays opt-in (F7).
             if chunk.startswith("_step_ "):
-                nonlocal thinking_widget
                 step_text = chunk[len("_step_ "):].strip()
                 self._append_trace("tool_progress", step_text[:220])
-                if self.state.show_thinking and step_text:
-                    thinking_steps.append(step_text)
-                    if thinking_widget is None:
-                        thinking_widget = ThinkingMessage("")
-                        log.mount(thinking_widget, before=live_response)
-                    preview = "\n\n".join(f"› {s}" for s in thinking_steps[-6:])
-                    thinking_widget.update(Text(preview[:3000], style="dim italic"))
+                show_thinking_step(step_text)
+                if self.state.show_thinking:
                     log.scroll_end(animate=False)
                 return
             if chunk.startswith("_tool_ "):
-                nonlocal steps_widget
                 tool_text = chunk[len("_tool_ "):].strip()
                 self._append_trace("tool_progress", tool_text[:220])
-                self._refresh_status()
+                st["out"] = ""
                 if tool_text:
                     step_lines.append(tool_text)
                     if steps_widget is None:
@@ -3076,18 +3432,11 @@ class ChatPane(Vertical):
                     except Exception:
                         pass
                 return
+            committed.append(chunk)
+            dirty = True
 
-            nonlocal reasoning_widget, current_raw
-            chunks.append(chunk)
-            current_raw = "".join(chunks)
-            reasoning, answer = _extract_reasoning_and_answer(current_raw)
-            if reasoning:
-                if reasoning_widget is None:
-                    reasoning_widget = ReasoningMessage("")
-                    log.mount(reasoning_widget, before=live_response)
-                reasoning_widget.update(Text(reasoning[:2500], style="dim italic"))
-            live_response.update(self._render_agent_markdown(header_ts, answer or ""))
-        async def on_trace_event(*args) -> None:
+        def on_trace_event(*args) -> None:
+            nonlocal has_real_usage
             event_type = "trace"
             payload: Dict[str, Any] = {}
             if len(args) == 2:
@@ -3098,8 +3447,7 @@ class ChatPane(Vertical):
                 event_type = str(payload.get("stage") or payload.get("event") or "trace")
 
             def _tool_detail(prefix: str, tool: str, path: str, error: str = "") -> str:
-                subject = tool if tool else "tool"
-                detail = f"{subject} {prefix}"
+                detail = f"{tool or 'tool'} {prefix}"
                 if path:
                     detail += f" on `{path}`"
                 if error:
@@ -3107,61 +3455,108 @@ class ChatPane(Vertical):
                 return detail
 
             detail = ""
-            if isinstance(payload, dict) and event_type == "usage":
-                nonlocal has_real_usage
+            if event_type == "usage":
                 has_real_usage = True
                 turn_usage["prompt_tokens"] += int(payload.get("prompt_tokens") or 0)
                 turn_usage["completion_tokens"] += int(payload.get("completion_tokens") or 0)
                 turn_usage["total_tokens"] += int(payload.get("total_tokens") or 0)
-                detail = (
-                    f"+{payload.get('prompt_tokens', 0)} prompt / "
-                    f"+{payload.get('completion_tokens', 0)} completion"
+                st["tokens"] = turn_usage["total_tokens"]
+                self._append_trace(
+                    event_type,
+                    f"+{payload.get('prompt_tokens', 0)} prompt / +{payload.get('completion_tokens', 0)} completion",
                 )
-                self._append_trace(event_type, detail[:220])
                 return
-            if isinstance(payload, dict):
-                # Tool events: build a short, human-readable sentence.
-                if event_type in {"tool_start", "tool_done", "tool_error"}:
-                    tool = payload.get("tool", "")
-                    path = payload.get("path", "")
-                    error = payload.get("error", "")
-                    if event_type == "tool_start":
-                        detail = _tool_detail("about to run", tool, path)
-                    elif event_type == "tool_done":
-                        detail = _tool_detail("finished", tool, path)
-                    elif event_type == "tool_error":
-                        detail = _tool_detail("failed", tool, path, error)
-                elif event_type == "tool_progress":
-                    detail = payload.get("message", "")
+            if event_type == "model_step":
+                st["step"] = payload.get("step", st["step"])
+                if st["ttft"] is None and payload.get("ttft_ms") is not None:
+                    st["ttft"] = payload["ttft_ms"] / 1000
+                ttft = payload.get("ttft_ms")
+                detail = f"step {payload.get('step')}: {payload.get('duration_ms', 0) / 1000:.1f}s" + (
+                    f" (first token {ttft / 1000:.1f}s)" if ttft is not None else ""
+                )
+            elif event_type == "turn_done":
+                summary_info.update(payload)
+                detail = payload.get("message", "")
+            elif event_type in {"tool_start", "tool_done", "tool_error"}:
+                tool = payload.get("tool", "")
+                path = payload.get("path", "")
+                error = payload.get("error", "")
+                if event_type == "tool_start":
+                    st["phase"] = f"running {tool}"
+                    detail = _tool_detail("about to run", tool, path)
+                elif event_type == "tool_done":
+                    st["phase"] = "thinking"
+                    detail = _tool_detail("finished", tool, path)
                 else:
-                    detail = payload.get("message", "")
-                    if not detail:
-                        parts: list[str] = []
-                        for key in ("query", "target", "provider", "model", "task_id", "status"):
-                            value = payload.get(key)
-                            if value is not None and value != "":
-                                parts.append(f"{key}={value}")
-                                if len(parts) >= 2:
-                                    break
-                        detail = ", ".join(parts)
+                    st["phase"] = "thinking"
+                    detail = _tool_detail("failed", tool, path, error)
+            elif event_type == "tool_progress":
+                detail = payload.get("message", "")
+            else:
+                detail = payload.get("message", "")
+                if not detail:
+                    parts: list[str] = []
+                    for key in ("query", "target", "provider", "model", "task_id", "status"):
+                        value = payload.get(key)
+                        if value is not None and value != "":
+                            parts.append(f"{key}={value}")
+                            if len(parts) >= 2:
+                                break
+                    detail = ", ".join(parts)
             self._append_trace(event_type, detail[:220])
 
         async def on_permission_request(path: str) -> str:
             """Modal approval for a tool call that would touch a path outside
-            the workspace root, instead of a hard failure (FR in the issue
-            report). Returns "once", "session", or "deny".
-            """
+            the workspace root. Returns "once", "session", or "deny"."""
+            st["phase"] = "waiting for you"
             try:
                 choice = await self.app.push_screen_wait(PermissionScreen(str(path)))
             except Exception:
                 choice = "deny"
+            st["phase"] = "thinking"
             return choice if choice in ("once", "session") else "deny"
 
+        async def on_approval(kind: str, subject: str, reason: str) -> str:
+            """Modal approval for a risky shell command or a fetch to a
+            private-network address."""
+            title = {
+                "command": "⚠ The agent wants to run a risky command",
+                "network": "⚠ The agent wants to reach a private network address",
+            }.get(kind, "⚠ Approval needed")
+            st["phase"] = "waiting for you"
+            try:
+                choice = await self.app.push_screen_wait(PermissionScreen(subject, title=title, detail=reason))
+            except Exception:
+                choice = "deny"
+            st["phase"] = "thinking"
+            return choice if choice in ("once", "session") else "deny"
+
+        async def on_ask_user(question: str, options: list) -> Optional[str]:
+            st["phase"] = "waiting for you"
+            try:
+                return await self.app.push_screen_wait(AskUserScreen(question, options))
+            except Exception:
+                return None
+            finally:
+                st["phase"] = "thinking"
+
+        def on_todo(todos: list) -> None:
+            self.state.todos = todos
+            try:
+                main_screen = self.screen
+                if isinstance(main_screen, MainScreen):
+                    main_screen.query_one("#context_panel", ContextPanel).update_todos(todos)
+            except Exception:
+                pass
+
+        renderer_task = asyncio.create_task(renderer())
+        status_timer = self.set_interval(0.25, self._refresh_status)
         try:
+            await self._maybe_auto_compact(log)
             # Reference prior conversation so the model isn't left to guess:
             # the context query pulls related memory AND the last turns keep
-            # the model grounded in what was already said. Cap history at the
-            # most recent 8 turns so a long session cannot drown out the latest
+            # the model grounded in what was already said. Capped at the most
+            # recent 8 turns so a long session cannot drown out the latest
             # user message.
             history: list[dict[str, str]] = []
             turns = (getattr(self.state, "conversation_turns", None) or [])[-8:]
@@ -3181,28 +3576,36 @@ class ChatPane(Vertical):
                 agent_mode=self.state.agent_mode,
                 on_permission_request=on_permission_request,
                 allowed_paths=self.state.allowed_workspace_paths,
+                session=self.state.tool_session,
+                on_ask_user=on_ask_user,
+                on_approval=on_approval,
+                on_todo=on_todo,
+                images=images or None,
             )
-            if not chunks:
-                raw = response or ""
-                reasoning, answer = _extract_reasoning_and_answer(raw)
-                if reasoning:
+            renderer_task.cancel()
+            reasoning, answer = _extract_reasoning_and_answer(response or "")
+            self.state.last_agent_response = answer or ""
+            live_response.update(self._render_agent_markdown(header_ts, answer or ""))
+            elapsed = time.monotonic() - st["started"]
+            # Collapse the reasoning block to a one-line "thought for Ns" (F7
+            # keeps the full text visible) so the answer stays the focus. This
+            # also covers turns that finished before the first render tick.
+            all_reasoning = "\n\n".join(x for x in (think_buf, reasoning) if x).strip()
+            if all_reasoning or reasoning_widget is not None:
+                if reasoning_widget is None:
                     reasoning_widget = ReasoningMessage("")
-                    reasoning_widget.update(Text(reasoning[:2500], style="dim italic"))
                     log.mount(reasoning_widget, before=live_response)
-                live_response.update(self._render_agent_markdown(header_ts, answer or ""))
-                self.state.last_agent_response = answer or ""
-            else:
-                reasoning, answer = _extract_reasoning_and_answer("".join(chunks))
-                self.state.last_agent_response = answer or ""
-                live_response.update(self._render_agent_markdown(header_ts, answer or ""))
+                secs = (think_last - think_t0) if think_t0 is not None else elapsed
+                if self.state.show_thinking:
+                    reasoning_widget.update(Text(all_reasoning[-2500:], style="dim italic"))
+                else:
+                    reasoning_widget.update(Text(
+                        f"▸ thought for {max(secs, 0.1):.1f}s  (F7 shows reasoning)", style="dim italic"
+                    ))
             if has_real_usage:
-                # Real counts from the provider(s), summed across every
-                # request this turn made (tool-loop steps + final answer).
                 est_prompt_tokens = turn_usage["prompt_tokens"]
                 est_output_tokens = turn_usage["completion_tokens"]
             else:
-                # No provider in this turn reported usage - fall back to the
-                # char-based estimate of just the final prompt/answer.
                 est_prompt_tokens = max(1, len(prompt) // 4)
                 est_output_tokens = max(1, len(self.state.last_agent_response or "") // 4)
             provider_type = getattr(self.state.agent.provider.config, "provider_type", "")
@@ -3214,6 +3617,9 @@ class ChatPane(Vertical):
                 "estimated_cost_usd": est_cost_usd,
                 "provider_type": provider_type,
                 "tokens_are_real": has_real_usage,
+                "elapsed_s": elapsed,
+                "ttft_s": st["ttft"],
+                "tool_calls": summary_info.get("tool_calls", 0),
             }
             session = self.state.session_metrics
             session["turns"] += 1
@@ -3222,10 +3628,13 @@ class ChatPane(Vertical):
             session["total_tokens_est"] += est_prompt_tokens + est_output_tokens
             if isinstance(est_cost_usd, (int, float)):
                 session["estimated_cost_usd"] += float(est_cost_usd)
-            self._refresh_status()
             # Record the turn for the context panel + rolling session context.
-            self.state.conversation_turns.append((prompt, self.state.last_agent_response))
-            self.state.update_session_context(prompt, self.state.last_agent_response)
+            recorded = display_prompt or prompt
+            self.state.conversation_turns.append((recorded, self.state.last_agent_response))
+            self.state.update_session_context(recorded, self.state.last_agent_response)
+            self.state.log_interaction(recorded, self.state.last_agent_response)
+            log.scroll_end(animate=False)
+            self._refresh_status()
             main_screen = self.screen
             if isinstance(main_screen, MainScreen):
                 main_screen.refresh_session_footer()
@@ -3246,8 +3655,8 @@ class ChatPane(Vertical):
             provider_id = self.state.current_provider_id or "unknown"
             model_name = self.state.agent.provider.config.name if self.state.agent else "?"
             # Log the full traceback to motion.log (not just the short message
-            # shown in-app) so a "it just stopped"-style report (#8) can be
-            # diagnosed after the fact even without a live repro.
+            # shown in-app) so a "it just stopped" report can be diagnosed
+            # after the fact even without a live repro.
             logger.exception("Agent turn failed (provider=%s, model=%s)", provider_id, model_name)
             log.mount(SystemMessage(f"❌ {error_detail}"))
             self._append_trace(
@@ -3257,43 +3666,175 @@ class ChatPane(Vertical):
                 model=model_name,
                 prompt_preview=prompt[:120],
             )
-            # If the provider timed out or errored, append a helpful inline
-            # hint so the user knows how to recover without restarting.
             if "provider" in error_detail.lower() and "timed out" in error_detail.lower():
                 log.mount(SystemMessage(
                     "💡 Provider timed out. Try again, check your connection, "
                     "or switch providers with /auth or the provider picker."
                 ))
             return False
+        finally:
+            renderer_task.cancel()
+            status_timer.stop()
+            self._turn = {}
 
     async def _handle_tools_command(self) -> None:
         """Show the available tools and commands (opencode-style /tools | /help)."""
         log = self.query_one("#chat_log", VerticalScroll)
         lines = [
-            "Available agent tools (XML <motion_tool> envelopes):",
-            "  list_files · glob_files · read_file · write_file · replace_in_file",
-            "  run_command · run_script · run_python · read_image",
-            "  web_fetch · web_search · memory_save · memory_get · env_var",
+            "Agent tools:",
+            "  files:    list_files · glob_files · grep · read_file · write_file · replace_in_file",
+            "  run:      run_command · run_script · run_python",
+            "  web:      web_fetch · web_search   (results are treated as untrusted)",
+            "  other:    read_image · todo_write · ask_user · use_skill · memory_save/get · MCP tools",
             "",
             "Slash commands:",
-            "  /skill save|delete <name>   persist the last reply as a reusable skill",
+            "  /attach [path]              attach a file to your next message (sent once)",
+            "  /compact                    summarize the conversation to free context",
+            "  /undo                       revert the file changes made in the last turn",
+            "  /new                        start a fresh conversation",
+            "  /resume [id]                list saved sessions / reload one",
+            "  /todos                      show the agent's task list",
+            "  /skill list|show|save|delete   manage reusable skills",
+            "  /mcp                        connected MCP servers and tools",
+            "  /parallel a ; b ; c         run sub-tasks on background workers",
             "  /synthesize on|off          toggle auto-crystallization into skills",
-            "  /parallel <subtask>, ...    run sub-tasks on background workers",
-            "  /tools | /help              show this help",
             "  /auth list|login|logout     manage provider API keys",
             "",
             "Read tools also work in Plan mode; write/run tools need Build (Tab).",
+            "Risky shell commands (rm -r, sudo, git push, …) always ask first.",
         ]
         for line in lines:
             log.mount(SystemMessage(line))
+        log.scroll_end(animate=False)
+
+    async def _handle_session_command(self, text: str, log: VerticalScroll) -> None:
+        parts = text.split(maxsplit=1)
+        cmd = parts[0]
+        arg = parts[1].strip() if len(parts) > 1 else ""
+        busy_only = ("/compact", "/undo", "/new", "/resume")
+        if cmd in busy_only and self.state.busy:
+            log.mount(SystemMessage(f"⛔ {cmd} can't run while the agent is working — press Esc to cancel first."))
+            return
+
+        if cmd == "/compact":
+            if not self.state.conversation_turns:
+                log.mount(SystemMessage("Nothing to compact yet."))
+                return
+            log.mount(SystemMessage(f"🗜 Summarizing {len(self.state.conversation_turns)} turn(s)…"))
+            log.scroll_end(animate=False)
+            self.run_worker(self._do_compact(log), exclusive=False)
+            return
+
+        if cmd == "/undo":
+            lines = self.state.tool_session.checkpoints.undo_last_turn()
+            if not lines:
+                log.mount(SystemMessage("Nothing to undo — no file changes recorded."))
+                return
+            log.mount(SystemMessage("↩ Reverted the last turn's file changes:"))
+            for line in lines:
+                log.mount(SystemMessage(f"  {line}"))
+            return
+
+        if cmd == "/new":
+            self.state.new_session()
+            for child in list(log.children):
+                if getattr(child, "id", None) != "connection_line":
+                    child.remove()
+            log.mount(SystemMessage("✨ New conversation. (Approvals and settings are kept.)"))
+            self._refresh_context_panel_safe()
+            self._refresh_status()
+            return
+
+        if cmd == "/resume":
+            if not self.state.config_manager.get("track_interactions"):
+                log.mount(SystemMessage(
+                    "Session history is off. Enable it from the command palette (Toggle interaction tracking) "
+                    "and future sessions can be resumed."
+                ))
+                return
+            if not arg:
+                sessions = SessionStore.list_sessions(WORKSPACE)
+                if not sessions:
+                    log.mount(SystemMessage("No saved sessions in this workspace yet."))
+                    return
+                log.mount(SystemMessage("Saved sessions (use /resume <id>):"))
+                for sess in sessions:
+                    log.mount(SystemMessage(
+                        f"  {sess['id']}  {sess['modified']}  {sess['turns']} turn(s)  {sess['first_prompt']}"
+                    ))
+                return
+            turns = SessionStore.load(WORKSPACE, arg)
+            if not turns:
+                log.mount(SystemMessage(f"No session named '{arg}'. Use /resume to list them."))
+                return
+            self.state.new_session()
+            for child in list(log.children):
+                if getattr(child, "id", None) != "connection_line":
+                    child.remove()
+            for rec in turns:
+                ts = str(rec.get("timestamp", ""))[11:19]
+                user_msg = UserMessage("")
+                user_msg.update(self._render_user_markdown(ts, rec.get("prompt", "")))
+                log.mount(user_msg)
+                agent_msg = AgentMessage("")
+                agent_msg.update(self._render_agent_markdown(ts, rec.get("response", "")))
+                log.mount(agent_msg)
+                self.state.conversation_turns.append((rec.get("prompt", ""), rec.get("response", "")))
+                self.state.update_session_context(rec.get("prompt", ""), rec.get("response", ""))
+            self.state._session_store = SessionStore(WORKSPACE, Path(arg).stem)
+            log.mount(SystemMessage(f"↻ Resumed {len(turns)} turn(s) from {arg}. New turns append to that session."))
+            self._refresh_context_panel_safe()
+            return
+
+        if cmd == "/todos":
+            todos = self.state.todos
+            if not todos:
+                log.mount(SystemMessage("No todo list yet — the agent creates one for multi-step tasks."))
+                return
+            marks = {"completed": "✓", "in_progress": "▶", "pending": "○"}
+            for t in todos:
+                log.mount(SystemMessage(f"  {marks.get(t.get('status'), '○')} {t.get('content', '')}"))
+            return
+
+        if cmd == "/mcp":
+            mgr = self.state.mcp_manager
+            if mgr is None or not mgr.servers:
+                log.mount(SystemMessage("No MCP servers configured. Add an `mcp: servers:` block to config.yml."))
+                return
+            index = mgr.tool_index()
+            for name in sorted(mgr.servers):
+                tools = [t for srv, t, _ in index if srv == name]
+                if name in mgr.errors:
+                    log.mount(SystemMessage(f"  ✗ {name}: {mgr.errors[name]}"))
+                elif tools:
+                    log.mount(SystemMessage(f"  ✓ {name}: {len(tools)} tool(s) — {', '.join(tools[:8])}{' …' if len(tools) > 8 else ''}"))
+                else:
+                    log.mount(SystemMessage(f"  … {name}: connecting"))
+            return
+
+    async def _do_compact(self, log: VerticalScroll) -> None:
+        try:
+            before = self.state.history_tokens()
+            summary = await self.state.compact_with_model()
+        except Exception as e:
+            log.mount(SystemMessage(f"⚠ Compact failed: {e}"))
+            return
+        if not summary:
+            log.mount(SystemMessage("⚠ The model returned an empty summary; nothing changed."))
+            return
+        log.mount(SystemMessage(
+            f"✓ Compacted: ~{self._fmt_tokens(before)} → ~{self._fmt_tokens(self.state.history_tokens())} tok of history."
+        ))
+        self._refresh_context_panel_safe()
         log.scroll_end(animate=False)
 
     async def _handle_attach_command(self, text: str, log: VerticalScroll) -> None:
         parts = text.split(maxsplit=1)
         cmd = parts[0]
         if cmd == "/clear":
+            count = len(self.state.attachments)
             self.state.attachments.clear()
-            log.mount(SystemMessage(f"🗑 Cleared {len(self.state.attachments)} attached file(s)."))
+            log.mount(SystemMessage(f"🗑 Cleared {count} attached file(s)."))
             return
         if len(parts) < 2 or not parts[1].strip():
             log.mount(SystemMessage("Usage: /attach <path>   (or /clear to drop attachments)"))
@@ -3336,6 +3877,10 @@ class ChatPane(Vertical):
             text_content = self._extract_pdf(path)
         elif suffix in {"png", "jpg", "jpeg", "gif", "webp"}:
             raw = path.read_bytes()
+            if not raw:
+                raise ValueError("image file is empty")
+            if len(raw) > 5 * 1024 * 1024:
+                raise ValueError(f"image is {len(raw) // (1024 * 1024)} MB; most providers accept at most 5 MB")
             b64 = base64.b64encode(raw).decode("ascii")
             mime_t = {
                 "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
@@ -3343,7 +3888,7 @@ class ChatPane(Vertical):
             }.get(suffix, "image/png")
             return {
                 "path": str(path), "type": "image", "mime": mime_t,
-                "data_url": f"data:{mime_t};base64,{b64[:300_000]}",
+                "data": b64,  # complete: a truncated base64 image is corrupt
                 "summary": f"{path.name} (image {len(raw) // 1024}k)",
             }
         else:
@@ -3391,14 +3936,12 @@ class ChatPane(Vertical):
         try:
             import pypdf
         except ImportError:
-            try:
-                import PyPDF2 as pypdf
-            except ImportError:
-                return f"[pdf text extraction requires pypdf; raw file at {path}]"
-        reader = pypdf.PdfFileReader(str(path))
+            return f"[pdf text extraction requires pypdf; raw file at {path}]"
+        # pypdf >= 3 dropped PdfFileReader/getNumPages; use the current API.
+        reader = pypdf.PdfReader(str(path))
         text = []
-        for i in range(reader.getNumPages()):
-            text.append(reader.getPage(i).extract_text())
+        for page in reader.pages:
+            text.append(page.extract_text() or "")
         return "\n".join(t for t in text if t)[:200_000]
 
     async def _handle_synthesize_command(self, text: str, log: VerticalScroll) -> None:
@@ -3436,22 +3979,64 @@ class ChatPane(Vertical):
             return
         log.mount(SystemMessage(f"⚡ Spawning {len(subtasks)} parallel sub-tasks…"))
         log.scroll_end(animate=False)
+
+        def make_reporter():
+            announced = False
+
+            async def report(status) -> None:
+                nonlocal announced
+                if announced or status.status not in ("COMPLETED", "FAILED"):
+                    return
+                announced = True
+                try:
+                    if status.status == "COMPLETED":
+                        snippet = (status.result or "").strip().replace("\n", " ")[:220]
+                        msg = f"✅ task {status.task_id} finished in {status.duration}: {snippet}"
+                    else:
+                        msg = f"❌ task {status.task_id} failed: {status.error}"
+                    if status.artifact_path:
+                        msg += f"\n   full transcript: {status.artifact_path}"
+                    log.mount(SystemMessage(msg))
+                    log.scroll_end(animate=False)
+                except Exception:
+                    pass
+
+            return report
+
         for prompt in subtasks:
             req = TaskRequest(prompt=prompt, model_id=self.state.current_provider_id or None)
-            task_id = await tm.spawn_task(req)
+            task_id = await tm.spawn_task(req, progress_callback=make_reporter())
             log.mount(SystemMessage(f"  › {task_id}: {prompt[:80]}"))
             log.scroll_end(animate=False)
-        log.mount(SystemMessage("Results are saved under tasks/. Parallel status shows here as they complete."))
+        log.mount(SystemMessage(
+            "Background tasks run non-interactively: risky commands are refused. Results appear here as they finish."
+        ))
         log.scroll_end(animate=False)
 
     async def _handle_skill_command(self, text: str, log: VerticalScroll) -> None:
         parts = text.split(maxsplit=2)
         if len(parts) < 2:
-            log.mount(SystemMessage("Usage: /skill save <name>  or  /skill delete <name>"))
+            log.mount(SystemMessage("Usage: /skill list | show <name> | save <name> | delete <name>"))
             return
         action = parts[1].strip().lower()
+        if action == "list":
+            index = SkillLibrary.for_workspace(WORKSPACE).index()
+            if not index:
+                log.mount(SystemMessage("No skills saved yet. Use /skill save <name> after a good reply."))
+            for name, desc in index:
+                log.mount(SystemMessage(f"  {name} — {desc}"))
+            return
+        if action == "show":
+            name = parts[2].strip() if len(parts) > 2 else ""
+            content = SkillLibrary.for_workspace(WORKSPACE).get(name) if name else None
+            if content is None:
+                log.mount(SystemMessage(f"Skill not found: {name or '(no name given)'}"))
+            else:
+                for line in content.splitlines()[:30]:
+                    log.mount(SystemMessage(f"  {line}"))
+            return
         if action not in {"save", "delete"}:
-            log.mount(SystemMessage("Unknown /skill action. Use save or delete."))
+            log.mount(SystemMessage("Unknown /skill action. Use list, show, save or delete."))
             return
         if len(parts) < 3 or not parts[2].strip():
             log.mount(SystemMessage("Provide a skill name, e.g. /skill save refactor_parser"))
@@ -3580,8 +4165,8 @@ class MotionTUI(App):
         self.set_class(self.state.ui_mode == "experimental", "experimental-ui")
 
         if self._model_config:
-            self.state.agent = MotionAgent(self._model_config, mcp_manager=self.state.mcp_manager)
-            self.state.task_manager = TaskManager(self._model_config, self._workspace)
+            self.state.agent = self.state.make_agent(self._model_config)
+            self.state.task_manager = TaskManager(self._model_config, self._workspace, self.state.mcp_manager, self.state.config_manager.data)
             if self._provider_id:
                 self.state.current_provider_id = self._provider_id
             else:
@@ -3591,10 +4176,27 @@ class MotionTUI(App):
         else:
             self.push_screen(ProviderSelectScreen(self.state))
 
+        if self.state.mcp_manager is not None:
+            self.run_worker(self._init_mcp(), exclusive=False)
+
         # One-time tracking consent on first launch: ask before first use so
         # the user gets a clear choice, but never nag again afterwards.
         if self.state.config_manager.get("track_interactions") is None:
             self.call_after_refresh(self._ask_tracking_consent)
+
+    async def _init_mcp(self) -> None:
+        """Connect MCP servers in the background so startup isn't delayed."""
+        mgr = self.state.mcp_manager
+        try:
+            await mgr.initialize_all()
+        except Exception as e:
+            self.notify(f"MCP setup failed: {e}", severity="warning")
+            return
+        tools = len(mgr.tool_index())
+        if tools:
+            self.notify(f"MCP: {tools} tool(s) from {len(mgr.servers) - len(mgr.errors)} server(s)")
+        for name, err in mgr.errors.items():
+            self.notify(f"MCP server '{name}' failed: {err[:120]}", severity="warning", timeout=10)
 
     def _ask_tracking_consent(self) -> None:
         """Show the tracking consent prompt over the current screen."""
@@ -3604,17 +4206,27 @@ class MotionTUI(App):
             pass
 
     def action_request_cancel(self) -> None:
-        """Cancel the running agent chat — not a quit."""
-        try:
-            worker = self.workers.get("agent_chat")
-            if worker:
+        """Cancel the running agent chat — not a quit.
+
+        (This used to call ``self.workers.get(...)``, which does not exist on
+        Textual's WorkerManager; the resulting AttributeError was swallowed, so
+        Esc / Ctrl+C never cancelled anything.)
+        """
+        cancelled = False
+        for worker in list(self.workers):
+            if worker.name == "agent_chat" and not worker.is_finished:
                 worker.cancel()
-                self.notify("Request cancelled")
-        except Exception:
-            pass
+                cancelled = True
+        if cancelled:
+            self.notify("Request cancelled")
 
     async def on_unmount(self) -> None:
-        """Graceful shutdown: close provider and DB connections."""
+        """Graceful shutdown: close provider, MCP and DB connections."""
+        if self.state.mcp_manager is not None:
+            try:
+                await asyncio.wait_for(self.state.mcp_manager.close_all(), timeout=3.0)
+            except Exception:
+                pass
         if self.state.agent:
             try:
                 await asyncio.wait_for(self.state.agent.provider.close(), timeout=2.0)
