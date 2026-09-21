@@ -42,13 +42,15 @@ REPO_DIR = os.path.dirname(os.path.abspath(__file__))
 MAX_TOOL_STEPS = 150
 
 class MotionAgent:
-    def __init__(self, model_config: ModelConfig, memory_path: Optional[str] = None, auto_skill_synthesis: bool = False):
+    def __init__(self, model_config: ModelConfig, memory_path: Optional[str] = None, auto_skill_synthesis: bool = False, mcp_manager: Optional[Any] = None):
         self.provider = ProviderFactory.get_provider(model_config)
         self.memory = MemoryDB(memory_path or os.path.join(REPO_DIR, "motion_memory.db"))
         self.retriever = HybridRetriever(self.memory, self)
         self.caveman = CavemanProtocol(enabled=True)
         self.synthesizer = SkillSynthesizer(model_config, self.memory, embedding_provider=self)
         self.auto_skill_synthesis = auto_skill_synthesis
+        # Optional MCP manager exposing external MCP servers' tools to the agent.
+        self.mcp_manager = mcp_manager
 
     async def get_embedding(self, text: str):
         """Generate embeddings using the provider's embedding endpoint.
@@ -143,6 +145,7 @@ class MotionAgent:
             workspace or os.getcwd(),
             read_only=agent_mode == "plan",
             allowed_paths=allowed_paths,
+            mcp_manager=self.mcp_manager,
         )
         system_prompt = (
             f"You are Motion Agent.\n\n{tools.instructions}\n\n"
@@ -275,8 +278,11 @@ class MotionAgent:
             # Plan mode rejects writes by design. Treat this as a soft policy
             # nudge rather than a tool_error, so the model can recover with a
             # real plan instead of the loop stopping on the first write attempt.
-            if agent_mode == "plan" and name in {"write_file", "replace_in_file"}:
-                result_message = format_tool_result(name, error="write tools are disabled in plan mode")
+            if agent_mode == "plan" and name in {
+                "write_file", "replace_in_file", "run_command", "run_script",
+                "run_python", "env_var",
+            }:
+                result_message = format_tool_result(name, error=f"{name} is disabled in plan mode")
                 tool_history.extend([
                     {"role": "assistant", "content": candidate},
                     {"role": "user", "content": result_message},
@@ -284,11 +290,11 @@ class MotionAgent:
                 tool_history.append({
                     "role": "user",
                     "content": (
-                        "You are in read-only Plan mode - file writes are disabled here. "
-                        "Do not retry write_file/replace_in_file. Respond now with a concrete "
-                        "written plan: proposed files/directories, the approach for each major "
-                        "piece, and any libraries you'd use. The user will review this and switch "
-                        "you to Build mode to implement it."
+                        "You are in read-only Plan mode - mutations/runs are disabled here. "
+                        "Do not retry write_file/replace_in_file/run_command/run_script/run_python. "
+                        "Respond now with a concrete written plan: proposed files/directories, the "
+                        "approach for each major piece, and any libraries you'd use. The user will "
+                        "review this and switch you to Build mode (Tab) to implement/execute it."
                     ),
                 })
                 await emit_trace("tool_done", f"{name} blocked in plan mode", tool=name)
@@ -370,6 +376,13 @@ class MotionAgent:
                         cmd = str(arguments.get("command", "")).strip()
                         exit_code = result.get("exit_code")
                         operation = f"ran `{cmd}` (exit {exit_code})"
+                        stream_text = operation
+                    elif name in ("run_script", "run_python"):
+                        exit_code = result.get("exit_code")
+                        operation = f"ran `{name}` (exit {exit_code})"
+                        stream_text = f"{name} finished (exit {exit_code})"
+                    elif name in ("web_fetch", "web_search"):
+                        operation = f"`{name}` -> {result.get('status', result.get('count', ''))}"
                         stream_text = operation
                     else:
                         operation = f"ran `{name}`"
