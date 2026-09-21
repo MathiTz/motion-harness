@@ -1,12 +1,43 @@
-import os
-import logging
-from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, AsyncIterator
-from dataclasses import dataclass, field
+"""Model providers: one streaming chat interface, native tool calling, retries.
+
+Every provider implements ``chat_stream(messages, system_prompt, tools)`` and
+yields :class:`StreamEvent` objects (text deltas, reasoning deltas, completed
+tool calls, token usage). ``complete()`` / ``stream_complete()`` remain as thin
+convenience wrappers so older callers keep working.
+
+Internal message format (provider-neutral, converted per wire protocol):
+
+    {"role": "user", "content": "text" | [parts]}
+    {"role": "assistant", "content": "text", "tool_calls": [{"id", "name", "arguments"}]}
+    {"role": "tool", "tool_call_id": "...", "name": "...", "content": "text"}
+
+where a content part is ``{"type": "text", "text": ...}`` or
+``{"type": "image", "mime": "image/png", "data": "<base64>"}``.
+"""
+
+from __future__ import annotations
+
+import asyncio
 import json
+import logging
+import os
+import random
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from typing import Any, AsyncIterator, Dict, List, Optional
+from urllib.parse import urlparse
+
 import httpx
 
 logger = logging.getLogger(__name__)
+
+# Idle-read timeout (seconds) between bytes on a streamed response. Reasoning
+# models can sit silent for a while before the first token, so this is much
+# more generous than the connect timeout. Override with options.timeout.
+DEFAULT_READ_TIMEOUT = 120.0
+DEFAULT_CONNECT_TIMEOUT = 10.0
+DEFAULT_MAX_RETRIES = 3
+RETRYABLE_STATUS = {408, 409, 425, 429, 500, 502, 503, 504, 529}
 
 
 @dataclass
@@ -17,6 +48,53 @@ class ModelConfig:
     provider_type: str = "cloud"  # "cloud", "local", "proxy"
     options: Dict[str, Any] = field(default_factory=dict)
 
+
+@dataclass
+class ToolCall:
+    id: str
+    name: str
+    arguments: Dict[str, Any] = field(default_factory=dict)
+    # Set when the provider streamed arguments that were not valid JSON, so the
+    # agent can report the problem to the model instead of running a bad call.
+    parse_error: Optional[str] = None
+
+
+@dataclass
+class StreamEvent:
+    kind: str  # "text" | "reasoning" | "tool_call" | "usage"
+    text: str = ""
+    tool_call: Optional[ToolCall] = None
+    usage: Optional[Dict[str, int]] = None
+
+
+@dataclass
+class ChatResult:
+    text: str = ""
+    reasoning: str = ""
+    tool_calls: List[ToolCall] = field(default_factory=list)
+    usage: Optional[Dict[str, int]] = None
+
+
+class ProviderError(httpx.HTTPError):
+    """An HTTP-level failure from a provider (kept an ``httpx.HTTPError`` so
+    existing ``except httpx.HTTPError`` handlers still catch it)."""
+
+    def __init__(self, message: str, status_code: Optional[int] = None, body: str = "") -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.body = body
+
+
+class NativeToolsUnsupported(ProviderError):
+    """The endpoint/model rejected the native ``tools`` parameter."""
+
+
+class _Retry(Exception):
+    def __init__(self, delay: float) -> None:
+        self.delay = delay
+
+
+# ── usage helpers ───────────────────────────────────────────────────────────
 
 def _openai_usage(data: Dict[str, Any]) -> Optional[Dict[str, int]]:
     """Extract real token usage from an OpenAI-compatible chat response."""
@@ -63,106 +141,509 @@ def _ollama_usage(data: Dict[str, Any]) -> Optional[Dict[str, int]]:
     return {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": prompt + completion}
 
 
+# ── message conversion ──────────────────────────────────────────────────────
+
+def _text_of(content: Any) -> str:
+    """Flatten message content (str or parts) to plain text."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    out = []
+    for part in content:
+        if isinstance(part, dict) and part.get("type") == "text":
+            out.append(part.get("text", ""))
+    return "\n".join(out)
+
+
+def _images_of(content: Any) -> List[Dict[str, str]]:
+    if isinstance(content, list):
+        return [p for p in content if isinstance(p, dict) and p.get("type") == "image"]
+    return []
+
+
+def _to_openai_messages(messages: List[Dict[str, Any]], system_prompt: str) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    if system_prompt:
+        out.append({"role": "system", "content": system_prompt})
+    for m in messages:
+        role = m.get("role")
+        if role == "tool":
+            out.append({
+                "role": "tool",
+                "tool_call_id": m.get("tool_call_id", ""),
+                "content": _text_of(m.get("content")),
+            })
+        elif role == "assistant":
+            msg: Dict[str, Any] = {"role": "assistant", "content": _text_of(m.get("content")) or None}
+            calls = m.get("tool_calls") or []
+            if calls:
+                msg["tool_calls"] = [
+                    {
+                        "id": c["id"],
+                        "type": "function",
+                        "function": {"name": c["name"], "arguments": json.dumps(c.get("arguments") or {})},
+                    }
+                    for c in calls
+                ]
+            elif msg["content"] is None:
+                msg["content"] = ""
+            out.append(msg)
+        else:
+            content = m.get("content")
+            images = _images_of(content)
+            if images:
+                parts: List[Dict[str, Any]] = []
+                text = _text_of(content)
+                if text:
+                    parts.append({"type": "text", "text": text})
+                for img in images:
+                    parts.append({
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{img.get('mime', 'image/png')};base64,{img.get('data', '')}"},
+                    })
+                out.append({"role": "user", "content": parts})
+            else:
+                out.append({"role": "user", "content": _text_of(content)})
+    return out
+
+
+def _to_anthropic_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+
+    def push(role: str, blocks: List[Dict[str, Any]]) -> None:
+        if not blocks:
+            return
+        # The API alternates roles; merge consecutive same-role turns.
+        if out and out[-1]["role"] == role:
+            out[-1]["content"].extend(blocks)
+        else:
+            out.append({"role": role, "content": list(blocks)})
+
+    for m in messages:
+        role = m.get("role")
+        if role == "tool":
+            push("user", [{
+                "type": "tool_result",
+                "tool_use_id": m.get("tool_call_id", ""),
+                "content": _text_of(m.get("content")) or "(empty)",
+            }])
+        elif role == "assistant":
+            blocks: List[Dict[str, Any]] = []
+            text = _text_of(m.get("content"))
+            if text.strip():
+                blocks.append({"type": "text", "text": text})
+            for c in m.get("tool_calls") or []:
+                blocks.append({
+                    "type": "tool_use", "id": c["id"], "name": c["name"], "input": c.get("arguments") or {},
+                })
+            push("assistant", blocks)
+        else:
+            content = m.get("content")
+            blocks = []
+            for img in _images_of(content):
+                blocks.append({
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": img.get("mime", "image/png"), "data": img.get("data", "")},
+                })
+            text = _text_of(content)
+            if text.strip() or not blocks:
+                blocks.append({"type": "text", "text": text or "(empty)"})
+            push("user", blocks)
+    # The API requires the first message to be from the user.
+    if out and out[0]["role"] != "user":
+        out.insert(0, {"role": "user", "content": [{"type": "text", "text": "(conversation continues)"}]})
+    return out
+
+
+def _to_ollama_messages(messages: List[Dict[str, Any]], system_prompt: str) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    if system_prompt:
+        out.append({"role": "system", "content": system_prompt})
+    for m in messages:
+        role = m.get("role")
+        if role == "tool":
+            out.append({"role": "tool", "content": _text_of(m.get("content")), "tool_name": m.get("name", "")})
+        elif role == "assistant":
+            msg: Dict[str, Any] = {"role": "assistant", "content": _text_of(m.get("content"))}
+            calls = m.get("tool_calls") or []
+            if calls:
+                msg["tool_calls"] = [
+                    {"function": {"name": c["name"], "arguments": c.get("arguments") or {}}} for c in calls
+                ]
+            out.append(msg)
+        else:
+            content = m.get("content")
+            msg = {"role": "user", "content": _text_of(content)}
+            images = _images_of(content)
+            if images:
+                msg["images"] = [i.get("data", "") for i in images]
+            out.append(msg)
+    return out
+
+
+def _openai_tools(tools: Optional[List[Dict[str, Any]]]) -> Optional[List[Dict[str, Any]]]:
+    if not tools:
+        return None
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": t["name"],
+                "description": t.get("description", ""),
+                "parameters": t.get("parameters") or {"type": "object", "properties": {}},
+            },
+        }
+        for t in tools
+    ]
+
+
+def _finish_tool_call(call_id: str, name: str, raw_args: str) -> ToolCall:
+    raw = (raw_args or "").strip()
+    if not raw:
+        return ToolCall(id=call_id, name=name, arguments={})
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        return ToolCall(id=call_id, name=name, arguments={}, parse_error=f"invalid JSON arguments: {exc}")
+    if not isinstance(parsed, dict):
+        return ToolCall(id=call_id, name=name, arguments={}, parse_error="arguments must be a JSON object")
+    return ToolCall(id=call_id, name=name, arguments=parsed)
+
+
 class BaseProvider(ABC):
-    """Abstract Base Class for all model providers."""
+    """Abstract base class for all model providers."""
 
     def __init__(self, config: ModelConfig):
         self.config = config
-        # Configurable timeout (seconds) via options.timeout. Default is 30s so
-        # long reasoning/tool loops have enough time; lower it if you want to
-        # fail faster on a stalled provider.
-        timeout_seconds = float(config.options.get("timeout", 30.0))
-        self._client = httpx.AsyncClient(timeout=timeout_seconds)
+        # Idle-read timeout via options.timeout; connect stays short so an
+        # unreachable endpoint fails fast instead of stalling the whole turn.
+        read_timeout = float(config.options.get("timeout", DEFAULT_READ_TIMEOUT))
+        self._client = httpx.AsyncClient(
+            timeout=httpx.Timeout(read_timeout, connect=DEFAULT_CONNECT_TIMEOUT)
+        )
+        self.max_retries = int(config.options.get("max_retries", DEFAULT_MAX_RETRIES))
         # Real token usage from the most recently completed request, when the
-        # provider's response includes it (OpenAI/Anthropic/Ollama all do).
-        # None means "no usage reported for the last call" - callers should
-        # fall back to a char-based estimate in that case. This replaces
-        # fabricated len(text)//4 estimates with real provider-reported
-        # counts wherever available (#10 in the issue report).
+        # provider's response includes it. None means "not reported" and
+        # callers should fall back to a char-based estimate.
         self.last_usage: Optional[Dict[str, int]] = None
+        # Flipped when the endpoint rejects native tool calling, so the agent
+        # falls back to the text (XML) tool protocol for the rest of the session.
+        self._native_tools_disabled = False
 
+    # ── capabilities ────────────────────────────────────────────────────
+    @property
+    def native_tools(self) -> bool:
+        opt = self.config.options.get("native_tools", True)
+        return bool(opt) and not self._native_tools_disabled
+
+    def disable_native_tools(self) -> None:
+        self._native_tools_disabled = True
+
+    @property
+    def supports_vision(self) -> bool:
+        opt = self.config.options.get("vision")
+        if opt is not None:
+            return bool(opt)
+        model = str(self.config.options.get("model", "")).lower()
+        markers = ("claude", "gpt-4o", "gpt-4.1", "gpt-5", "gemma3", "gemma4", "llava", "-vl", "vision",
+                   "kimi-k2.5", "kimi-k2.6", "kimi-k3", "qwen3.5", "mistral-large-3", "gemini", "fable")
+        return any(m in model for m in markers)
+
+    @property
+    def context_window(self) -> int:
+        try:
+            return int(self.config.options.get("context_window") or 32768)
+        except (TypeError, ValueError):
+            return 32768
+
+    # ── the one method providers implement ──────────────────────────────
     @abstractmethod
-    async def complete(self, prompt: str, system_prompt: str = "", history: Optional[List[Dict[str, str]]] = None, **kwargs) -> str:
-        """Generate a completion from the model.
+    def chat_stream(
+        self,
+        messages: List[Dict[str, Any]],
+        system_prompt: str = "",
+        tools: Optional[List[Dict[str, Any]]] = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[StreamEvent]:
+        """Stream a chat turn as :class:`StreamEvent` objects."""
 
-        ``history`` is an optional list of prior turns as
-        ``[{"role": "user"|"assistant", "content": "..."}, ...]``.
-        """
-        pass
+    async def chat(
+        self,
+        messages: List[Dict[str, Any]],
+        system_prompt: str = "",
+        tools: Optional[List[Dict[str, Any]]] = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        """Collect a full streamed turn into one :class:`ChatResult`."""
+        result = ChatResult()
+        text: List[str] = []
+        reasoning: List[str] = []
+        async for ev in self.chat_stream(messages, system_prompt=system_prompt, tools=tools, **kwargs):
+            if ev.kind == "text":
+                text.append(ev.text)
+            elif ev.kind == "reasoning":
+                reasoning.append(ev.text)
+            elif ev.kind == "tool_call" and ev.tool_call:
+                result.tool_calls.append(ev.tool_call)
+            elif ev.kind == "usage" and ev.usage:
+                result.usage = ev.usage
+        result.text = "".join(text)
+        result.reasoning = "".join(reasoning)
+        return result
 
-    async def stream_complete(self, prompt: str, system_prompt: str = "", history: Optional[List[Dict[str, str]]] = None, **kwargs) -> AsyncIterator[str]:
-        """Optional streaming completion. Defaults to one-shot completion."""
-        result = await self.complete(prompt, system_prompt=system_prompt, history=history, **kwargs)
-        if result:
-            yield result
+    # ── convenience wrappers (older API) ────────────────────────────────
+    @staticmethod
+    def _prompt_messages(prompt: str, history: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+        messages = list(history or [])
+        messages.append({"role": "user", "content": prompt})
+        return messages
+
+    async def complete(self, prompt: str, system_prompt: str = "", history: Optional[List[Dict[str, Any]]] = None, **kwargs) -> str:
+        """Generate a completion (history is prior ``{role, content}`` turns)."""
+        result = await self.chat(self._prompt_messages(prompt, history), system_prompt=system_prompt)
+        return result.text
+
+    async def stream_complete(self, prompt: str, system_prompt: str = "", history: Optional[List[Dict[str, Any]]] = None, **kwargs) -> AsyncIterator[str]:
+        async for ev in self.chat_stream(self._prompt_messages(prompt, history), system_prompt=system_prompt):
+            if ev.kind == "text" and ev.text:
+                yield ev.text
 
     async def close(self):
         await self._client.aclose()
 
+    # ── shared HTTP plumbing ────────────────────────────────────────────
+    def _retry_delay(self, resp: Optional[httpx.Response], attempt: int) -> float:
+        if resp is not None:
+            header = resp.headers.get("retry-after")
+            if header:
+                try:
+                    return min(float(header), 20.0)
+                except ValueError:
+                    pass
+        return min(0.5 * (2 ** attempt), 8.0) + random.uniform(0, 0.25)
+
+    async def _stream_lines(
+        self, url: str, payload: Dict[str, Any], headers: Optional[Dict[str, str]] = None
+    ) -> AsyncIterator[str]:
+        """POST ``payload`` and yield response lines, retrying transient
+        failures (connect errors, 429/5xx) that occur *before* any output has
+        been received. Errors after output started are never retried, since
+        that would duplicate streamed text."""
+        attempt = 0
+        while True:
+            started = False
+            try:
+                async with self._client.stream("POST", url, json=payload, headers=headers) as resp:
+                    if resp.status_code >= 400:
+                        body = (await resp.aread()).decode("utf-8", "replace")[:2000]
+                        if resp.status_code in RETRYABLE_STATUS and attempt < self.max_retries:
+                            raise _Retry(self._retry_delay(resp, attempt))
+                        raise ProviderError(
+                            f"HTTP {resp.status_code} from {urlparse(url).netloc}: {body[:300]}",
+                            status_code=resp.status_code,
+                            body=body,
+                        )
+                    async for line in resp.aiter_lines():
+                        started = True
+                        yield line
+                    return
+            except _Retry as retry:
+                attempt += 1
+                logger.info("provider retry %d/%d in %.1fs", attempt, self.max_retries, retry.delay)
+                await asyncio.sleep(retry.delay)
+            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.RemoteProtocolError, httpx.WriteError) as exc:
+                if started or attempt >= self.max_retries:
+                    raise
+                delay = self._retry_delay(None, attempt)
+                attempt += 1
+                logger.info("provider connection retry %d/%d in %.1fs: %s", attempt, self.max_retries, delay, exc)
+                await asyncio.sleep(delay)
+
+
+def _tool_rejection(exc: ProviderError) -> bool:
+    body = (exc.body or str(exc)).lower()
+    return exc.status_code in (400, 404, 422) and (
+        "tool" in body and any(w in body for w in ("support", "not allowed", "unknown", "invalid", "unrecognized", "function"))
+    )
+
+
+class _OpenAICompatMixin:
+    """Chat/streaming for OpenAI-compatible ``/chat/completions`` endpoints."""
+
+    def _openai_headers(self, api_key: str) -> Dict[str, str]:
+        headers = {"content-type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        return headers
+
+    async def _openai_stream(
+        self,
+        url: str,
+        api_key: str,
+        model: str,
+        messages: List[Dict[str, Any]],
+        system_prompt: str,
+        tools: Optional[List[Dict[str, Any]]],
+        *,
+        max_tokens: Optional[int],
+        temperature: Optional[float],
+    ) -> AsyncIterator[StreamEvent]:
+        headers = self._openai_headers(api_key)
+        payload: Dict[str, Any] = {
+            "model": model,
+            "messages": _to_openai_messages(messages, system_prompt),
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+        if max_tokens:
+            payload["max_tokens"] = max_tokens
+        if temperature is not None:
+            payload["temperature"] = temperature
+        oa_tools = _openai_tools(tools)
+        if oa_tools:
+            payload["tools"] = oa_tools
+        effort = self.config.options.get("reasoning_effort")  # type: ignore[attr-defined]
+        if effort:
+            payload["reasoning_effort"] = effort
+
+        adjustments = 0
+        while True:
+            try:
+                async for ev in self._openai_parse(url, payload, headers):
+                    yield ev
+                return
+            except ProviderError as exc:
+                body = (exc.body or "").lower()
+                if exc.status_code != 400 or adjustments >= 4:
+                    if oa_tools and _tool_rejection(exc):
+                        raise NativeToolsUnsupported(str(exc), exc.status_code, exc.body) from exc
+                    raise
+                # Endpoints disagree on optional params; peel off what they reject.
+                if "max_completion_tokens" in body and "max_tokens" in payload:
+                    payload["max_completion_tokens"] = payload.pop("max_tokens")
+                elif "stream_options" in body and "stream_options" in payload:
+                    payload.pop("stream_options")
+                elif "temperature" in body and "temperature" in payload:
+                    payload.pop("temperature")
+                elif "reasoning_effort" in body and "reasoning_effort" in payload:
+                    payload.pop("reasoning_effort")
+                elif oa_tools and _tool_rejection(exc):
+                    raise NativeToolsUnsupported(str(exc), exc.status_code, exc.body) from exc
+                else:
+                    raise
+                adjustments += 1
+
+    async def _openai_parse(self, url: str, payload: Dict[str, Any], headers: Dict[str, str]) -> AsyncIterator[StreamEvent]:
+        acc: Dict[int, Dict[str, str]] = {}
+        usage: Optional[Dict[str, int]] = None
+        async for line in self._stream_lines(url, payload, headers):  # type: ignore[attr-defined]
+            if not line or not line.startswith("data:"):
+                continue
+            data_str = line[5:].strip()
+            if data_str == "[DONE]":
+                break
+            try:
+                data = json.loads(data_str)
+            except Exception:
+                continue
+            if isinstance(data, dict) and data.get("error"):
+                err = data["error"]
+                msg = err.get("message") if isinstance(err, dict) else str(err)
+                raise ProviderError(f"provider stream error: {msg}", body=json.dumps(data)[:1000])
+            usage = _openai_usage(data) or usage
+            choices = data.get("choices") or []
+            if not choices:
+                continue
+            delta = choices[0].get("delta") or {}
+            reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+            if reasoning:
+                yield StreamEvent("reasoning", text=reasoning)
+            content = delta.get("content")
+            if content:
+                yield StreamEvent("text", text=content)
+            for tc in delta.get("tool_calls") or []:
+                idx = tc.get("index", 0)
+                slot = acc.setdefault(idx, {"id": "", "name": "", "args": ""})
+                if tc.get("id"):
+                    slot["id"] = tc["id"]
+                fn = tc.get("function") or {}
+                if fn.get("name") and not slot["name"]:
+                    slot["name"] = fn["name"]
+                if fn.get("arguments"):
+                    slot["args"] += fn["arguments"]
+        for idx in sorted(acc):
+            slot = acc[idx]
+            if slot["name"]:
+                yield StreamEvent(
+                    "tool_call",
+                    tool_call=_finish_tool_call(slot["id"] or f"call_{idx}", slot["name"], slot["args"]),
+                )
+        if usage:
+            self.last_usage = usage  # type: ignore[attr-defined]
+            yield StreamEvent("usage", usage=usage)
+
 
 class LocalProvider(BaseProvider):
-    """Provider for local LLMs via Ollama-compatible /api/chat endpoint."""
+    """Provider for local LLMs via an Ollama-compatible ``/api/chat`` endpoint."""
 
-    async def complete(self, prompt: str, system_prompt: str = "", history: Optional[List[Dict[str, str]]] = None, **kwargs) -> str:
+    def _model(self) -> str:
+        return self.config.options.get("model", self.config.name.lower())
+
+    async def chat_stream(self, messages, system_prompt="", tools=None, **kwargs) -> AsyncIterator[StreamEvent]:
         url = f"{self.config.endpoint.rstrip('/')}/api/chat"
-        model = self.config.options.get("model", self.config.name.lower())
-        payload = {
-            "model": model,
-            "messages": [],
-            "stream": False,
-            "options": {},
-        }
-        if system_prompt:
-            payload["messages"].append({"role": "system", "content": system_prompt})
-        if history:
-            payload["messages"].extend(history)
-        payload["messages"].append({"role": "user", "content": prompt})
-
-        if "temperature" in self.config.options:
-            payload["options"]["temperature"] = self.config.options["temperature"]
-        if "num_ctx" in self.config.options:
-            payload["options"]["num_ctx"] = self.config.options["num_ctx"]
-
-        resp = await self._client.post(url, json=payload)
-        resp.raise_for_status()
-        data = resp.json()
-        self.last_usage = _ollama_usage(data)
-        return data.get("message", {}).get("content", "")
-
-    async def stream_complete(self, prompt: str, system_prompt: str = "", history: Optional[List[Dict[str, str]]] = None, **kwargs) -> AsyncIterator[str]:
-        url = f"{self.config.endpoint.rstrip('/')}/api/chat"
-        model = self.config.options.get("model", self.config.name.lower())
-        payload = {
-            "model": model,
-            "messages": [],
+        payload: Dict[str, Any] = {
+            "model": self._model(),
+            "messages": _to_ollama_messages(messages, system_prompt),
             "stream": True,
             "options": {},
         }
-        if system_prompt:
-            payload["messages"].append({"role": "system", "content": system_prompt})
-        if history:
-            payload["messages"].extend(history)
-        payload["messages"].append({"role": "user", "content": prompt})
-
         if "temperature" in self.config.options:
             payload["options"]["temperature"] = self.config.options["temperature"]
         if "num_ctx" in self.config.options:
             payload["options"]["num_ctx"] = self.config.options["num_ctx"]
+        if "think" in self.config.options:
+            payload["think"] = self.config.options["think"]
+        oa_tools = _openai_tools(tools)
+        if oa_tools:
+            payload["tools"] = oa_tools
 
-        async with self._client.stream("POST", url, json=payload) as resp:
-            resp.raise_for_status()
-            async for line in resp.aiter_lines():
+        n = 0
+        try:
+            async for line in self._stream_lines(url, payload):
                 if not line:
                     continue
                 try:
                     data = json.loads(line)
                 except Exception:
                     continue
+                if data.get("error"):
+                    raise ProviderError(f"ollama error: {data['error']}", body=str(data["error"]))
+                msg = data.get("message") or {}
+                if msg.get("thinking"):
+                    yield StreamEvent("reasoning", text=msg["thinking"])
+                if msg.get("content"):
+                    yield StreamEvent("text", text=msg["content"])
+                for tc in msg.get("tool_calls") or []:
+                    fn = tc.get("function") or {}
+                    args = fn.get("arguments")
+                    call = (
+                        ToolCall(id=f"call_{n}", name=fn.get("name", ""), arguments=args)
+                        if isinstance(args, dict)
+                        else _finish_tool_call(f"call_{n}", fn.get("name", ""), args if isinstance(args, str) else "")
+                    )
+                    n += 1
+                    if call.name:
+                        yield StreamEvent("tool_call", tool_call=call)
                 if data.get("done"):
-                    self.last_usage = _ollama_usage(data)
-                chunk = data.get("message", {}).get("content", "")
-                if chunk:
-                    yield chunk
+                    usage = _ollama_usage(data)
+                    if usage:
+                        self.last_usage = usage
+                        yield StreamEvent("usage", usage=usage)
+        except ProviderError as exc:
+            if oa_tools and _tool_rejection(exc):
+                raise NativeToolsUnsupported(str(exc), exc.status_code, exc.body) from exc
+            raise
 
     async def embed(self, text: str) -> List[float]:
         """Generate an embedding via Ollama /api/embeddings."""
@@ -193,186 +674,181 @@ class LocalProvider(BaseProvider):
         return [configured] if configured else []
 
 
-class CloudProvider(BaseProvider):
-    """Provider for cloud LLMs (Anthropic, OpenAI) using their native chat APIs."""
+# Env var to consult per API host. Deliberately host-specific: the old code
+# tried every provider's variable in turn, which could send one vendor's key
+# to another vendor's endpoint.
+_HOST_KEY_ENV = (
+    ("anthropic.com", "ANTHROPIC_API_KEY"),
+    ("openai.com", "OPENAI_API_KEY"),
+    ("ollama.com", "OLLAMA_API_KEY"),
+)
 
-    async def complete(self, prompt: str, system_prompt: str = "", history: Optional[List[Dict[str, str]]] = None, **kwargs) -> str:
-        endpoint = self.config.endpoint
-        api_key = self.config.api_key or os.environ.get("OLLAMA_API_KEY") or os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
 
-        if "anthropic" in endpoint:
-            return await self._anthropic_complete(prompt, system_prompt, api_key, history)
-        elif "openai" in endpoint:
-            return await self._openai_complete(prompt, system_prompt, api_key, history)
-        else:
-            return await self._openai_complete(prompt, system_prompt, api_key, history)
+def _env_key_for(endpoint: str) -> str:
+    host = urlparse(endpoint).netloc.lower()
+    for suffix, env in _HOST_KEY_ENV:
+        if host.endswith(suffix):
+            return os.environ.get(env, "")
+    return os.environ.get("MOTION_API_KEY", "")
 
-    async def stream_complete(self, prompt: str, system_prompt: str = "", history: Optional[List[Dict[str, str]]] = None, **kwargs) -> AsyncIterator[str]:
-        endpoint = self.config.endpoint
-        api_key = self.config.api_key or os.environ.get("OLLAMA_API_KEY") or os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
 
-        if "anthropic" in endpoint:
-            async for chunk in super().stream_complete(prompt, system_prompt=system_prompt, history=history, **kwargs):
-                yield chunk
-            return
+class CloudProvider(_OpenAICompatMixin, BaseProvider):
+    """Cloud LLMs: Anthropic's native Messages API, or any OpenAI-compatible API."""
 
-        url = f"{self.config.endpoint.rstrip('/')}/chat/completions"
-        model = self.config.options.get("model", "gpt-4o")
-        max_tokens = self.config.options.get("max_tokens", 4096)
-        temperature = self.config.options.get("temperature", 0.8)
+    def _api_key(self) -> str:
+        return self.config.api_key or _env_key_for(self.config.endpoint)
+
+    @property
+    def is_anthropic(self) -> bool:
+        return "anthropic" in self.config.endpoint
+
+    def chat_stream(self, messages, system_prompt="", tools=None, **kwargs) -> AsyncIterator[StreamEvent]:
+        if self.is_anthropic:
+            return self._anthropic_stream(messages, system_prompt, tools)
+        base = self.config.endpoint.rstrip("/")
+        return self._openai_stream(
+            f"{base}/chat/completions",
+            self._api_key(),
+            self.config.options.get("model", "gpt-4o"),
+            messages,
+            system_prompt,
+            tools,
+            max_tokens=self.config.options.get("max_tokens", 4096),
+            temperature=self.config.options.get("temperature", 0.8),
+        )
+
+    def _anthropic_url(self) -> str:
+        base = (self.config.endpoint or "https://api.anthropic.com").rstrip("/")
+        return f"{base}/messages" if base.endswith("/v1") else f"{base}/v1/messages"
+
+    async def _anthropic_stream(self, messages, system_prompt, tools) -> AsyncIterator[StreamEvent]:
+        opts = self.config.options
         headers = {
-            "Authorization": f"Bearer {api_key}",
-            "content-type": "application/json",
-        }
-        messages = []
-        if system_prompt:
-            messages.append({"role": "system", "content": system_prompt})
-        if history:
-            messages.extend(history)
-        messages.append({"role": "user", "content": prompt})
-        payload = {
-            "model": model,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-            "messages": messages,
-            "stream": True,
-        }
-
-        async with self._client.stream("POST", url, json=payload, headers=headers) as resp:
-            resp.raise_for_status()
-            async for line in resp.aiter_lines():
-                if not line or not line.startswith("data: "):
-                    continue
-                data_str = line[6:].strip()
-                if data_str == "[DONE]":
-                    break
-                try:
-                    data = json.loads(data_str)
-                except Exception:
-                    continue
-                delta = data.get("choices", [{}])[0].get("delta", {})
-                chunk = delta.get("content", "")
-                if chunk:
-                    yield chunk
-
-    async def _anthropic_complete(self, prompt: str, system_prompt: str, api_key: str, history: Optional[List[Dict[str, str]]] = None) -> str:
-        url = "https://api.anthropic.com/v1/messages"
-        model = self.config.options.get("model", "claude-3-5-sonnet-20241022")
-        max_tokens = self.config.options.get("max_tokens", 4096)
-        temperature = self.config.options.get("temperature", 0.7)
-        headers = {
-            "x-api-key": api_key,
+            "x-api-key": self._api_key(),
             "anthropic-version": "2023-06-01",
             "content-type": "application/json",
         }
-        messages = list(history) if history else []
-        messages.append({"role": "user", "content": prompt})
-        payload = {
-            "model": model,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-            "messages": messages,
-        }
-        if system_prompt:
-            payload["system"] = system_prompt
-
-        resp = await self._client.post(url, json=payload, headers=headers)
-        resp.raise_for_status()
-        data = resp.json()
-        self.last_usage = _anthropic_usage(data)
-        return data.get("content", [{}])[0].get("text", "")
-
-    async def _openai_complete(self, prompt: str, system_prompt: str, api_key: str, history: Optional[List[Dict[str, str]]] = None) -> str:
-        url = f"{self.config.endpoint.rstrip('/')}/chat/completions"
-        model = self.config.options.get("model", "gpt-4o")
-        max_tokens = self.config.options.get("max_tokens", 4096)
-        temperature = self.config.options.get("temperature", 0.8)
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "content-type": "application/json",
-        }
-        messages = []
-        if system_prompt:
-            messages.append({"role": "system", "content": system_prompt})
-        if history:
-            messages.extend(history)
-        messages.append({"role": "user", "content": prompt})
-        payload = {
-            "model": model,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-            "messages": messages,
-        }
-        resp = await self._client.post(url, json=payload, headers=headers)
-        resp.raise_for_status()
-        data = resp.json()
-        self.last_usage = _openai_usage(data)
-        return data.get("choices", [{}])[0].get("message", {}).get("content", "")
-
-
-class ProxyProvider(BaseProvider):
-    """Provider for custom proxy/gateway endpoints (OpenAI-compatible)."""
-
-    async def complete(self, prompt: str, system_prompt: str = "", history: Optional[List[Dict[str, str]]] = None, **kwargs) -> str:
-        url = f"{self.config.endpoint.rstrip('/')}/chat/completions"
-        api_key = self.config.api_key or os.environ.get("PROXY_API_KEY", "")
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "content-type": "application/json",
-        }
-        messages = []
-        if system_prompt:
-            messages.append({"role": "system", "content": system_prompt})
-        if history:
-            messages.extend(history)
-        messages.append({"role": "user", "content": prompt})
-        payload = {
-            "model": self.config.options.get("model", "default"),
-            "messages": messages,
-            "temperature": self.config.options.get("temperature", 0.7),
-        }
-        resp = await self._client.post(url, json=payload, headers=headers)
-        resp.raise_for_status()
-        data = resp.json()
-        self.last_usage = _openai_usage(data)
-        return data.get("choices", [{}])[0].get("message", {}).get("content", "")
-
-    async def stream_complete(self, prompt: str, system_prompt: str = "", history: Optional[List[Dict[str, str]]] = None, **kwargs) -> AsyncIterator[str]:
-        url = f"{self.config.endpoint.rstrip('/')}/chat/completions"
-        api_key = self.config.api_key or os.environ.get("PROXY_API_KEY", "")
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "content-type": "application/json",
-        }
-        messages = []
-        if system_prompt:
-            messages.append({"role": "system", "content": system_prompt})
-        if history:
-            messages.extend(history)
-        messages.append({"role": "user", "content": prompt})
-        payload = {
-            "model": self.config.options.get("model", "default"),
-            "messages": messages,
-            "temperature": self.config.options.get("temperature", 0.7),
+        payload: Dict[str, Any] = {
+            "model": opts.get("model", "claude-sonnet-5"),
+            "max_tokens": opts.get("max_tokens", 4096),
+            "messages": _to_anthropic_messages(messages),
             "stream": True,
         }
+        thinking_budget = opts.get("thinking_budget")
+        if thinking_budget:
+            payload["thinking"] = {"type": "enabled", "budget_tokens": int(thinking_budget)}
+        elif opts.get("temperature") is not None:
+            payload["temperature"] = opts["temperature"]
+        if system_prompt:
+            # Cache the (large, stable) system prompt across the tool loop.
+            payload["system"] = [{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}]
+        if tools:
+            specs = [
+                {
+                    "name": t["name"],
+                    "description": t.get("description", ""),
+                    "input_schema": t.get("parameters") or {"type": "object", "properties": {}},
+                }
+                for t in tools
+            ]
+            specs[-1]["cache_control"] = {"type": "ephemeral"}
+            payload["tools"] = specs
 
-        async with self._client.stream("POST", url, json=payload, headers=headers) as resp:
-            resp.raise_for_status()
-            async for line in resp.aiter_lines():
-                if not line or not line.startswith("data: "):
+        blocks: Dict[int, Dict[str, Any]] = {}
+        in_tokens = 0
+        out_tokens = 0
+        try:
+            async for line in self._stream_lines(self._anthropic_url(), payload, headers):
+                if not line.startswith("data:"):
                     continue
-                data_str = line[6:].strip()
-                if data_str == "[DONE]":
-                    break
                 try:
-                    data = json.loads(data_str)
+                    data = json.loads(line[5:].strip())
                 except Exception:
                     continue
-                delta = data.get("choices", [{}])[0].get("delta", {})
-                chunk = delta.get("content", "")
-                if chunk:
-                    yield chunk
+                etype = data.get("type")
+                if etype == "message_start":
+                    u = (data.get("message") or {}).get("usage") or {}
+                    in_tokens = (
+                        int(u.get("input_tokens") or 0)
+                        + int(u.get("cache_creation_input_tokens") or 0)
+                        + int(u.get("cache_read_input_tokens") or 0)
+                    )
+                    out_tokens = int(u.get("output_tokens") or 0)
+                elif etype == "content_block_start":
+                    block = data.get("content_block") or {}
+                    blocks[data.get("index", 0)] = {
+                        "type": block.get("type"), "id": block.get("id", ""), "name": block.get("name", ""), "args": "",
+                    }
+                elif etype == "content_block_delta":
+                    delta = data.get("delta") or {}
+                    dtype = delta.get("type")
+                    if dtype == "text_delta" and delta.get("text"):
+                        yield StreamEvent("text", text=delta["text"])
+                    elif dtype == "thinking_delta" and delta.get("thinking"):
+                        yield StreamEvent("reasoning", text=delta["thinking"])
+                    elif dtype == "input_json_delta":
+                        slot = blocks.get(data.get("index", 0))
+                        if slot is not None:
+                            slot["args"] += delta.get("partial_json", "")
+                elif etype == "content_block_stop":
+                    slot = blocks.pop(data.get("index", 0), None)
+                    if slot and slot["type"] == "tool_use":
+                        yield StreamEvent(
+                            "tool_call", tool_call=_finish_tool_call(slot["id"], slot["name"], slot["args"])
+                        )
+                elif etype == "message_delta":
+                    u = data.get("usage") or {}
+                    out_tokens = int(u.get("output_tokens") or out_tokens)
+                elif etype == "error":
+                    err = data.get("error") or {}
+                    raise ProviderError(
+                        f"anthropic stream error: {err.get('type', 'error')}: {err.get('message', '')}",
+                        body=json.dumps(data)[:1000],
+                    )
+        except ProviderError as exc:
+            if tools and _tool_rejection(exc):
+                raise NativeToolsUnsupported(str(exc), exc.status_code, exc.body) from exc
+            raise
+        if in_tokens or out_tokens:
+            usage = {"prompt_tokens": in_tokens, "completion_tokens": out_tokens, "total_tokens": in_tokens + out_tokens}
+            self.last_usage = usage
+            yield StreamEvent("usage", usage=usage)
+
+    async def embed(self, text: str) -> List[float]:
+        """Embeddings via an OpenAI-compatible ``/embeddings`` endpoint.
+        Only used when ``options.embed_model`` is configured."""
+        model = self.config.options.get("embed_model")
+        if not model or self.is_anthropic:
+            raise ProviderError("no embedding model configured for this provider")
+        resp = await self._client.post(
+            f"{self.config.endpoint.rstrip('/')}/embeddings",
+            json={"model": model, "input": text},
+            headers=self._openai_headers(self._api_key()),
+        )
+        resp.raise_for_status()
+        data = resp.json().get("data") or [{}]
+        return data[0].get("embedding", [])
+
+    @property
+    def can_embed(self) -> bool:
+        return bool(self.config.options.get("embed_model")) and not self.is_anthropic
+
+
+class ProxyProvider(_OpenAICompatMixin, BaseProvider):
+    """Custom proxy/gateway endpoints (OpenAI-compatible)."""
+
+    def chat_stream(self, messages, system_prompt="", tools=None, **kwargs) -> AsyncIterator[StreamEvent]:
+        api_key = self.config.api_key or os.environ.get("PROXY_API_KEY", "")
+        return self._openai_stream(
+            f"{self.config.endpoint.rstrip('/')}/chat/completions",
+            api_key,
+            self.config.options.get("model", "default"),
+            messages,
+            system_prompt,
+            tools,
+            max_tokens=self.config.options.get("max_tokens"),
+            temperature=self.config.options.get("temperature", 0.7),
+        )
 
 
 class ProviderFactory:
