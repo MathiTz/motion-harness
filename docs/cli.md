@@ -81,7 +81,7 @@ echo "explain this" | motion -p -                     # prompt from stdin
 git diff | motion -p "review this diff" --stdin       # stdin appended as context
 ```
 
-The JSON result has `ok`, `result`, `error`, `provider`, `model`, `mode`, `steps`, `tool_calls`, `elapsed_s`, `ttft_s`, `usage` and `cost_usd`. Exit codes: `0` success, `1` the turn failed (provider or tool-loop error), `2` usage/config error, `130` interrupted. `MOTION_CONFIG=/path/config.yml` selects a config file. There is no UI to approve anything, so risky commands, private-network fetches and `ask_user` are refused unless pre-approved with `permissions.commands.allow`. Headless runs don't write to long-term memory unless `remember_turns_headless: true`.
+The JSON result has `ok`, `result`, `error`, `provider`, `model`, `mode`, `steps`, `tool_calls`, `elapsed_s`, `ttft_s`, `usage`, `cost_usd` and `trajectory` (one record per model step: duration, first-token latency, prompt/completion tokens, and each tool call's arguments preview, success and result size). `stream-json` emits each record as a `{"type": "step", ...}` event as it happens. Exit codes: `0` success, `1` the turn failed (provider or tool-loop error), `2` usage/config error, `130` interrupted. `MOTION_CONFIG=/path/config.yml` selects a config file. There is no UI to approve anything, so risky commands, private-network fetches and `ask_user` are refused unless pre-approved with `permissions.commands.allow`. Headless runs don't write to long-term memory unless `remember_turns_headless: true`.
 
 ## Slash commands (inside the TUI)
 
@@ -93,6 +93,8 @@ The JSON result has `ok`, `result`, `error`, `provider`, `model`, `mode`, `steps
 | `/undo` | Revert the file changes made in the last turn |
 | `/diff [on\|off]` | Show the last turn's edits in full / toggle inline diffs |
 | `/jobs [stop <id\|all>]` | List background processes; stop one or all |
+| `/trajectory [copy\|save [full]\|all]` | Steps of the last turn (or `all` the session): time, tokens, tool calls and result sizes, plus where the cost went. `copy` → clipboard, `save` → `.motion/trajectories/*.json` (`full` adds every message sent) |
+| `/tracking [on\|off]` | Whether session transcripts are saved to `.motion/sessions/`. No argument shows the state; use `on` if you declined the first-launch prompt |
 | `/new` | Start a fresh conversation (approvals and settings are kept) |
 | `/resume [id]` | List saved sessions, or reload one (needs interaction tracking) |
 | `/todos` | Show the agent's current task list |

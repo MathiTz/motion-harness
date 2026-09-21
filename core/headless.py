@@ -100,6 +100,7 @@ async def run_headless(
     stats: Dict[str, Any] = {
         "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         "steps": 0, "tool_calls": 0, "ttft_s": None, "elapsed_s": None, "error": None,
+        "trajectory": [],
     }
 
     def event(obj: Dict[str, Any]) -> None:
@@ -129,6 +130,9 @@ async def run_headless(
             stats["steps"] = payload.get("step", stats["steps"])
             if stats["ttft_s"] is None and payload.get("ttft_ms") is not None:
                 stats["ttft_s"] = payload["ttft_ms"] / 1000
+        elif stage == "step_record":
+            stats["trajectory"].append(payload["record"])
+            event({"type": "step", **payload["record"]})
         elif stage == "turn_done":
             stats["elapsed_s"] = payload.get("elapsed_ms", 0) / 1000
             stats["tool_calls"] = payload.get("tool_calls", 0)
@@ -203,6 +207,7 @@ async def run_headless(
         "ttft_s": stats["ttft_s"],
         "usage": usage,
         "cost_usd": cost,
+        "trajectory": stats["trajectory"],
     }
     if output_format in ("json", "stream-json"):
         out.write(json.dumps(summary, ensure_ascii=False) + "\n")

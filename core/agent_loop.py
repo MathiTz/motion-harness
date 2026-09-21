@@ -34,7 +34,8 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 
-from core.context import compact_messages, trim_old_tool_results
+from core.context import compact_messages, messages_tokens, trim_old_tool_results
+from core.trajectory import preview_args
 from core.instructions import build_context_blocks
 from core.permissions import CommandPolicy
 from core.providers import BaseProvider, NativeToolsUnsupported, ToolCall
@@ -100,6 +101,7 @@ class Outcome:
     text: str
     failed: bool = False
     nudge: Optional[str] = None
+    duration_s: float = 0.0
 
 
 class _ToolTagFilter:
@@ -214,6 +216,7 @@ class TurnRunner:
         self._pending_images: List[Dict[str, str]] = []
         self.tool_call_count = 0
         self.first_ttft: Optional[float] = None
+        self.trajectory: List[Dict[str, Any]] = []
 
     # ── plumbing ─────────────────────────────────────────────────────────
     @property
@@ -458,6 +461,42 @@ class TurnRunner:
         return self._wrap(name, error=str(exc))
 
     async def _run_call(self, call: ToolCall) -> Outcome:
+        started = time.monotonic()
+        outcome = await self._run_call_inner(call)
+        outcome.duration_s = time.monotonic() - started
+        return outcome
+
+    async def _record_step(
+        self, step_no: int, step: StepResult, secs: float, ctx_tokens: int,
+        calls: Optional[List[ToolCall]] = None, outcomes: Optional[List[Outcome]] = None,
+    ) -> None:
+        """One trajectory record per model step (see core/trajectory.py)."""
+        usage = step.usage or {}
+        record = {
+            "agent": "lead" if self.depth == 0 else "sub",
+            "step": step_no,
+            "duration_s": round(secs, 3),
+            "ttft_s": round(step.ttft, 3) if step.ttft is not None else None,
+            "prompt_tokens": usage.get("prompt_tokens"),
+            "completion_tokens": usage.get("completion_tokens"),
+            "context_tokens_est": ctx_tokens,
+            "text_chars": len(step.text or ""),
+            "reasoning_chars": len(step.reasoning or ""),
+            "tools": [
+                {
+                    "name": c.name,
+                    "args": preview_args(c.arguments),
+                    "ok": not o.failed,
+                    "result_chars": len(o.text),
+                    "duration_s": round(o.duration_s, 3),
+                }
+                for c, o in zip(calls or [], outcomes or [])
+            ],
+        }
+        self.trajectory.append(record)
+        await self.trace("step_record", f"step {step_no}", record=record)
+
+    async def _run_call_inner(self, call: ToolCall) -> Outcome:
         name, arguments = call.name, call.arguments
         await self.trace("tool_start", f"Running {name}", tool=name, path=str(arguments.get("path", "")))
         if call.parse_error:
@@ -646,6 +685,9 @@ class TurnRunner:
                 }))
             elif stage == "model_step":
                 forwarded["steps"] = payload.get("step", forwarded["steps"])
+            elif stage == "step_record":
+                asyncio.ensure_future(self.trace("step_record", payload.get("message", ""), record={
+                    **payload["record"], "agent": f"sub:{label}"}))
 
         runner = TurnRunner(
             self.agent,
@@ -746,6 +788,7 @@ class TurnRunner:
             if compact_messages(self.messages, self.system_prompt, window, prompt_index):
                 await self.trace("context_compacted", "Trimmed older tool steps to stay within the context window")
 
+            ctx_tokens = messages_tokens(self.messages, self.system_prompt)
             step_started = time.monotonic()
             try:
                 step = await self._model_step(tool_step)
@@ -812,6 +855,7 @@ class TurnRunner:
                     )
                     if step.streamed:
                         await self.emit("_endstep_ ")
+                    await self._record_step(tool_step + 1, step, step_secs, ctx_tokens)
                     self.messages.extend([
                         {"role": "assistant", "content": candidate},
                         {"role": "user", "content": format_tool_result("invalid", error=error_msg)},
@@ -835,6 +879,7 @@ class TurnRunner:
             if not calls:
                 tool_response = candidate
                 final_streamed = step.streamed
+                await self._record_step(tool_step + 1, step, step_secs, ctx_tokens)
                 break
 
             # ── tool calls ───────────────────────────────────────────────
@@ -859,6 +904,7 @@ class TurnRunner:
             else:
                 outcomes = [await self._run_call(c) for c in calls]
 
+            await self._record_step(tool_step + 1, step, step_secs, ctx_tokens, calls, outcomes)
             nudges: List[str] = []
             for c, out in zip(calls, outcomes):
                 if self.mode == "native":
@@ -983,6 +1029,9 @@ class TurnRunner:
                 elapsed_ms=int((time.monotonic() - t_turn) * 1000),
                 tool_calls=self.tool_call_count,
                 ttft_ms=int(self.first_ttft * 1000) if self.first_ttft is not None else None,
+                # the conversation as sent to the model, plus the final answer it produced
+                transcript=[*self.messages, {"role": "assistant", "content": final_response or ""}],
+                system_prompt=self.system_prompt,
             )
 
         # Remember substantive turns so later sessions can recall them.

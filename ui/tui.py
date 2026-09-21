@@ -68,6 +68,7 @@ from core.config import ConfigManager
 from core.context import estimate_tokens
 from core.orchestrator import TaskManager, TaskRequest
 from core.pricing import format_cost, turn_cost
+from core import trajectory as traj
 from core.providers import ModelConfig
 from core.session import SessionStore, state_dir
 from core.skills import SkillLibrary, slugify
@@ -157,6 +158,11 @@ class AppState:
         # Edits made during the most recent turn, for the /diff command, and
         # whether to show them inline as they happen (config: show_diffs).
         self.turn_diffs: list[tuple[str, str, int, int]] = []
+        # One record per model step of every turn this session (see core/trajectory.py),
+        # plus the last turn's full message transcript for `/trajectory save full`.
+        self.trajectory: list[dict] = []
+        self.trajectory_turn: int = 0
+        self.last_transcript: Optional[dict] = None
         self.show_diffs: bool = bool(self.config_manager.get("show_diffs", True))
         self.session_context: str = ""  # rolling, bounded summary of the session
         self._context_turns: list[tuple[str, str]] = []  # recent turns used to build context
@@ -260,6 +266,9 @@ class AppState:
         self.session_context = ""
         self.attachments.clear()
         self.todos = []
+        self.trajectory = []
+        self.trajectory_turn = 0
+        self.last_transcript = None
         self.last_agent_response = ""
         self.message_queue.clear()
         self.tool_session.todos = []
@@ -644,6 +653,8 @@ class ChatComposer(Static, can_focus=True):
         ("/compact", "summarize the conversation to free context"),
         ("/undo", "revert the file changes of the last turn"),
         ("/diff", "show the last turn's edits (on|off toggles inline diffs)"),
+        ("/trajectory", "steps, tokens and tools of the last turn (copy|save|all)"),
+        ("/tracking", "save session transcripts locally (on|off)"),
         ("/new", "start a fresh conversation"),
         ("/resume", "list or reload a saved session"),
         ("/todos", "show the agent's task list"),
@@ -1385,6 +1396,10 @@ class CommandPalette(Screen):
             ("Toggle agent thinking", "thinking"),
             ("Copy last response", "copy"),
             ("Copy last code block", "copy_code"),
+            ("Copy trace log", "copy_trace"),
+            ("Show turn trajectory (/trajectory)", "trajectory"),
+            ("Copy turn trajectory", "copy_trajectory"),
+            ("Toggle interaction tracking", "tracking"),
             ("Toggle context panel", "context"),
             ("Manage API keys (/auth)", "auth"),
             ("Close menu (Esc)", "close"),
@@ -1516,6 +1531,19 @@ class CommandPalette(Screen):
                 pass
         elif action == "context":
             self._main.action_toggle_context_panel()
+        elif action in ("copy_trace", "trajectory", "copy_trajectory", "tracking"):
+            try:
+                chat = self._main.query_one(ChatPane)
+                if action == "copy_trace":
+                    chat.action_copy_trace()
+                elif action == "trajectory":
+                    chat.show_trajectory()
+                elif action == "copy_trajectory":
+                    chat.copy_trajectory()
+                else:
+                    chat.set_tracking("toggle")
+            except Exception:
+                pass
 
     def action_dismiss_palette(self) -> None:
         self.app.pop_screen()
@@ -2198,7 +2226,8 @@ class TrackingConsentScreen(Screen):
                 "Save every prompt + full response this session to a local "
                 "JSONL file (sessions/<timestamp>.jsonl) for your own review "
                 "or later context reuse. Nothing leaves your machine. You can "
-                "change this anytime from the command palette.",
+                "change this anytime with /tracking on|off or Ctrl+K → "
+                "Toggle interaction tracking.",
                 id="tracking_body",
             )
             yield ListView(id="tracking_list")
@@ -2216,7 +2245,11 @@ class TrackingConsentScreen(Screen):
             self.app.state.config_manager.set("track_interactions", enabled)
         except Exception:
             pass
-        self.notify("Interaction tracking " + ("enabled" if enabled else "disabled"))
+        self.notify(
+            "Interaction tracking enabled" if enabled
+            else "Interaction tracking disabled — turn it on later with /tracking on",
+            timeout=8,
+        )
         self.app.pop_screen()
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
@@ -2583,6 +2616,7 @@ class ChatPane(Vertical):
         Binding("f7", "toggle_thinking", "Thinking", priority=True),
         Binding("f8", "toggle_trace_panel", "Trace", priority=True),
         Binding("f9", "copy_last_response", "Copy", priority=True),
+        Binding("f10", "copy_trace", "Copy trace", priority=True),
         Binding("tab", "toggle_agent_mode", "Agent", priority=True),
         Binding("ctrl+e", "open_external_editor", "Editor", priority=True),
     ]
@@ -2856,6 +2890,123 @@ class ChatPane(Vertical):
     def action_copy_last_response(self) -> None:
         self._copy_last_response()
 
+    # ── trace / trajectory / tracking ────────────────────────────────────────
+    def _copy_text(self, text: str, what: str) -> None:
+        """Copy to the clipboard, falling back to the input box (as the response copy does)."""
+        copy_fn = getattr(self.app, "copy_to_clipboard", None)
+        if callable(copy_fn):
+            try:
+                copy_fn(text)
+                self.notify(f"Copied {what} to clipboard.")
+                return
+            except Exception:
+                pass
+        try:
+            input_box = self.query_one("#chat_input", ChatComposer)
+            input_box.value = text[:10000]
+            input_box.focus()
+            self.notify(f"Clipboard unavailable; {what} inserted into input for manual copy.", severity="warning")
+        except Exception:
+            self.notify("Clipboard copy unavailable in this terminal.", severity="warning")
+
+    def action_copy_trace(self) -> None:
+        """Copy the whole interaction-trace log as plain text (the panel itself can't be selected)."""
+        if not self._trace_lines:
+            self.notify("The trace log is empty.", severity="warning")
+            return
+        plain = "\n".join(Text.from_markup(line).plain for line in self._trace_lines)
+        self._copy_text(plain, f"trace log ({len(self._trace_lines)} lines)")
+
+    def _trajectory_records(self, everything: bool = False) -> list[dict]:
+        recs = self.state.trajectory
+        return recs if everything else traj.turn_records(recs)
+
+    def _trajectory_title(self, everything: bool) -> str:
+        if everything:
+            return f"Trajectory (whole session, {self.state.trajectory_turn} turns)"
+        return f"Trajectory of turn {self.state.trajectory_turn}"
+
+    def show_trajectory(self, everything: bool = False) -> None:
+        log = self.query_one("#chat_log", VerticalScroll)
+        recs = self._trajectory_records(everything)
+        text = traj.render(recs, self._trajectory_title(everything))
+        widget = Static(Text(text), classes="trajectory")
+        widget.styles.border_left = ("solid", "orange")
+        widget.styles.padding = (0, 2)
+        widget.styles.margin = (0, 0, 1, 1)
+        log.mount(widget)
+        if recs:
+            log.mount(SystemMessage("  /trajectory copy · /trajectory save [full] · /trajectory all"))
+        log.scroll_end(animate=False)
+
+    def copy_trajectory(self, everything: bool = False) -> None:
+        recs = self._trajectory_records(everything)
+        if not recs:
+            self.notify("No steps recorded yet.", severity="warning")
+            return
+        self._copy_text(traj.render(recs, self._trajectory_title(everything)), "trajectory")
+
+    def save_trajectory(self, full: bool = False, everything: bool = False) -> Optional[Path]:
+        import json
+
+        recs = self._trajectory_records(everything)
+        if not recs:
+            self.notify("No steps recorded yet.", severity="warning")
+            return None
+        last = self.state.last_transcript or {}
+        doc = traj.to_json(
+            self.state.trajectory if everything else recs,
+            turn=None if everything else recs[0].get("turn"),
+            provider=self.state.current_provider_id,
+            system_prompt=last.get("system_prompt") if full else None,
+            messages=last.get("messages") if full else None,
+        )
+        if everything:
+            doc["steps"], doc["summary"], doc["insights"] = recs, traj.totals(recs), traj.insights(recs)
+        directory = Path(WORKSPACE) / ".motion" / "trajectories"
+        directory.mkdir(parents=True, exist_ok=True)
+        name = f"session-{datetime.now():%Y%m%d-%H%M%S}.json" if everything else f"turn-{recs[0].get('turn', 0)}-{datetime.now():%H%M%S}.json"
+        path = directory / name
+        path.write_text(json.dumps(doc, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+        return path
+
+    def _trajectory_command(self, arg: str, log: VerticalScroll) -> None:
+        words = arg.lower().split()
+        everything = "all" in words
+        if "copy" in words:
+            self.copy_trajectory(everything)
+        elif "save" in words:
+            path = self.save_trajectory(full="full" in words, everything=everything)
+            if path:
+                log.mount(SystemMessage(f"💾 Saved {path}" + ("" if "full" in words else "  (add 'full' to include every message sent to the model)")))
+        elif words and not everything:
+            log.mount(SystemMessage("Usage: /trajectory [all] | copy [all] | save [full] [all]"))
+        else:
+            self.show_trajectory(everything)
+
+    def set_tracking(self, mode: str = "toggle") -> None:
+        """on | off | toggle | status. This is also how to undo the first-launch 'No thanks'."""
+        cm = self.state.config_manager
+        log = self.query_one("#chat_log", VerticalScroll)
+        mode = (mode or "status").lower()
+        if mode not in ("on", "off", "toggle", "status"):
+            log.mount(SystemMessage("Usage: /tracking [on|off]"))
+            return
+        current = bool(cm.get("track_interactions"))
+        enabled = {"on": True, "off": False, "status": current}.get(mode, not current)
+        if enabled != current:
+            try:
+                cm.set("track_interactions", enabled)
+            except Exception as exc:
+                log.mount(SystemMessage(f"⚠ Could not save the setting: {exc}"))
+                return
+            self.state._session_store = None  # next turn starts a fresh transcript file
+        state = (
+            f"ON — every turn is saved under {WORKSPACE}/.motion/sessions/" if enabled else "OFF — nothing is saved"
+        )
+        log.mount(SystemMessage(f"💾 Interaction tracking is {state}. Change it with /tracking {'off' if enabled else 'on'}."))
+        log.scroll_end(animate=False)
+
     def _copy_last_code_block(self) -> None:
         """Copy the last fenced code block from the last agent response.
 
@@ -3084,7 +3235,7 @@ class ChatPane(Vertical):
         if text.startswith("/tools") or text.strip() == "/help":
             await self._handle_tools_command()
             return
-        if text.split()[0] in ("/compact", "/undo", "/new", "/resume", "/todos", "/mcp", "/diff", "/jobs"):
+        if text.split()[0] in ("/compact", "/undo", "/new", "/resume", "/todos", "/mcp", "/diff", "/jobs", "/trajectory", "/tracking"):
             await self._handle_session_command(text, log)
             log.scroll_end(animate=False)
             return
@@ -3207,6 +3358,7 @@ class ChatPane(Vertical):
         "sandbox": "🧱 sandbox",
         "subagent_start": "🧩 subagent.start",
         "subagent_done": "🧩 subagent.done",
+        "exploration_nudge": "💡 nudge",
     }
     TRACE_BUFFER_MAX = 400
     TRACE_WIDGET_MAX = 250
@@ -3371,6 +3523,7 @@ class ChatPane(Vertical):
         has_real_usage = False
         summary_info: dict = {}
         self.state.turn_diffs = []
+        self.state.trajectory_turn += 1
         if not self.state.seen_first_turn_hint:
             self.state.seen_first_turn_hint = True
             self.notify(
@@ -3507,6 +3660,12 @@ class ChatPane(Vertical):
                 return detail
 
             detail = ""
+            if event_type == "step_record":
+                record = dict(payload.get("record") or {})
+                if record:
+                    record["turn"] = self.state.trajectory_turn
+                    self.state.trajectory.append(record)
+                return
             if event_type == "usage":
                 has_real_usage = True
                 turn_usage["prompt_tokens"] += int(payload.get("prompt_tokens") or 0)
@@ -3527,7 +3686,11 @@ class ChatPane(Vertical):
                     f" (first token {ttft / 1000:.1f}s)" if ttft is not None else ""
                 )
             elif event_type == "turn_done":
-                summary_info.update(payload)
+                self.state.last_transcript = {
+                    "system_prompt": payload.get("system_prompt"),
+                    "messages": payload.get("transcript"),
+                }
+                summary_info.update({k: v for k, v in payload.items() if k not in ("transcript", "system_prompt")})
                 detail = payload.get("message", "")
             elif event_type in {"tool_start", "tool_done", "tool_error"}:
                 tool = payload.get("tool", "")
@@ -3761,6 +3924,8 @@ class ChatPane(Vertical):
             "  /compact                    summarize the conversation to free context",
             "  /undo                       revert the file changes made in the last turn",
             "  /diff [on|off]              show the last turn's edits / toggle inline diffs",
+            "  /trajectory [copy|save|all] steps, tokens and tool results of the last turn (F10 copies the trace log)",
+            "  /tracking [on|off]          save session transcripts locally (asked once at first launch)",
             "  /new                        start a fresh conversation",
             "  /resume [id]                list saved sessions / reload one",
             "  /todos                      show the agent's task list",
@@ -3855,6 +4020,14 @@ class ChatPane(Vertical):
             self.state._session_store = SessionStore(WORKSPACE, Path(arg).stem)
             log.mount(SystemMessage(f"↻ Resumed {len(turns)} turn(s) from {arg}. New turns append to that session."))
             self._refresh_context_panel_safe()
+            return
+
+        if cmd == "/trajectory":
+            self._trajectory_command(arg, log)
+            return
+
+        if cmd == "/tracking":
+            self.set_tracking(arg or "status")
             return
 
         if cmd == "/diff":

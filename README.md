@@ -144,11 +144,12 @@ A high-performance terminal interface built with `Textual`, designed for daily-d
 - **Sub-agents.** The model can hand a self-contained task (`task`) to a sub-agent with its own fresh context; only its final report comes back, so broad exploration doesn't fill the main conversation. Read-only ("explore") sub-agents run in parallel, up to 3. General ones can edit and run commands but are sequential, cannot ask you questions or use your approval prompts, and can't spawn further sub-agents. They have a step cap and a timeout, and one `/undo` reverts their edits too.
 - **Background jobs.** `job_start` runs a dev server or watcher in the background (same approvals and sandbox as commands); `job_output` returns only new lines and can wait for output; `job_stop` ends the whole process tree. `/jobs` lists them, `/jobs stop <id|all>` stops them, the status line shows how many are running, and they are stopped when the app exits.
 - **Diffs.** Edits to existing files appear inline as a colored diff; `/diff` replays the last turn's edits in full and `/diff off` (or `show_diffs: false`) hides them.
+- **Trajectory.** `/trajectory` shows every model step of the last turn: time, first-token latency, prompt/output tokens, and each tool call with its result size, followed by plain-language findings (prompt growth, the largest results, repeated calls, how much time was the model thinking). `/trajectory copy` puts it on the clipboard, `save` writes JSON under `.motion/trajectories/` (`save full` also stores the system prompt and every message sent to the model). `F10` (or Ctrl+K → Copy trace log) copies the whole trace panel as plain text. Sub-agent steps appear labelled `sub:<name>`.
 - **Cost.** Per-turn and session cost are computed from real token usage and the model's pricing (`input_mtok` / `output_mtok`, USD per million tokens; the catalog has them for the Ollama Cloud models, set them in `config.yml` for others). Models without pricing show `cost n/a`; local models are free.
 
 #### 🤖 Headless mode
 
-`motion -p "prompt"` runs one turn with no UI, for scripts and CI. `--output-format text` (default) prints the answer; `json` prints one result object (answer, usage, cost, steps, timing); `stream-json` prints events as they happen and ends with that result. `--plan` is read-only, `--workspace DIR` picks the directory, `--verbose` prints tool activity to stderr, `-p -` reads the prompt from stdin and `--stdin` appends piped input as context (`git diff | motion -p "review this" --stdin`). Nothing can be approved interactively, so risky commands are refused unless pre-approved in `permissions.commands.allow`. Exit codes: 0 ok, 1 the turn failed, 2 usage error, 130 interrupted.
+`motion -p "prompt"` runs one turn with no UI, for scripts and CI. `--output-format text` (default) prints the answer; `json` prints one result object (answer, usage, cost, steps, timing and a per-step `trajectory`); `stream-json` prints events as they happen and ends with that result. `--plan` is read-only, `--workspace DIR` picks the directory, `--verbose` prints tool activity to stderr, `-p -` reads the prompt from stdin and `--stdin` appends piped input as context (`git diff | motion -p "review this" --stdin`). Nothing can be approved interactively, so risky commands are refused unless pre-approved in `permissions.commands.allow`. Exit codes: 0 ok, 1 the turn failed, 2 usage error, 130 interrupted.
 
 #### 🔐 Safety & permissions
 
@@ -193,6 +194,8 @@ Everything the harness writes into your project goes under one self-ignoring fol
 | `/undo` | Revert the file changes of the last turn |
 | `/diff [on\|off]` | Show the last turn's edits / toggle inline diffs |
 | `/jobs [stop <id\|all>]` | Background processes the agent started |
+| `/trajectory [copy\|save [full]\|all]` | Per-step time, tokens and tool results of the last turn, with where the cost went |
+| `/tracking [on\|off]` | Save session transcripts locally (asked once at first launch; this undoes "No thanks") |
 | `/new` | Start a fresh conversation |
 | `/resume [id]` | List saved sessions / reload one |
 | `/todos` | Show the agent's task list |
