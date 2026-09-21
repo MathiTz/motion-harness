@@ -137,7 +137,20 @@ def merge_catalog(user_providers: Dict[str, Any]) -> Dict[str, Any]:
             # Deep-merge: user options/models override catalog defaults.
             base = merged[pid]
             for key, value in cfg.items():
-                if isinstance(value, dict) and isinstance(base.get(key), dict):
+                if key == "models" and isinstance(value, dict) and isinstance(base.get(key), dict):
+                    # Merge per model: a user entry that only sets temperature /
+                    # max_tokens must not erase the catalog's context_window and
+                    # pricing for that model (a shallow merge did).
+                    models = dict(base[key])
+                    for name, opts in value.items():
+                        catalog_opts = models.get(name)
+                        models[name] = (
+                            {**catalog_opts, **opts}
+                            if isinstance(catalog_opts, dict) and isinstance(opts, dict)
+                            else opts
+                        )
+                    base[key] = models
+                elif isinstance(value, dict) and isinstance(base.get(key), dict):
                     base[key] = {**base[key], **value}
                 else:
                     base[key] = value

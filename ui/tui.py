@@ -66,6 +66,7 @@ from textual.widgets import (
 from core.config import ConfigManager
 from core.context import estimate_tokens
 from core.orchestrator import TaskManager, TaskRequest
+from core.pricing import format_cost, turn_cost
 from core.providers import ModelConfig
 from core.session import SessionStore, state_dir
 from core.skills import SkillLibrary, slugify
@@ -165,6 +166,7 @@ class AppState:
             "output_tokens_est": 0,
             "total_tokens_est": 0,
             "estimated_cost_usd": 0.0,
+            "unpriced_turns": 0,
         }
 
     def _build_mcp_manager(self):
@@ -2971,7 +2973,11 @@ class ChatPane(Vertical):
         turns = s.get("turns", 0)
         cost = s.get("estimated_cost_usd", 0.0)
         if isinstance(cost, (int, float)) and cost > 0:
-            cost_part = f"  [dim]·[/]  [$warning]${cost:.4f}[/]"
+            cost_part = f"  [dim]·[/]  [$warning]{format_cost(cost)}[/]"
+            if s.get("unpriced_turns"):
+                cost_part += f" [dim]+ {s['unpriced_turns']} unpriced[/]"
+        elif s.get("unpriced_turns"):
+            cost_part = "  [dim]·  cost n/a (model has no pricing; set input_mtok/output_mtok)[/]"
         else:
             cost_part = ""
         if self.state.busy:
@@ -2998,6 +3004,9 @@ class ChatPane(Vertical):
                 timing = f"[dim]last turn[/] {m['elapsed_s']:.1f}s"
                 if m.get("ttft_s") is not None:
                     timing += f" [dim](first token {m['ttft_s']:.1f}s)[/]"
+                last_cost = m.get("estimated_cost_usd")
+                if isinstance(last_cost, (int, float)) and last_cost > 0:
+                    timing += f" [$warning]{format_cost(last_cost)}[/]"
                 timing += "  [dim]·[/]  "
             status_text.update(
                 f"{timing}"
@@ -3611,7 +3620,12 @@ class ChatPane(Vertical):
                 est_prompt_tokens = max(1, len(prompt) // 4)
                 est_output_tokens = max(1, len(self.state.last_agent_response or "") // 4)
             provider_type = getattr(self.state.agent.provider.config, "provider_type", "")
-            est_cost_usd = 0.0 if provider_type == "local" else None
+            est_cost_usd = turn_cost(
+                provider_type,
+                getattr(self.state.agent.provider.config, "options", {}) or {},
+                est_prompt_tokens,
+                est_output_tokens,
+            )
             self.state.last_turn_metrics = {
                 "prompt_tokens_est": est_prompt_tokens,
                 "output_tokens_est": est_output_tokens,
@@ -3630,6 +3644,8 @@ class ChatPane(Vertical):
             session["total_tokens_est"] += est_prompt_tokens + est_output_tokens
             if isinstance(est_cost_usd, (int, float)):
                 session["estimated_cost_usd"] += float(est_cost_usd)
+            else:
+                session["unpriced_turns"] = session.get("unpriced_turns", 0) + 1
             # Record the turn for the context panel + rolling session context.
             recorded = display_prompt or prompt
             self.state.conversation_turns.append((recorded, self.state.last_agent_response))
