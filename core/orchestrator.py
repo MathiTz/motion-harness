@@ -10,7 +10,9 @@ from pathlib import Path
 import logging
 
 from core.providers import ModelConfig, ProviderFactory
-from main import MotionAgent, REPO_DIR
+from core.session import state_dir
+from core.toolstate import ToolSession
+from main import MotionAgent
 
 logger = logging.getLogger(__name__)
 
@@ -57,10 +59,20 @@ class TaskManager:
     Uses asyncio.Event per task for efficient notification instead of polling.
     Supports progress_callback for streaming status updates to the TUI.
     """
-    def __init__(self, default_model_config: ModelConfig, workspace_path: str):
+    def __init__(
+        self,
+        default_model_config: ModelConfig,
+        workspace_path: str,
+        mcp_manager: Any = None,
+        permissions_config: Optional[dict] = None,
+    ):
         self.default_config = default_model_config
         self.workspace_path = workspace_path
-        self.tasks_dir = os.path.join(self.workspace_path, "tasks")
+        self.mcp_manager = mcp_manager
+        self.permissions_config = permissions_config or {}
+        # Task transcripts live under <workspace>/.motion/ with the rest of the
+        # harness's state, not as a loose tasks/ folder in the user's project.
+        self.tasks_dir = str(state_dir(self.workspace_path, "tasks", create=False))
         
         # Hardware-aware concurrency: os.cpu_count() * 2
         self.max_workers = (os.cpu_count() or 1) * 2
@@ -69,10 +81,8 @@ class TaskManager:
         self.tasks: Dict[str, TaskStatus] = {}
         self._events: Dict[str, asyncio.Event] = {}
         self._progress_callbacks: Dict[str, List[Callable]] = {}
+        self._running: Dict[str, "asyncio.Task"] = {}
         self.active_count = 0
-
-        # Ensure tasks directory exists
-        os.makedirs(self.tasks_dir, exist_ok=True)
 
     async def spawn_task(
         self,
@@ -96,9 +106,19 @@ class TaskManager:
             self._progress_callbacks.setdefault(request.task_id, []).append(progress_callback)
         
         # Schedule execution without blocking the main loop
-        asyncio.create_task(self._execute_task(request, model_override))
-        
+        runner = asyncio.create_task(self._execute_task(request, model_override))
+        self._running[request.task_id] = runner
+        runner.add_done_callback(lambda _t, tid=request.task_id: self._running.pop(tid, None))
+
         return request.task_id
+
+    def cancel_task(self, task_id: str) -> bool:
+        """Cancel a queued or running task. Returns True if there was one."""
+        runner = self._running.get(task_id)
+        if runner is None or runner.done():
+            return False
+        runner.cancel()
+        return True
 
     async def wait_for_task(self, task_id: str, timeout: Optional[float] = None) -> TaskStatus:
         """Wait for a task to complete. Returns the final TaskStatus."""
@@ -140,7 +160,8 @@ class TaskManager:
         self.tasks[task_id].logs.append(f"[{ts}] {message}")
 
     def _save_artifact(self, task: TaskStatus) -> str:
-        """Save task conversation + result to tasks/{task_id}.md."""
+        """Save task conversation + result to .motion/tasks/{task_id}.md."""
+        state_dir(self.workspace_path, "tasks")
         os.makedirs(self.tasks_dir, exist_ok=True)
         path = os.path.join(self.tasks_dir, f"{task.task_id}.md")
         lines = [
@@ -176,6 +197,7 @@ class TaskManager:
 
     async def _execute_task(self, request: TaskRequest, model_override: Optional[ModelConfig] = None):
         task = self.tasks[request.task_id]
+        agent: Optional[MotionAgent] = None
 
         if self.semaphore.locked():
             self._log(request.task_id, f"Queued — {self.active_count}/{self.max_workers} workers busy")
@@ -186,39 +208,71 @@ class TaskManager:
             task.start_time = datetime.now()
             self._log(request.task_id, f"Started")
             await self._notify_progress(request.task_id)
-            
+
             try:
                 config = model_override or self.default_config
-                agent = MotionAgent(config, memory_path=os.path.join(REPO_DIR, f"memory_{request.task_id}.db"))
+                # Each task gets a private in-memory store: parallel tasks must
+                # not write to one shared SQLite file (or litter the repo with
+                # per-task database files).
+                agent = MotionAgent(config, memory_path=":memory:", mcp_manager=self.mcp_manager)
+                agent.permissions_config = self.permissions_config
 
                 # Record user turn
                 task.conversation.append({"role": "user", "content": request.prompt})
                 task.conversation.append({"role": "agent", "content": ""})
                 self._log(request.task_id, f"Running agent ({config.name})")
                 await self._notify_progress(request.task_id)
+
+                step_text = ""
+
                 async def on_stream_chunk(chunk: str) -> None:
+                    """Live view of the answer. Marker chunks (see
+                    core/agent_loop.py) are progress signals, not answer text."""
+                    nonlocal step_text
                     if not chunk:
                         return
-                    task.result = (task.result or "") + chunk
+                    if chunk.startswith("_delta_ "):
+                        step_text += chunk[8:]
+                        task.result = step_text
+                    elif chunk.startswith("_endstep_"):
+                        step_text = ""
+                        task.result = ""
+                    elif chunk.startswith("_tool_ "):
+                        self._log(request.task_id, chunk[len("_tool_ "):].strip())
+                        await self._notify_progress(request.task_id)
+                        return
+                    elif chunk.startswith(("_step_ ", "_think_ ", "_out_ ")):
+                        return
+                    else:
+                        task.result = (task.result or "") + chunk
                     if task.conversation and task.conversation[-1].get("role") == "agent":
-                        task.conversation[-1]["content"] = task.result
+                        task.conversation[-1]["content"] = task.result or ""
                     await self._notify_progress(request.task_id)
 
+                # No interactive callbacks: background tasks cannot prompt the
+                # user, so risky commands / private-network fetches / ask_user
+                # are refused rather than silently approved.
                 result = await agent.run(
                     request.prompt,
                     target="user",
                     on_stream_chunk=on_stream_chunk,
                     workspace=self.workspace_path,
                     agent_mode="build",
+                    session=ToolSession(),
                 )
-                
-                # Fallback for non-streaming providers
-                if result and not task.result:
+
+                # The return value is the authoritative final answer.
+                if result:
                     task.result = result
                     if task.conversation and task.conversation[-1].get("role") == "agent":
                         task.conversation[-1]["content"] = result
                 task.status = "COMPLETED"
                 self._log(request.task_id, f"Completed ({len(task.result or '')} chars)")
+            except asyncio.CancelledError:
+                task.status = "FAILED"
+                task.error = "cancelled"
+                self._log(request.task_id, "Cancelled")
+                raise
             except Exception as e:
                 task.error = str(e)
                 task.status = "FAILED"
@@ -229,17 +283,16 @@ class TaskManager:
             finally:
                 task.end_time = datetime.now()
                 self.active_count -= 1
-                # Clean up the per-task memory DB file (created above).
-                try:
-                    agent.memory.close()
-                except Exception:
-                    pass
-                try:
-                    db_path = os.path.join(REPO_DIR, f"memory_{request.task_id}.db")
-                    if os.path.exists(db_path):
-                        os.remove(db_path)
-                except Exception:
-                    pass
+                if agent is not None:
+                    # Release the HTTP client and the in-memory DB.
+                    try:
+                        await asyncio.wait_for(asyncio.shield(agent.provider.close()), timeout=2.0)
+                    except Exception:
+                        pass
+                    try:
+                        agent.memory.close()
+                    except Exception:
+                        pass
                 # Save artifact
                 try:
                     task.artifact_path = self._save_artifact(task)

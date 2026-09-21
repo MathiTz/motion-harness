@@ -69,7 +69,7 @@ async def test_task_manager_streaming_callbacks_and_artifact_path():
         assert final.status == "COMPLETED"
         assert final.result == "hello world"
         assert final.artifact_path is not None
-        assert final.artifact_path.startswith(os.path.join(workspace, "tasks") + os.sep)
+        assert final.artifact_path.startswith(os.path.join(workspace, ".motion", "tasks") + os.sep)
         assert os.path.exists(final.artifact_path)
         assert any(status == "RUNNING" for status, _, _ in updates)
         assert any(status == "COMPLETED" and has_result for status, has_result, _ in updates)

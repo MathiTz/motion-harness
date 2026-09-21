@@ -1,5 +1,6 @@
 import hashlib
 import os
+import re
 import asyncio
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
@@ -77,8 +78,10 @@ class SkillSynthesizer:
             skill_content = await self.provider.complete(synthesis_prompt, system_prompt="You are an expert in procedural knowledge extraction.")
             
             # Generate a filename based on the goal
-            skill_name = trajectory.prompt.replace(" ", "_").lower()[:30] + ".md"
-            file_path = os.path.join(self.skills_dir, skill_name)
+            # Slugified: prompts are free text and must never contain path
+            # separators (a prompt like "../../x" used to escape skills_dir).
+            slug = re.sub(r"[^a-z0-9_-]+", "", re.sub(r"\s+", "_", trajectory.prompt.strip().lower()))[:40] or "skill"
+            file_path = os.path.join(self.skills_dir, f"{slug}.md")
             
             with open(file_path, "w", encoding="utf-8") as f:
                 f.write(skill_content)
