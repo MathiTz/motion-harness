@@ -6,13 +6,19 @@
 # command so you can launch the TUI from anywhere with a single word.
 #
 # Usage:  ./install.sh [options]
-#   --shell fish|zsh|bash   configure this shell instead of auto-detecting
+#   --shell NAME            configure this shell instead of auto-detecting
+#   --link                  also symlink `motion` into a PATH directory (works in any shell)
 #   --shell-only            only (re)create the launcher + shell integration
 #   --no-shell              install everything except the shell integration
-#   --uninstall             remove the motion block from fish, zsh and bash configs
+#   --uninstall             remove what this installer added (shell blocks and the symlink)
 #   -h, --help              show this help
 #
-# Environment: MOTION_SHELL (same as --shell), MOTION_BIN_DIR (launcher dir).
+# Shells: fish, zsh, bash, ksh, tcsh and csh get a `motion` alias/function in their
+# config file. sh/dash, nushell, elvish, xonsh, PowerShell and anything unknown get a
+# symlink in ~/.local/bin instead (works in every shell) plus the PATH line to add.
+#
+# Environment: MOTION_SHELL (same as --shell), MOTION_BIN_DIR (launcher dir),
+# MOTION_LINK_DIR (where the symlink goes).
 # ──────────────────────────────────────────────────────────────────────────────
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
@@ -23,27 +29,48 @@ MARK_END="# motion-harness-end"
 usage() {
     cat << 'USAGE_EOF'
 Usage: ./install.sh [options]
-  --shell fish|zsh|bash   configure this shell instead of auto-detecting
+  --shell NAME            configure this shell instead of auto-detecting
+                          (fish zsh bash ksh tcsh csh sh dash nu elvish xonsh pwsh)
+  --link                  also symlink `motion` into a PATH directory (works in any shell)
   --shell-only            only (re)create the launcher + shell integration
   --no-shell              install everything except the shell integration
-  --uninstall             remove the motion block from fish, zsh and bash configs
+  --uninstall             remove what this installer added (shell blocks and the symlink)
   -h, --help              show this help
 
-Environment: MOTION_SHELL (same as --shell), MOTION_BIN_DIR (launcher directory).
+fish, zsh, bash, ksh, tcsh and csh get an alias/function in their config file. sh/dash,
+nushell, elvish, xonsh, PowerShell and unknown shells get a symlink in ~/.local/bin
+(works in every shell) and the PATH line to add if it isn't on PATH yet.
+
+Environment: MOTION_SHELL (same as --shell), MOTION_BIN_DIR (launcher directory),
+MOTION_LINK_DIR (symlink directory).
 USAGE_EOF
 }
 
 # ── shell detection ───────────────────────────────────────────────────────────
 
-# "-zsh", "/usr/bin/fish", "FISH" -> fish|zsh|bash, anything else -> "".
+# "-zsh", "/usr/bin/fish", "FISH", "ksh93", "dash", "nushell" -> a canonical name
+# (fish zsh bash ksh tcsh csh sh nu elvish xonsh pwsh); anything else -> "".
 normalize_shell() {
     local name
     name="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
     name="${name##*/}"
     name="${name#-}"
     case "$name" in
-        fish|zsh|bash) printf '%s' "$name" ;;
+        fish|zsh|bash|tcsh|csh|elvish|xonsh) printf '%s' "$name" ;;
+        ksh|ksh93|mksh|pdksh|oksh) printf 'ksh' ;;
+        sh|dash|ash|busybox) printf 'sh' ;;
+        nu|nushell) printf 'nu' ;;
+        pwsh|powershell) printf 'pwsh' ;;
         *) printf '' ;;
+    esac
+}
+
+# How we integrate: "block" = write an alias/function into the shell's config file;
+# "link" = symlink the launcher into a PATH directory (needs no shell-specific syntax).
+shell_method() {
+    case "$1" in
+        fish|zsh|bash|ksh|tcsh|csh) printf 'block' ;;
+        *) printf 'link' ;;
     esac
 }
 
@@ -77,7 +104,7 @@ detect_shell() {
     if [ -n "$requested" ]; then
         found="$(normalize_shell "$requested")"
         if [ -z "$found" ]; then
-            echo "❌ Unsupported shell '$requested' (supported: fish, zsh, bash)." >&2
+            echo "❌ Unsupported shell '$requested' (supported: fish zsh bash ksh tcsh csh sh dash nu elvish xonsh pwsh)." >&2
             return 2
         fi
         DETECTED_SHELL="$found"
@@ -104,6 +131,12 @@ rc_file_for() {
             # ~/.bash_profile and not ~/.bashrc.
             if [ "$(uname -s)" = "Darwin" ]; then printf '%s' "$HOME/.bash_profile"; else printf '%s' "$HOME/.bashrc"; fi
             ;;
+        ksh)  printf '%s' "${ENV:-$HOME/.kshrc}" ;;
+        tcsh)
+            # tcsh reads ~/.tcshrc, falling back to ~/.cshrc if that is all there is.
+            if [ ! -f "$HOME/.tcshrc" ] && [ -f "$HOME/.cshrc" ]; then printf '%s' "$HOME/.cshrc"; else printf '%s' "$HOME/.tcshrc"; fi
+            ;;
+        csh)  printf '%s' "$HOME/.cshrc" ;;
     esac
 }
 
@@ -113,6 +146,29 @@ rc_file_for() {
 sh_quote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 # Single-quote for fish: backslash and quote are escaped with a backslash.
 fish_quote() { printf "'%s'" "$(printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e "s/'/\\\\'/g")"; }
+
+# A "plain" path needs no quoting at all.
+plain_path() { case "$1" in *[!A-Za-z0-9_./+:@%,=-]*) return 1 ;; esac; return 0; }
+
+# The whole right-hand side of a bash/zsh/ksh alias for the launcher path.
+# An alias value is re-parsed every time it is used, so a path containing spaces or
+# quotes has to be quoted *inside* the value (alias motion='"/a b/c"' style), not just
+# when it is written. (Plain `alias motion='/a b/c'` expands to two words.)
+sh_alias_token() {
+    if plain_path "$1"; then sh_quote "$1"; else sh_quote "$(sh_quote "$1")"; fi
+}
+
+# Same for csh/tcsh: alias motion '"/a b/c"'. csh cannot escape ' inside '...', treats !
+# as history and still expands $ and backticks inside "...", so such paths return 1 and
+# the caller falls back to the PATH symlink.
+csh_quote() {
+    if plain_path "$1"; then printf "'%s'" "$1"; return 0; fi
+    case "$1" in
+        *"'"*|*'"'*|*'!'*|*'$'*|*'`'*|*'\\'*|*'
+'*) return 1 ;;
+    esac
+    printf "'\"%s\"'" "$1"
+}
 
 # 0 if every start marker is followed by exactly one end marker, in order.
 blocks_well_formed() {
@@ -154,6 +210,10 @@ remove_blocks() {
 
 install_shell_integration() {
     local shell_type="$1" config_file="$2"
+    if { [ "$shell_type" = tcsh ] || [ "$shell_type" = csh ]; } && ! csh_quote "$WRAPPER" > /dev/null; then
+        echo "⚠️  The launcher path contains a quote or '!', which $shell_type can't alias safely." >&2
+        return 3
+    fi
     mkdir -p "$(dirname "$config_file")"
     touch "$config_file"
     remove_blocks "$config_file" || return 1
@@ -165,16 +225,78 @@ install_shell_integration() {
     {
         echo ""
         echo "$MARK_START"
-        if [ "$shell_type" = "fish" ]; then
-            echo "function motion"
-            echo "    $(fish_quote "$WRAPPER") \$argv"
-            echo "end"
-        else
-            echo "alias motion=$(sh_quote "$WRAPPER")"
-        fi
+        case "$shell_type" in
+            fish)
+                echo "function motion"
+                echo "    $(fish_quote "$WRAPPER") \$argv"
+                echo "end" ;;
+            tcsh|csh) echo "alias motion $(csh_quote "$WRAPPER")" ;;
+            *)        echo "alias motion=$(sh_alias_token "$WRAPPER")" ;;
+        esac
         echo "$MARK_END"
     } >> "$config_file"
     echo "📝 Added the 'motion' command to $config_file"
+}
+
+on_path() { case ":$PATH:" in *":$1:"*) return 0 ;; *) return 1 ;; esac; }
+
+# Directory for the `motion` symlink: an existing user bin dir that is already on PATH,
+# else ~/.local/bin (created).
+pick_link_dir() {
+    local d
+    if [ -n "${MOTION_LINK_DIR:-}" ]; then printf '%s' "$MOTION_LINK_DIR"; return; fi
+    for d in "$HOME/.local/bin" "$HOME/bin" "$HOME/.bin"; do
+        if [ -d "$d" ] && on_path "$d"; then printf '%s' "$d"; return; fi
+    done
+    printf '%s' "$HOME/.local/bin"
+}
+
+# Symlink the launcher into a PATH directory. Never replaces something that isn't ours.
+install_link() {
+    local dir link current
+    dir="$(pick_link_dir)"
+    link="$dir/motion"
+    mkdir -p "$dir"
+    if [ -e "$link" ] || [ -L "$link" ]; then
+        current="$(readlink "$link" 2>/dev/null || true)"
+        if [ -L "$link" ] && { [ "$current" = "$WRAPPER" ] || [ ! -e "$link" ]; }; then
+            rm -f "$link"
+        else
+            echo "⚠️  $link already exists and is not this installer's link; leaving it alone." >&2
+            LINK_DIR="$dir"
+            return 3
+        fi
+    fi
+    ln -s "$WRAPPER" "$link"
+    LINK_DIR="$dir"
+    echo "🔗 Linked $link -> $WRAPPER"
+}
+
+# The line that puts a directory on PATH, in the given shell's syntax.
+path_line() {
+    local shell_type="$1" dir="$2"
+    case "$shell_type" in
+        fish)   echo "fish_add_path $dir" ;;
+        tcsh|csh) echo "set path = ($dir \$path)" ;;
+        nu)     echo "\$env.PATH = (\$env.PATH | prepend '$dir')" ;;
+        elvish) echo "set paths = [$dir \$@paths]" ;;
+        xonsh)  echo "\$PATH.insert(0, '$dir')" ;;
+        pwsh)   echo "\$env:PATH = \"$dir\" + [IO.Path]::PathSeparator + \$env:PATH" ;;
+        *)      echo "export PATH=\"$dir:\$PATH\"" ;;
+    esac
+}
+
+path_config_hint() {
+    case "$1" in
+        fish)   echo "~/.config/fish/config.fish" ;;
+        tcsh|csh) echo "~/.tcshrc or ~/.cshrc" ;;
+        nu)     echo "config.nu (run \`config nu\`)" ;;
+        elvish) echo "~/.config/elvish/rc.elv" ;;
+        xonsh)  echo "~/.xonshrc" ;;
+        pwsh)   echo "your PowerShell profile (\$PROFILE)" ;;
+        sh)     echo "~/.profile" ;;
+        *)      echo "your shell's startup file" ;;
+    esac
 }
 
 reload_hint() {
@@ -182,14 +304,19 @@ reload_hint() {
         fish) echo "source $(rc_file_for fish)     # or open a new terminal" ;;
         zsh)  echo "source $(rc_file_for zsh)" ;;
         bash) echo "source $(rc_file_for bash)" ;;
+        ksh)  echo ". $(rc_file_for ksh)" ;;
+        tcsh) echo "source $(rc_file_for tcsh)" ;;
+        csh)  echo "source $(rc_file_for csh)" ;;
+        *)    echo "open a new terminal" ;;
     esac
 }
 
 # ── main ──────────────────────────────────────────────────────────────────────
 
 do_uninstall() {
-    local removed=0 f
-    for f in "$(rc_file_for fish)" "$(rc_file_for zsh)" "$HOME/.bashrc" "$HOME/.bash_profile"; do
+    local removed=0 f dir link current wrapper
+    for f in "$(rc_file_for fish)" "$(rc_file_for zsh)" "$HOME/.bashrc" "$HOME/.bash_profile" \
+             "$(rc_file_for ksh)" "$HOME/.tcshrc" "$HOME/.cshrc"; do
         if [ -f "$f" ] && grep -q -F "$MARK_START" "$f" 2>/dev/null; then
             if remove_blocks "$f"; then
                 echo "🧹 Removed the motion block from $f"
@@ -197,17 +324,32 @@ do_uninstall() {
             fi
         fi
     done
-    [ "$removed" -eq 0 ] && echo "Nothing to remove: no motion block found in your shell configs."
+    # Remove our symlink (only ours: it must point at this launcher).
+    wrapper="${MOTION_BIN_DIR:-$REPO_DIR/bin}/motion"
+    for dir in "${MOTION_LINK_DIR:-}" "$HOME/.local/bin" "$HOME/bin" "$HOME/.bin"; do
+        [ -n "$dir" ] || continue
+        link="$dir/motion"
+        if [ -L "$link" ]; then
+            current="$(readlink "$link" 2>/dev/null || true)"
+            if [ "$current" = "$wrapper" ]; then
+                rm -f "$link"
+                echo "🧹 Removed the symlink $link"
+                removed=$((removed + 1))
+            fi
+        fi
+    done
+    [ "$removed" -eq 0 ] && echo "Nothing to remove: no motion block or symlink found."
     return 0
 }
 
 main() {
     set -e
-    local shell_arg="" shell_only=0 no_shell=0 uninstall=0
+    local shell_arg="" shell_only=0 no_shell=0 uninstall=0 want_link=0
     while [ $# -gt 0 ]; do
         case "$1" in
             --shell)      shell_arg="${2:-}"; [ -n "$shell_arg" ] || { echo "❌ --shell needs a value" >&2; return 2; }; shift 2 ;;
             --shell=*)    shell_arg="${1#--shell=}"; shift ;;
+            --link)       want_link=1; shift ;;
             --shell-only) shell_only=1; shift ;;
             --no-shell)   no_shell=1; shift ;;
             --uninstall)  uninstall=1; shift ;;
@@ -277,20 +419,44 @@ WRAPPER_EOF
     echo "✅ Launcher: $WRAPPER"
 
     # ── 5. Shell integration ──────────────────────────────────────────────────
-    local hint="source your shell config, or open a new terminal"
+    local hint="open a new terminal" method="" linked=0 note=""
     if [ "$no_shell" -eq 1 ]; then
         echo "⏭  Skipping shell integration. Run $WRAPPER directly, or add an alias yourself."
     else
         detect_shell "$shell_arg" || return $?
         if [ -z "$DETECTED_SHELL" ]; then
-            echo "⚠️  Could not tell which shell you use."
-            echo "   Re-run with --shell fish|zsh|bash, or add this yourself:"
-            echo "   alias motion=$(sh_quote "$WRAPPER")"
+            echo "🐚 Could not tell which shell you use: falling back to a PATH symlink, which works in any shell."
+            method="link"
         else
             echo "🐚 Shell: $DETECTED_SHELL ($DETECT_REASON)"
-            install_shell_integration "$DETECTED_SHELL" "$(rc_file_for "$DETECTED_SHELL")"
-            hint="$(reload_hint "$DETECTED_SHELL")"
-            echo "   Wrong shell? Re-run with --shell fish|zsh|bash (and --uninstall removes the block)."
+            method="$(shell_method "$DETECTED_SHELL")"
+        fi
+
+        if [ "$method" = "block" ]; then
+            local rc rc_status=0
+            rc="$(rc_file_for "$DETECTED_SHELL")"
+            install_shell_integration "$DETECTED_SHELL" "$rc" || rc_status=$?
+            if [ "$rc_status" -eq 0 ]; then
+                hint="$(reload_hint "$DETECTED_SHELL")"
+                echo "   Wrong shell? Re-run with --shell NAME (and --uninstall removes what was added)."
+            elif [ "$rc_status" -eq 3 ]; then
+                method="link"           # e.g. csh can't quote this path: use the symlink instead
+            else
+                return "$rc_status"
+            fi
+        fi
+
+        if [ "$method" = "link" ] || [ "$want_link" -eq 1 ]; then
+            install_link && linked=1 || true
+            if [ "$linked" -eq 1 ]; then
+                if on_path "$LINK_DIR"; then
+                    [ "$method" = "link" ] && hint="open a new terminal (or just run: motion)"
+                else
+                    note="Add $LINK_DIR to your PATH — put this in $(path_config_hint "${DETECTED_SHELL:-sh}"):
+       $(path_line "${DETECTED_SHELL:-sh}" "$LINK_DIR")"
+                    [ "$method" = "link" ] && hint="add $LINK_DIR to PATH (see below), then open a new terminal"
+                fi
+            fi
         fi
     fi
 
@@ -304,6 +470,8 @@ WRAPPER_EOF
     echo "     motion --provider ollama-cloud/glm-5.2    # With specific model"
     echo "     motion -p \"summarize README.md\"           # Headless one-shot"
     echo "     motion --list                             # List providers"
+    echo ""
+    [ -n "$note" ] && printf '\n   %s\n' "$note"
     echo ""
     echo "   Config: $REPO_DIR/config.yml"
     echo "   Venv:   $VENV_DIR"

@@ -88,17 +88,22 @@ def test_falls_back_to_the_login_shell_then_to_nothing(home, tmp_path):
     shell, reason, _ = detect(home, tmp_path, ["python3", "sudo", "login"], login="/bin/zsh")
     assert shell == "zsh" and "login shell" in reason
     assert detect(home, tmp_path, ["python3"], login="")[0] == ""
-    assert detect(home, tmp_path, ["python3"], login="/bin/tcsh")[0] == ""            # unsupported => ask the user
+    assert detect(home, tmp_path, ["python3"], login="/usr/sbin/nologin")[0] == ""    # unknown => PATH symlink fallback
 
 
 def test_explicit_choice_wins_and_bad_values_are_rejected(home, tmp_path):
     assert detect(home, tmp_path, ["fish"], arg="zsh")[0] == "zsh"
     assert fn(f'{FAKE_PS}\ndetect_shell; echo $DETECTED_SHELL', home, tmp_path, C1="fish", MOTION_SHELL="bash").stdout.strip() == "bash"
-    r = install(home, tmp_path, "--shell", "tcsh")
+    r = install(home, tmp_path, "--shell", "weirdsh")
     assert r.returncode == 2 and "Unsupported shell" in r.stderr
 
 
-@pytest.mark.parametrize("raw,expected", [("-zsh", "zsh"), ("/usr/bin/FISH", "fish"), ("bash", "bash"), ("sh", ""), ("", ""), ("-tcsh", "")])
+@pytest.mark.parametrize("raw,expected", [
+    ("-zsh", "zsh"), ("/usr/bin/FISH", "fish"), ("bash", "bash"), ("", ""), ("-nologin", ""), ("weirdsh", ""),
+    ("sh", "sh"), ("dash", "sh"), ("/bin/ash", "sh"), ("ksh", "ksh"), ("ksh93", "ksh"), ("mksh", "ksh"),
+    ("-tcsh", "tcsh"), ("csh", "csh"), ("nu", "nu"), ("nushell", "nu"), ("elvish", "elvish"),
+    ("xonsh", "xonsh"), ("pwsh", "pwsh"), ("PowerShell", "pwsh"),
+])
 def test_normalize_shell(home, tmp_path, raw, expected):
     assert fn(f'normalize_shell "{raw}"', home, tmp_path).stdout == expected
 
@@ -248,7 +253,7 @@ def test_the_closing_hint_names_the_right_file_for_the_shell(home, tmp_path):
 
 def test_unknown_shell_and_options_are_handled(home, tmp_path):
     r = subprocess.run(["bash", str(INSTALL), "--shell-only"], capture_output=True, text=True,
-                       env=env_for(home, tmp_path, SHELL="/bin/tcsh"), cwd=str(tmp_path), timeout=30)
+                       env=env_for(home, tmp_path, SHELL="/usr/sbin/nologin"), cwd=str(tmp_path), timeout=30)
     # (only meaningful when no ancestor is a supported shell; either outcome must not crash)
     assert r.returncode == 0
     bad = install(home, tmp_path, "--bogus")
@@ -281,3 +286,201 @@ def test_uninstall_removes_the_block_from_every_shell_and_keeps_the_rest(home, t
     again = subprocess.run(["bash", str(INSTALL), "--uninstall"], capture_output=True, text=True,
                            env=env_for(home, tmp_path), timeout=30)
     assert "Nothing to remove" in again.stdout
+
+
+# ═══ every shell ════════════════════════════════════════════════════════════
+# Each shell that gets an alias/function block: install, replace the launcher with a stub that
+# echoes its arguments, then run the *real shell* on a script that sources the config and calls `motion`.
+
+BLOCK_SHELLS = {
+    # name: (executable, rc file, extra flags to skip the user's own config, script template)
+    "bash": ("bash", BASH_RC, [], 'shopt -s expand_aliases\n. {rc}\nmotion a "b c"\n'),
+    "zsh":  ("zsh", ".zshrc", ["-f"], 'source {rc}\nmotion a "b c"\n'),
+    "ksh":  ("ksh", ".kshrc", [], '. {rc}\nmotion a "b c"\n'),
+    "tcsh": ("tcsh", ".tcshrc", ["-f"], 'source {rc}\nmotion a "b c"\n'),
+    "csh":  ("csh", ".cshrc", ["-f"], 'source {rc}\nmotion a "b c"\n'),
+    "fish": ("fish", ".config/fish/config.fish", ["--no-config"], 'source {rc}\nmotion a "b c"\n'),
+}
+
+
+def stub_launcher(tmp_path, bin_dir=None):
+    launcher = Path(bin_dir or tmp_path / "bin") / "motion"
+    launcher.write_text('#!/bin/sh\necho "ARGS:$*"\n')
+    launcher.chmod(0o755)
+
+
+def run_in_shell(name, rc: Path, tmp_path, home):
+    exe, _, flags, template = BLOCK_SHELLS[name]
+    script = tmp_path / f"probe.{name}"
+    script.write_text(template.format(rc=rc))
+    return subprocess.run([shutil.which(exe), *flags, str(script)], capture_output=True, text=True,
+                          env={**os.environ, "HOME": str(home)}, timeout=30)
+
+
+@pytest.mark.parametrize("name", list(BLOCK_SHELLS))
+def test_motion_actually_runs_in_each_real_shell(home, tmp_path, name):
+    if not shutil.which(BLOCK_SHELLS[name][0]):
+        pytest.skip(f"{name} not installed")
+    r = install(home, tmp_path, "--shell", name)
+    assert r.returncode == 0, r.stderr
+    rc = home / BLOCK_SHELLS[name][1]
+    assert count(rc) == 1 and count(rc, END) == 1
+    stub_launcher(tmp_path)
+    out = run_in_shell(name, rc, tmp_path, home)
+    assert out.stdout.strip() == "ARGS:a b c", (out.stdout, out.stderr)      # arguments survive intact, spaces included
+
+
+@pytest.mark.parametrize("name", list(BLOCK_SHELLS))
+def test_launcher_paths_with_spaces_work_in_each_shell(home, tmp_path, name):
+    if not shutil.which(BLOCK_SHELLS[name][0]):
+        pytest.skip(f"{name} not installed")
+    bin_dir = tmp_path / "my launcher dir"
+    assert install(home, tmp_path, "--shell", name, MOTION_BIN_DIR=str(bin_dir)).returncode == 0
+    stub_launcher(tmp_path, bin_dir)
+    out = run_in_shell(name, home / BLOCK_SHELLS[name][1], tmp_path, home)
+    assert out.stdout.strip() == "ARGS:a b c", (out.stdout, out.stderr)
+
+
+@pytest.mark.parametrize("name", ["bash", "zsh", "ksh", "fish"])
+def test_launcher_paths_with_apostrophes_work_where_the_shell_can_quote_them(home, tmp_path, name):
+    if not shutil.which(BLOCK_SHELLS[name][0]):
+        pytest.skip(f"{name} not installed")
+    bin_dir = tmp_path / "it's a dir"
+    assert install(home, tmp_path, "--shell", name, MOTION_BIN_DIR=str(bin_dir)).returncode == 0
+    stub_launcher(tmp_path, bin_dir)
+    out = run_in_shell(name, home / BLOCK_SHELLS[name][1], tmp_path, home)
+    assert out.stdout.strip() == "ARGS:a b c", (out.stdout, out.stderr)
+
+
+@pytest.mark.parametrize("name", ["tcsh", "csh"])
+def test_csh_family_falls_back_to_the_symlink_for_paths_it_cannot_quote(home, tmp_path, name):
+    """csh has no way to escape ' inside '...' (and treats ! as history), so it must not write a broken alias."""
+    bin_dir = tmp_path / "it's a dir"
+    link_dir = tmp_path / "linkbin"
+    r = install(home, tmp_path, "--shell", name, MOTION_BIN_DIR=str(bin_dir), MOTION_LINK_DIR=str(link_dir))
+    assert r.returncode == 0 and "can't alias safely" in r.stderr
+    assert not (home / BLOCK_SHELLS[name][1]).exists() or count(home / BLOCK_SHELLS[name][1]) == 0
+    assert (link_dir / "motion").is_symlink() and os.readlink(link_dir / "motion") == str(bin_dir / "motion")
+
+
+def test_tcsh_uses_cshrc_when_that_is_all_the_user_has(home, tmp_path):
+    (home / ".cshrc").write_text("set x = 1\n")
+    assert fn("rc_file_for tcsh", home, tmp_path).stdout == f"{home}/.cshrc"
+    (home / ".tcshrc").write_text("set y = 2\n")
+    assert fn("rc_file_for tcsh", home, tmp_path).stdout == f"{home}/.tcshrc"
+    assert fn("csh_quote /a/b/c", home, tmp_path).stdout == "'/a/b/c'"                # plain: no inner quoting
+    assert fn("csh_quote \"/a b/c\"", home, tmp_path).stdout == "'\"/a b/c\"'"          # spaces: quoted inside the value
+    assert fn("csh_quote \"it's\"; echo rc=$?", home, tmp_path).stdout.strip() == "rc=1"
+    for bad in ("a!b", 'a"b', "a$b", "a`b", "a\\\\b"):
+        assert fn(f"csh_quote '{bad}'; echo rc=$?", home, tmp_path).stdout.strip() == "rc=1", bad
+
+
+@pytest.mark.parametrize("name", ["bash", "tcsh", "ksh"])
+def test_rerunning_and_cleaning_up_stale_blocks_work_for_every_block_shell(home, tmp_path, name):
+    rc = home / BLOCK_SHELLS[name][1]
+    rc.parent.mkdir(parents=True, exist_ok=True)
+    rc.write_text(f"# mine\n\n{START}\nalias motion=STALE\n{END}\n\n{START}\nalias motion=STALE\n{END}\n# also mine\n")
+    for _ in range(3):
+        assert install(home, tmp_path, "--shell", name).returncode == 0
+    text = rc.read_text()
+    assert count(rc) == 1 and "STALE" not in text and text.startswith("# mine\n") and "# also mine\n" in text
+
+
+# ── shells that use the PATH symlink ────────────────────────────────────────
+
+LINK_SHELLS = {
+    "sh":     "export PATH=",
+    "dash":   "export PATH=",
+    "nu":     "$env.PATH = ($env.PATH | prepend",
+    "elvish": "set paths = [",
+    "xonsh":  "$PATH.insert(0,",
+    "pwsh":   "$env:PATH =",
+}
+
+
+@pytest.mark.parametrize("name", list(LINK_SHELLS))
+def test_link_shells_get_a_symlink_and_the_right_path_line(home, tmp_path, name):
+    link_dir = tmp_path / "linkbin"
+    r = install(home, tmp_path, "--shell", name, MOTION_LINK_DIR=str(link_dir))
+    assert r.returncode == 0, r.stderr
+    assert (link_dir / "motion").is_symlink() and os.readlink(link_dir / "motion") == str(tmp_path / "bin" / "motion")
+    assert not any(home.iterdir())                                        # no shell config was touched at all
+    assert "Add " in r.stdout and LINK_SHELLS[name] in r.stdout and str(link_dir) in r.stdout   # PATH line in that shell's syntax
+    # ...and none of it is needed when the directory is already on PATH:
+    on_path = install(home, tmp_path, "--shell", name, MOTION_LINK_DIR=str(link_dir), PATH=f"{link_dir}:{os.environ['PATH']}")
+    assert "to your PATH" not in on_path.stdout and "Linked" in on_path.stdout
+
+
+@pytest.mark.parametrize("exe", ["sh", "dash"])
+def test_motion_runs_in_real_posix_shells_through_the_symlink(home, tmp_path, exe):
+    if not shutil.which(exe):
+        pytest.skip(f"{exe} not installed")
+    link_dir = tmp_path / "linkbin"
+    assert install(home, tmp_path, "--shell", "sh", MOTION_LINK_DIR=str(link_dir)).returncode == 0
+    stub_launcher(tmp_path)
+    out = subprocess.run([shutil.which(exe), "-c", 'motion a "b c"'], capture_output=True, text=True,
+                         env={**os.environ, "PATH": f"{link_dir}:{os.environ['PATH']}", "HOME": str(home)}, timeout=30)
+    assert out.stdout.strip() == "ARGS:a b c", (out.stdout, out.stderr)
+
+
+def test_link_flag_adds_the_symlink_alongside_the_alias(home, tmp_path):
+    link_dir = tmp_path / "linkbin"
+    assert install(home, tmp_path, "--shell", "bash", "--link", MOTION_LINK_DIR=str(link_dir)).returncode == 0
+    assert count(home / BASH_RC) == 1 and (link_dir / "motion").is_symlink()
+
+
+def test_an_existing_unrelated_motion_is_never_overwritten(home, tmp_path):
+    link_dir = tmp_path / "linkbin"
+    link_dir.mkdir()
+    foreign = link_dir / "motion"
+    foreign.write_text("#!/bin/sh\necho someone else's tool\n")
+    r = install(home, tmp_path, "--shell", "sh", MOTION_LINK_DIR=str(link_dir))
+    assert r.returncode == 0 and "not this installer's link" in r.stderr
+    assert foreign.read_text() == "#!/bin/sh\necho someone else's tool\n" and not foreign.is_symlink()
+
+
+def test_a_stale_link_from_a_previous_install_is_replaced(home, tmp_path):
+    link_dir = tmp_path / "linkbin"
+    assert install(home, tmp_path, "--shell", "sh", MOTION_LINK_DIR=str(link_dir)).returncode == 0
+    (tmp_path / "bin" / "motion").unlink()                                    # launcher removed: the link is now dead
+    assert install(home, tmp_path, "--shell", "sh", MOTION_LINK_DIR=str(link_dir)).returncode == 0
+    assert (link_dir / "motion").is_symlink() and (link_dir / "motion").exists()
+
+
+def test_undetectable_shells_fall_back_to_the_symlink(home, tmp_path):
+    link_dir = tmp_path / "linkbin"
+    r = fn(f'{FAKE_PS}\nmain --shell-only', home, tmp_path, C1="python3", C2="make", C3="login",
+           SHELL="/usr/sbin/nologin", MOTION_LINK_DIR=str(link_dir))
+    assert r.returncode == 0, r.stderr
+    assert "Could not tell which shell you use" in r.stdout and (link_dir / "motion").is_symlink()
+    assert not any(home.iterdir())
+
+
+def test_uninstall_removes_every_kind_of_install_but_only_ours(home, tmp_path):
+    link_dir = tmp_path / "linkbin"
+    kept = {}
+    for name in ("ksh", "tcsh", "bash"):
+        rc = home / BLOCK_SHELLS[name][1]
+        kept[rc] = f"# my {name} stuff\n"
+        rc.write_text(kept[rc])
+        assert install(home, tmp_path, "--shell", name).returncode == 0
+    assert install(home, tmp_path, "--shell", "sh", MOTION_LINK_DIR=str(link_dir)).returncode == 0
+    r = subprocess.run(["bash", str(INSTALL), "--uninstall"], capture_output=True, text=True,
+                       env=env_for(home, tmp_path, MOTION_LINK_DIR=str(link_dir)), timeout=30)
+    assert r.returncode == 0 and "Removed the symlink" in r.stdout
+    assert not (link_dir / "motion").exists() and not (link_dir / "motion").is_symlink()
+    for rc, content in kept.items():
+        assert rc.read_text() == content
+    # a symlink that is NOT ours survives uninstall
+    other = tmp_path / "other_motion"
+    other.write_text("x")
+    (link_dir / "motion").symlink_to(other)
+    subprocess.run(["bash", str(INSTALL), "--uninstall"], capture_output=True, text=True,
+                   env=env_for(home, tmp_path, MOTION_LINK_DIR=str(link_dir)), timeout=30)
+    assert (link_dir / "motion").is_symlink() and os.readlink(link_dir / "motion") == str(other)
+
+
+def test_the_installer_documents_all_supported_shells(home, tmp_path):
+    out = subprocess.run(["bash", str(INSTALL), "--help"], capture_output=True, text=True).stdout
+    for word in ("fish", "zsh", "bash", "ksh", "tcsh", "csh", "sh", "nu", "elvish", "xonsh", "pwsh", "--link", "--uninstall"):
+        assert word in out
