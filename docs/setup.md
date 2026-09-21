@@ -69,3 +69,20 @@ brew install sqlite
 
 ### TUI Rendering Issues
 If the interface looks distorted, ensure your terminal is set to a compatible font (e.g., Nerd Fonts) and that the window size is at least 80x24.
+
+---
+
+## 🐚 Shell integration (`install.sh`)
+
+The installer adds a `motion` command to **the shell you ran it from** (fish → `config.fish`, zsh → `.zshrc`, bash → `.bashrc`, or `.bash_profile` on macOS), not merely your login shell: `$SHELL` is only the login shell, so a fish session started from a bash login used to get the alias in the wrong file.
+
+```bash
+./install.sh                    # auto-detect (prints which shell it chose, and why)
+./install.sh --shell fish       # or zsh / bash: choose explicitly
+./install.sh --shell-only       # re-create just the launcher + shell block (no venv / pip)
+./install.sh --no-shell         # install everything except the shell block
+./install.sh --uninstall        # remove the block from fish, zsh and bash configs
+```
+
+The block sits between `# motion-harness-start` and `# motion-harness-end`. Re-running replaces it (never duplicates it), your own lines are left untouched, and a config that is a symlink into a dotfiles repo stays a symlink. If the markers in a file are unbalanced the installer refuses to edit it. Don't `source` a bash config from fish: fish can't parse it; use `source ~/.config/fish/config.fish` or open a new terminal.
+
