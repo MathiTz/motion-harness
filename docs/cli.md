@@ -111,6 +111,14 @@ The JSON result has `ok`, `result`, `error`, `provider`, `model`, `mode`, `steps
 ## config.yml reference (optional keys)
 
 ```yaml
+hooks:                       # your commands around tool calls (JSON on stdin; see README)
+  pre_tool:                  # non-zero exit blocks the call and tells the model why
+    - match: "write_file|replace_in_file|edit_files"   # regex on the tool name
+      command: "./scripts/guard.sh"
+      timeout: 10
+  post_tool:                 # output is appended to the tool result
+    - match: "write_file|replace_in_file|edit_files"
+      command: "ruff format . >/dev/null; echo formatted"
 budget:                      # per-turn limits, all optional
   max_steps: 12              # model calls
   max_tokens: 150000         # prompt + completion

@@ -225,13 +225,9 @@ class AppState:
         agent = MotionAgent(model_config, mcp_manager=self.mcp_manager)
         agent.auto_skill_synthesis = self.auto_synthesis_enabled
         agent.permissions_config = self.config_manager.data
-        from core.sandbox import sandbox_settings
+        from core.agent_config import configure_agent
 
-        from core.budget import Budget
-
-        agent.budget = Budget.from_config(self.config_manager.get)
-        agent.sandbox_options = sandbox_settings(self.config_manager.get)
-        agent.sandbox_mode = agent.sandbox_options["mode"]
+        configure_agent(agent, self.config_manager.get)
         agent.auto_remember = bool(self.config_manager.get("remember_turns", True))
         try:
             agent.recall_timeout = float(self.config_manager.get("recall_timeout", 2.0))
@@ -3367,6 +3363,9 @@ class ChatPane(Vertical):
         "subagent_start": "🧩 subagent.start",
         "subagent_done": "🧩 subagent.done",
         "exploration_nudge": "💡 nudge",
+        "budget_hit": "⏱ budget.hit",
+        "hook_blocked": "🪝 hook.blocked",
+        "hook_output": "🪝 hook.output",
     }
     TRACE_BUFFER_MAX = 400
     TRACE_WIDGET_MAX = 250

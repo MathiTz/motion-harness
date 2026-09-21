@@ -66,6 +66,11 @@ embedding:
   dimension: 128
 
 # ── Optional behaviour (all keys below are optional) ─────────────────────────
+# hooks:                       # your commands around tool calls
+#   pre_tool:                  # non-zero exit blocks the call
+#     - {match: "write_file|edit_files", command: "./scripts/guard.sh", timeout: 10}
+#   post_tool:
+#     - {match: "write_file|edit_files", command: "ruff format ."}
 # budget:                      # per-turn limits (all optional)
 #   max_steps: 12
 #   max_tokens: 150000

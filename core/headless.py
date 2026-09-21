@@ -61,13 +61,9 @@ def build_agent(provider_id: Optional[str]):
         mcp = MCPManager(servers)
     agent = MotionAgent(model_config, mcp_manager=mcp)
     agent.permissions_config = cm.data
-    from core.sandbox import sandbox_settings
+    from core.agent_config import configure_agent
 
-    from core.budget import Budget
-
-    agent.budget = Budget.from_config(cm.get)
-    agent.sandbox_options = sandbox_settings(cm.get)
-    agent.sandbox_mode = agent.sandbox_options["mode"]
+    configure_agent(agent, cm.get)
     # One-shot runs (often in CI) shouldn't write to the long-term memory DB
     # unless the user opts in explicitly.
     agent.auto_remember = bool(cm.get("remember_turns_headless", False))

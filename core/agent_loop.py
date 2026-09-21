@@ -539,6 +539,14 @@ class TurnRunner:
                 ),
             )
 
+        hooks = getattr(self.agent, "hooks", None)
+        if hooks:
+            verdict = await hooks.run("pre_tool", name, arguments, self.workspace)
+            if verdict.blocked:
+                await self.trace("hook_blocked", f"pre_tool hook blocked {name}: {verdict.output[:160]}", tool=name)
+                text = await self._fail(name, WorkspaceToolError(f"blocked by a pre_tool hook: {verdict.output}"), "")
+                return Outcome(text, failed=True)
+
         path = str(arguments.get("path", "") or "").strip()
         tools = self.tools
         assert tools is not None
@@ -574,6 +582,12 @@ class TurnRunner:
             except Exception as exc:
                 return Outcome(await self._fail(name, exc, path), failed=True)
             break
+
+        if hooks and name != "task":
+            after = await hooks.run("post_tool", name, arguments, self.workspace, result=result)
+            if after.output:
+                result["hook_output"] = after.output
+                await self.trace("hook_output", f"post_tool hook after {name}: {after.output[:160]}", tool=name)
 
         path = str(result.get("path") or path or "").strip()
         operation, stream_text = self._describe(name, arguments, result, path)
@@ -611,6 +625,11 @@ class TurnRunner:
         if name == "write_file":
             delta = f", +{result.get('lines_added', 0)} −{result.get('lines_removed', 0)}" if "lines_added" in result else ""
             return f"wrote `{path}`", f"wrote `{path}` ({result.get('bytes_written', 0)} bytes{delta})"
+        if name == "edit_files":
+            names = ", ".join(f"`{f['path']}`" for f in result.get("files", [])[:4])
+            more = f" +{len(result['files']) - 4} more" if len(result.get("files", [])) > 4 else ""
+            op = f"edited {len(result.get('files', []))} file(s): {names}{more} ({result.get('edits', 0)} edits)"
+            return op, op + f" (+{result.get('lines_added', 0)} −{result.get('lines_removed', 0)})"
         if name == "replace_in_file":
             op = f"updated `{path}`"
             delta = f" (+{result.get('lines_added', 0)} −{result.get('lines_removed', 0)})" if "lines_added" in result else ""

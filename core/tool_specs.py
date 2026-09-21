@@ -165,6 +165,20 @@ TOOL_SPECS: List[ToolSpec] = [
         "write",
     ),
     ToolSpec(
+        "edit_files",
+        "Make several exact-text replacements across one or more files in ONE call, all-or-nothing: if any "
+        "edit cannot be applied (text missing or ambiguous) nothing is written. Prefer this over repeated "
+        "replace_in_file calls for a change that touches several files.",
+        _obj(
+            {"edits": {"type": "array", "description": "edits applied in order",
+                       "items": _obj({"path": _S, "old": _s("exact text to replace"), "new": _s("replacement text"),
+                                      "replace_all": {"type": "boolean"}}, ["path", "old", "new"])}},
+            ["edits"],
+        ),
+        '{"edits": [{"path": "a.py", "old": "foo(", "new": "bar("}, {"path": "b.py", "old": "import foo", "new": "import bar"}]}',
+        "write",
+    ),
+    ToolSpec(
         "run_command",
         "Run a shell command in the workspace root. Returns exit_code, stdout, stderr. Risky commands need user approval.",
         _obj({"command": _S, "timeout": {"type": "number", "description": "seconds (default 120, max 600)"}}, ["command"]),
