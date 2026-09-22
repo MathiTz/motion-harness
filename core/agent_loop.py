@@ -234,7 +234,6 @@ class TurnRunner:
         self.turn_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         self._pending_images: List[Dict[str, str]] = []
         self.tool_call_count = 0
-        self.no_tools = False  # set for the final, budget-forced answer
         self.first_ttft: Optional[float] = None
         self.trajectory: List[Dict[str, Any]] = []
 
@@ -409,7 +408,9 @@ class TurnRunner:
             return StepResult(text=text or "", usage=usage)
 
         res = StepResult()
-        tools_arg = self.tools.tool_schemas() if self.mode == "native" and not self.no_tools else None  # type: ignore[union-attr]
+        # Tools stay declared even on the budget wrap-up step: Anthropic rejects a request whose history contains
+        # tool_use blocks but declares no tools. A tool call the model makes anyway is ignored (see run()).
+        tools_arg = self.tools.tool_schemas() if self.mode == "native" else None  # type: ignore[union-attr]
         tag_filter = _ToolTagFilter() if self.mode == "xml" else None
         started = time.monotonic()
         async for ev in provider.chat_stream(self.messages, system_prompt=self.system_prompt, tools=tools_arg):
@@ -882,7 +883,7 @@ class TurnRunner:
                     provider_type=getattr(pcfg, "provider_type", "cloud"), options=getattr(pcfg, "options", {}) or {},
                 )
                 if reason:
-                    wrapping_up, self.no_tools, budget_reason = True, True, reason
+                    wrapping_up, budget_reason = True, reason
                     self.messages.append({"role": "user", "content": BUDGET_WRAPUP.format(reason=reason)})
                     await self.trace("budget_hit", f"Budget reached: {reason}", reason=reason)
             trim_old_tool_results(self.messages)

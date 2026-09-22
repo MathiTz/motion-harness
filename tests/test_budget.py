@@ -60,7 +60,7 @@ async def test_step_budget_forces_a_final_tool_free_answer(tmp_path: Path):
     assert resp.startswith("Best answer from what I read.") and "Stopped early" in resp and "3 model steps" in resp
     assert len(provider.requests) == 4                                       # 3 working steps + the wrap-up, not 9
     last = provider.requests[-1]
-    assert not last["tools"]                                                 # the wrap-up cannot call tools
+    assert last["tools"]                     # still declared: Anthropic rejects tool_use history without tools; calls are ignored
     assert "Budget reached: 3 model steps" in str(last["messages"][-1]["content"])
     assert [r for s, r in traces if s == "budget_hit"][0]["reason"].startswith("3 model steps")
 
