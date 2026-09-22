@@ -138,6 +138,10 @@ default_agent_mode: plan     # plan (discuss first, read-only) | build (can writ
 remember_turns: true         # store substantive turns in memory for later recall
 recall_timeout: 2.0          # seconds a memory lookup may delay a turn
 
+# CLI delegates (Claude Code / Codex, run via the login already on this machine) need no config
+# beyond having `claude`/`codex` installed and logged in; they then appear in the model picker
+# automatically. See README's "Use Claude Code or Codex directly".
+
 permissions:
   commands:                  # shell-style globs, matched per part of a compound command (see below)
     allow: ["git push origin feature/*"]

@@ -216,7 +216,36 @@ class ConfigManager:
         if cfg.get("provider_type") == "local":
             return True
 
+        # CLI delegates (Claude Code / Codex via the login already on this machine) don't take a key
+        # either - "usable" means the binary is on PATH. See core/cli_delegate.py.
+        if cfg.get("provider_type") == "cli":
+            from core.cli_delegate import DELEGATE_CATALOG
+
+            models = cfg.get("models") or {}
+            delegate = next(iter(models.values()), {}).get("delegate", "") if models else ""
+            checker = DELEGATE_CATALOG.get(delegate)
+            return bool(checker and checker())
+
         return False
+
+    def unavailable_reason(self, provider_id: str) -> str:
+        """Empty string if the provider is usable; otherwise a short, specific reason plus how to fix
+        it - shown in the model picker instead of the provider just silently not appearing there."""
+        if self.has_api_key(provider_id):
+            return ""
+        base_id = provider_id.split('/', 1)[0]
+        cfg = (self.data.get("providers", {})).get(base_id, {})
+        if cfg.get("provider_type") == "cli":
+            models = cfg.get("models") or {}
+            delegate = next(iter(models.values()), {}).get("delegate", "") if models else ""
+            binary = {"claude-cli": "claude", "codex-cli": "codex"}.get(delegate, delegate)
+            return f"'{binary}' isn't on PATH - install it and run `{binary} login`"
+        env_key = f"{base_id.replace('-', '_').upper()}_API_KEY"
+        reason = f"no API key - `motion auth login {base_id}`, set {env_key}, or add it in Ctrl+A"
+        if base_id in ("claude", "openai") and self.has_api_key("claude-cli" if base_id == "claude" else "codex-cli"):
+            cli = "claude-cli" if base_id == "claude" else "codex-cli"
+            reason += f"; or switch to {(self.data.get('providers', {}).get(cli) or {}).get('name', cli)}, which is already available"
+        return reason
 
     def list_providers(self) -> list:
         """Return list of (provider_id, name, models, has_key) tuples."""

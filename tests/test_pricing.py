@@ -99,11 +99,13 @@ def test_user_model_entry_does_not_erase_catalog_pricing_or_context_window():
 
 def test_every_catalog_model_has_pricing_and_a_context_window():
     """Claude and OpenAI models used to have neither: cost showed 'n/a' for every user of them, and the
-    agent fell back to a 32k context window even for models with far larger real ones."""
+    agent fell back to a 32k context window even for models with far larger real ones. CLI delegates
+    (provider_type "cli") are exempt: their "model" is a synthetic marker, not a real billable one -
+    Claude Code reports its own actual cost per turn, and Codex reports none (subscription usage)."""
     from core.catalog import BUILTIN_CATALOG
 
     missing = [
-        f"{pid}/{name}" for pid, cfg in BUILTIN_CATALOG.items()
+        f"{pid}/{name}" for pid, cfg in BUILTIN_CATALOG.items() if cfg.get("provider_type") != "cli"
         for name, opts in (cfg.get("models") or {}).items()
         if "input_mtok" not in opts or "output_mtok" not in opts or "context_window" not in opts
     ]

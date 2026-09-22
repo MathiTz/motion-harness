@@ -122,6 +122,25 @@ BUILTIN_CATALOG: Dict[str, Dict[str, Any]] = {
             "embed_model": "nomic-embed-text",
         },
     },
+    # CLI delegates: not an HTTP endpoint - "endpoint" is a placeholder ProviderFactory ignores.
+    # Runs the whole turn through an already-installed, already-logged-in CLI instead of a raw
+    # completion API, so a Claude Pro/Max or ChatGPT subscription works without a separate API key.
+    # "Available" (core/config.py's has_api_key) means the binary is on PATH, not that a key exists -
+    # see core/cli_delegate.py for what this does and does not cover.
+    "claude-cli": {
+        "name": "Claude Code (your login)",
+        "endpoint": "cli://claude",
+        "provider_type": "cli",
+        "default_model": "default",
+        "models": {"default": {"delegate": "claude-cli"}},
+    },
+    "codex-cli": {
+        "name": "Codex (your login)",
+        "endpoint": "cli://codex",
+        "provider_type": "cli",
+        "default_model": "default",
+        "models": {"default": {"delegate": "codex-cli"}},
+    },
 }
 
 

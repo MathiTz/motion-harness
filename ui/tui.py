@@ -1608,7 +1608,7 @@ class ModelDialog(Screen):
     def __init__(self, state: AppState, **kwargs) -> None:
         super().__init__(**kwargs)
         self.state = state
-        self._entries: list[tuple[str, str]] = []  # (label, full_id)
+        self._entries: list[tuple[str, str, bool]] = []  # (label, full_id, available)
         self._selection_index: Optional[int] = None
         self._populated = False  # ensures rows are mounted exactly once
 
@@ -1640,7 +1640,7 @@ class ModelDialog(Screen):
             return
         first_visible: Optional[int] = None
         for idx in range(min(len(self._entries), len(lv.children))):
-            label, _full = self._entries[idx]
+            label, _full, _available = self._entries[idx]
             visible = (not q) or q in label.lower()
             lv.children[idx].display = visible
             if visible and first_visible is None:
@@ -1670,7 +1670,7 @@ class ModelDialog(Screen):
         if self._populated:
             return
         self._populated = True
-        await self._set_model_rows_async([ModelOption(label, full) for label, full in self._entries])
+        await self._set_model_rows_async([ModelOption(label, full, available) for label, full, available in self._entries])
         query = self.query_one("#model_input", Input).value
         self._render_models(query)
 
@@ -1679,7 +1679,7 @@ class ModelDialog(Screen):
         screen resume where the model list may have changed), then re-render."""
         lv = self.query_one("#model_list", ListView)
         if lv.children:
-            await self._set_model_rows_async([ModelOption(label, full) for label, full in self._entries])
+            await self._set_model_rows_async([ModelOption(label, full, available) for label, full, available in self._entries])
         self._render_models(query)
 
     def on_screen_resume(self) -> None:
@@ -1719,15 +1719,23 @@ class ModelDialog(Screen):
         else:
             self.notify("Model list is up to date")
 
-    def _collect_entries(self) -> list[tuple[str, str]]:
-        entries: list[tuple[str, str]] = []
-        providers_cfg = (self.state.config_manager.get("providers") or {})
+    def _collect_entries(self) -> list[tuple[str, str, bool]]:
+        """(label, full_id, available). An unavailable provider still gets ONE row - grayed out, with
+        why and how to fix it - instead of silently vanishing (previously: if not has_key: continue),
+        which left someone with a Claude Code/Codex login but no separate API key unable to tell the
+        difference between "not configured" and "doesn't exist"."""
+        entries: list[tuple[str, str, bool]] = []
+        cm = self.state.config_manager
+        providers_cfg = (cm.get("providers") or {})
         for pid, name, models, is_default, has_key in AppState.build_all_provider_info():
-            if not has_key:
-                continue
             cfg = providers_cfg.get(pid, {}) or {}
             cfg_models = cfg.get("models", {}) or {}
-            if models:
+            if not has_key:
+                entries.append((f"{name} — {cm.unavailable_reason(pid)}", pid, False))
+                continue
+            if cfg.get("provider_type") == "cli":
+                entries.append((name, pid, True))          # one synthetic "model"; "→ default" would be noise
+            elif models:
                 for m in models:
                     full = f"{pid}/{m}"
                     meta = cfg_models.get(m, {}) or {}
@@ -1737,9 +1745,9 @@ class ModelDialog(Screen):
                         label += f" · {ctx//1000}k ctx"
                     if meta.get("input_mtok") is not None and meta.get("output_mtok") is not None:
                         label += f" · ${meta['input_mtok']}/${meta['output_mtok']}/M"
-                    entries.append((label, full))
+                    entries.append((label, full, True))
             else:
-                entries.append((f"{name}", pid))
+                entries.append((f"{name}", pid, True))
         return entries
 
     def on_input_changed(self, event: Input.Changed) -> None:
@@ -1785,6 +1793,10 @@ class ModelDialog(Screen):
     def _select(self, item) -> None:
         if not isinstance(item, ModelOption):
             return
+        if not item.available:
+            reason = self.state.config_manager.unavailable_reason(item.full_id)
+            self.notify(reason or "This provider isn't available yet.", severity="warning", timeout=8)
+            return
         full_id = item.full_id
         try:
             self.state.reconnect(full_id)
@@ -1818,11 +1830,22 @@ class ModelDialog(Screen):
 
 
 class ModelOption(ListItem):
-    """A single selectable model row in the model dialog."""
+    """A single selectable model row in the model dialog. An unavailable provider still gets a row
+    (dim, unselectable) explaining why - see ModelDialog._collect_entries."""
 
-    def __init__(self, label: str, full_id: str, **kwargs) -> None:
+    DEFAULT_CSS = """
+    ModelOption.unavailable {
+        color: $text-muted;
+        text-style: italic;
+    }
+    """
+
+    def __init__(self, label: str, full_id: str, available: bool = True, **kwargs) -> None:
         self.full_id = full_id
+        self.available = available
         super().__init__(Label(label), **kwargs)
+        if not available:
+            self.add_class("unavailable")
 
 
 class FileEntry(ListItem):

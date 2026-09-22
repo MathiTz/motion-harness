@@ -39,7 +39,7 @@ from core.trajectory import preview_args
 from core.budget import Budget
 from core.instructions import build_context_blocks
 from core.permissions import CommandPolicy
-from core.providers import SYSTEM_CACHE_SPLIT, BaseProvider, NativeToolsUnsupported, StreamCutError, ToolCall
+from core.providers import SYSTEM_CACHE_SPLIT, BaseProvider, NativeToolsUnsupported, StreamCutError, StreamEvent, ToolCall
 from core.sandbox import Sandbox, default_protected_paths
 from core.skills import SkillLibrary
 from core.tool_specs import ALL_TOOL_NAMES, MUTATING_TOOLS
@@ -761,6 +761,47 @@ class TurnRunner:
             return True
         return False
 
+    async def _run_delegate_call(self) -> "tuple[str, bool]":
+        """The whole turn, run by an already-installed, already-logged-in CLI (Claude Code / Codex)
+        under the login it already has - see core/cli_delegate.py for why this is legitimate, sanctioned
+        automation rather than a workaround. Returns (response_text, already_streamed=True): text is
+        streamed live via emit() as it arrives, same as a normal turn."""
+        provider = self.provider
+        agent = self.agent
+        if not getattr(agent, "_delegate_notice_shown", False):
+            agent._delegate_notice_shown = True
+            await self.emit(
+                f"_tool_ ℹ️ Using {provider.display_name} with your existing login: its own tools run "
+                "outside this harness's sandbox/budget/hooks, and /undo does not cover its edits.\n"
+            )
+
+        async def on_event(ev: StreamEvent) -> None:
+            if ev.kind == "text":
+                await self.emit("_delta_ " + ev.text)
+            elif ev.kind == "reasoning":  # tool-progress visibility, not real reasoning - see cli_delegate.py
+                text = ev.text.strip()
+                if text:
+                    await self.emit("_tool_ " + text)
+
+        result = await provider.run_delegate(
+            self.prompt, mode=self.agent_mode, workspace=self.workspace, on_event=on_event,
+        )
+        provider.session_ref = result.session_ref or provider.session_ref
+        if result.tool_lines:
+            self.used_tool = True
+            self.tool_operations.extend(result.tool_lines)
+        if result.usage:
+            await self._emit_usage("delegate", result.usage)
+            if result.cost_usd is not None:
+                note = f"reported cost ${result.cost_usd:.4f}"
+            else:
+                note = "uses your subscription, not a separate API charge"
+            await self.emit(f"_tool_ via {provider.display_name} · {note}")
+        text = (result.text or "").strip()
+        if not text:
+            text = f"({provider.display_name} finished with no final text; see its tool activity above.)"
+        return text, True
+
     def _make_sandbox(self) -> Sandbox:
         opts = getattr(self.agent, "sandbox_options", None) or {}
         return Sandbox(
@@ -925,7 +966,25 @@ class TurnRunner:
 
         budget: Budget = getattr(agent, "budget", None) or Budget()
         wrapping_up = False
-        for tool_step in range(self.max_steps):
+        # A CLI-delegate provider (Claude Code / Codex, run via their own login) runs its OWN agent
+        # internally - one call, not our per-step tool loop - so it gets a single "iteration" that
+        # always ends in `break`, never falling into the `for...else` step-cap path below.
+        is_delegate = bool(getattr(self.provider, "is_delegate", False))
+        for tool_step in range(1 if is_delegate else self.max_steps):
+            if is_delegate:
+                try:
+                    tool_response, final_streamed = await self._run_delegate_call()
+                except Exception as exc:
+                    from core.cli_delegate import CLIDelegateError
+
+                    name = getattr(self.provider, "display_name", self.provider_type)
+                    if isinstance(exc, CLIDelegateError):
+                        error_msg = str(exc)
+                    else:
+                        error_msg = f"{name} delegate failed: {exc}"
+                    await self.trace("provider_error", error_msg, provider=self.provider_type, error=str(exc))
+                    return f"⚠️ {error_msg}"
+                break
             if budget.active and tool_step > 0 and not wrapping_up and self.depth == 0:
                 pcfg = getattr(self.provider, "config", None)
                 reason = budget.exceeded(

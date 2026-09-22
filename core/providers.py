@@ -1002,5 +1002,15 @@ class ProviderFactory:
             return CloudProvider(config)
         elif config.provider_type == "proxy":
             return ProxyProvider(config)
+        elif config.provider_type == "cli":
+            # Deferred import: core.cli_delegate imports FROM this module, so a top-level import here
+            # would be circular.
+            from core.cli_delegate import DELEGATE_CLASSES
+
+            delegate_key = config.options.get("delegate", "")
+            cls = DELEGATE_CLASSES.get(delegate_key)
+            if cls is None:
+                raise ValueError(f"Unknown CLI delegate: '{delegate_key}' (known: {', '.join(DELEGATE_CLASSES)})")
+            return cls(config)
         else:
             raise ValueError(f"Unsupported provider type: {config.provider_type}")
