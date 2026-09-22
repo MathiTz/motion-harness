@@ -34,8 +34,8 @@ def _provider(cls, handler, endpoint="https://api.example.com/v1", ptype="cloud"
     return p
 
 
-async def _collect(provider, messages, tools=None):
-    return await provider.chat(messages, system_prompt="sys", tools=tools)
+async def _collect(provider, messages, tools=None, system="sys"):
+    return await provider.chat(messages, system_prompt=system, tools=tools)
 
 
 # ── OpenAI-compatible ───────────────────────────────────────────────────────
@@ -545,3 +545,85 @@ async def test_the_agent_reports_a_cut_stream_and_a_configured_fallback_takes_ov
     agent = arm(make_agent(Scripted([StreamCutError("the connection closed before the model finished (x)")])), backup)
     resp2, _, _ = await run(agent, "hi", workspace=str(tmp_path))
     assert resp2 == "recovered on the backup"
+
+
+# ── system-prompt cache split (static instructions vs. per-turn memory/context) ─
+
+def test_split_and_join_system_prompt():
+    from core.providers import SYSTEM_CACHE_SPLIT, join_system_prompt, split_system_prompt
+
+    whole = f"static part{SYSTEM_CACHE_SPLIT}dynamic part"
+    assert split_system_prompt(whole) == ("static part", "dynamic part")
+    assert join_system_prompt(whole) == "static part\n\ndynamic part"
+    # a plain string with no marker (any caller that never splits) passes through unchanged
+    assert split_system_prompt("just one string") == ("just one string", "")
+    assert join_system_prompt("just one string") == "just one string"
+
+
+async def test_anthropic_puts_the_cache_breakpoint_only_on_the_static_part():
+    seen = {}
+
+    def handler(request):
+        seen["payload"] = json.loads(request.content)
+        return httpx.Response(200, text=_sse({"choices": []}, {"type": "message_stop"}))
+
+    from core.providers import SYSTEM_CACHE_SPLIT
+
+    p = _provider(CloudProvider, handler, endpoint="https://api.anthropic.com")
+    await _collect(p, [{"role": "user", "content": "x"}], system=f"STATIC-TOOLS{SYSTEM_CACHE_SPLIT}DYNAMIC-MEMORY-TODAY")
+    blocks = seen["payload"]["system"]
+    assert [b["text"] for b in blocks] == ["STATIC-TOOLS", "DYNAMIC-MEMORY-TODAY"]
+    assert blocks[0]["cache_control"] == {"type": "ephemeral"} and "cache_control" not in blocks[1]
+
+
+async def test_a_system_prompt_the_model_never_split_is_cached_as_one_block_as_before():
+    seen = {}
+
+    def handler(request):
+        seen["payload"] = json.loads(request.content)
+        return httpx.Response(200, text=_sse({"choices": []}, {"type": "message_stop"}))
+
+    p = _provider(CloudProvider, handler, endpoint="https://api.anthropic.com")
+    await _collect(p, [{"role": "user", "content": "x"}], system="a plain unsplit prompt")
+    blocks = seen["payload"]["system"]
+    assert len(blocks) == 1 and blocks[0]["text"] == "a plain unsplit prompt" and blocks[0]["cache_control"] == {"type": "ephemeral"}
+
+
+async def test_openai_and_ollama_never_see_the_split_marker():
+    from core.providers import SYSTEM_CACHE_SPLIT
+
+    seen = {}
+
+    def handler(request):
+        seen["payload"] = json.loads(request.content)
+        return httpx.Response(200, text=_sse({"choices": [{"delta": {"content": "ok"}}]}))
+
+    p = _provider(CloudProvider, handler, endpoint="https://api.example.com/v1")
+    await _collect(p, [{"role": "user", "content": "x"}], system=f"STATIC{SYSTEM_CACHE_SPLIT}DYNAMIC")
+    sys_msg = next(m for m in seen["payload"]["messages"] if m["role"] == "system")
+    assert sys_msg["content"] == "STATIC\n\nDYNAMIC" and SYSTEM_CACHE_SPLIT not in sys_msg["content"]
+
+    def ollama_handler(request):
+        seen["payload"] = json.loads(request.content)
+        return httpx.Response(200, text=json.dumps({"message": {"content": "ok"}, "done": True}) + "\n")
+
+    lp = LocalProvider(ModelConfig(name="l", endpoint="http://localhost:11434", provider_type="local", options={"model": "m"}))
+    lp._client = httpx.AsyncClient(transport=httpx.MockTransport(ollama_handler))
+    await _collect(lp, [{"role": "user", "content": "x"}], system=f"STATIC{SYSTEM_CACHE_SPLIT}DYNAMIC")
+    sys_msg = next(m for m in seen["payload"]["messages"] if m["role"] == "system")
+    assert sys_msg["content"] == "STATIC\n\nDYNAMIC"
+
+
+async def test_empty_static_part_falls_back_to_an_uncached_single_block():
+    from core.providers import SYSTEM_CACHE_SPLIT
+
+    seen = {}
+
+    def handler(request):
+        seen["payload"] = json.loads(request.content)
+        return httpx.Response(200, text=_sse({"choices": []}, {"type": "message_stop"}))
+
+    p = _provider(CloudProvider, handler, endpoint="https://api.anthropic.com")
+    await _collect(p, [{"role": "user", "content": "x"}], system=f"{SYSTEM_CACHE_SPLIT}only dynamic")
+    blocks = seen["payload"]["system"]
+    assert [b["text"] for b in blocks] == ["only dynamic"] and "cache_control" not in blocks[0]
