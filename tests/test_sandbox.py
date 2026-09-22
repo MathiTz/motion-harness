@@ -132,7 +132,8 @@ async def test_python_cannot_bypass_the_sandbox(tmp_path: Path, outside: Path):
     approve = lambda *a: "once"   # even with the user approving the code prompt...
     t = tools_for(tmp_path, approve=approve)
     r = await t.aexecute("run_python", {"code": f"import shutil; shutil.rmtree({str(outside)!r})"})
-    assert r["exit_code"] != 0 and "PermissionError" in r["stderr"]
+    # macOS Seatbelt says EPERM (PermissionError); Linux bubblewrap's read-only mount says EROFS. Either way: refused.
+    assert r["exit_code"] != 0 and ("PermissionError" in r["stderr"] or "Read-only file system" in r["stderr"])
     assert (outside / "victim.txt").exists()                        # ...the OS still says no
     (tmp_path / "s.py").write_text(f"import pathlib; pathlib.Path({str(outside / 'victim.txt')!r}).write_text('x')")
     s = await t.aexecute("run_script", {"path": "s.py"})
