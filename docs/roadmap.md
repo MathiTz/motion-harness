@@ -70,11 +70,10 @@ Speed, correctness and safety work that the chat UX sits on.
 - [x] Sub-agents (`task` tool): isolated context, parallel read-only, guarded general mode
 
 ### Still open
-- [ ] Sandbox: Windows backend; network / read confinement (currently writes only)
+- [ ] Sandbox: Windows backend; hiding *all* of $HOME (only credential stores and harness secrets are hidden today)
 - [ ] Sandbox on Linux is implemented but only exercised where bubblewrap works (CI runners often lack user namespaces)
-- [ ] User-configurable hooks (pre/post tool), per-turn token/cost/time budgets
-- [ ] Multi-file patch tool; model failover; recorded-provider evals against real models
-- [ ] Live verification of the Anthropic and OpenAI wire formats (mock-tested only)
+- [ ] Recorded-provider evals against real models
+- [ ] Live verification of the Anthropic and OpenAI wire formats (mock-tested only; `scripts/live_check.py` is ready, Ollama Cloud passes)
 
 ## Phase 2 — Document & File Ingestion (in progress)
 
@@ -135,3 +134,7 @@ without hallucinating or faking content.
   - `packages/opencode/src/tool/code-mode.ts` — `dataUrl()` helper
 - Principle: **never pretend to read a file.** If the active model can't ingest a
   modality, surface a clear message and inform the user.
+
+## Verifying providers live
+
+`python scripts/live_check.py [provider-id | --all]` streams a few tiny requests through a real provider and checks text streaming, token usage, the system prompt and a full tool-call round trip. Verified against Ollama Cloud; run it with an Anthropic or OpenAI key to close the "mock-tested only" item above.

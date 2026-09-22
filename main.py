@@ -41,6 +41,13 @@ class MotionAgent:
         # "auto" = confine shell/Python writes with an OS sandbox when the
         # platform has one; "off" disables it (config.yml: sandbox: off).
         self.sandbox_mode = "auto"
+        self.budget = None  # core.budget.Budget: per-turn limits (steps/tokens/cost/time)
+        self.hooks = None   # core.hooks.Hooks: user commands run before/after tool calls
+        self.stall_timeout: float = 180.0   # seconds with no model output before a turn fails (keepalives don't count)
+        self.fallback_ids: list = []        # providers to switch to when this one is unavailable
+        self.provider_builder = None        # callable(provider_id) -> provider | None
+        self.failovers: list = []           # (from, to, reason) switches made this session
+        self.sandbox_options: dict = {}  # allow_read / deny_read / network (see core/sandbox.py)
         # Memory recall must never stall a turn: give up after this many seconds.
         self.recall_timeout = 2.0
         # Store substantive turns in memory (off by default; the TUI enables it
@@ -366,6 +373,12 @@ def build_parser():
     headless.add_argument("--plan", action="store_true", help="Headless: read-only plan mode (no writes or commands)")
     headless.add_argument("--workspace", default=None, help="Headless: directory the agent works in (default: current directory)")
     headless.add_argument("--stdin", action="store_true", help="Headless: append piped stdin to the prompt as context")
+    headless.add_argument("--max-steps", type=int, default=None, help="Headless: stop after this many model steps and answer with what it has")
+    headless.add_argument("--max-tokens", type=int, default=None, help="Headless: stop after this many prompt+completion tokens")
+    headless.add_argument("--max-cost", type=float, default=None, help="Headless: stop after this many USD (needs model pricing)")
+    headless.add_argument("--max-seconds", type=float, default=None, help="Headless: stop after this many seconds")
+    headless.add_argument("--effort", choices=("low", "medium", "high"), default=None,
+                          help="Headless: reasoning effort for models that support it (lower = faster and cheaper)")
     headless.add_argument("--verbose", action="store_true", help="Headless: print tool activity to stderr")
     sub = parser.add_subparsers(dest="command")
     auth_parser = sub.add_parser("auth", help="Manage provider API keys")

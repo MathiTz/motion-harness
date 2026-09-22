@@ -192,7 +192,8 @@ async def test_jobs_run_inside_the_write_sandbox(tmp_path: Path):
         t, s = tools_for(tmp_path, sandbox=Sandbox(tmp_path))
         job = await start(t, f"echo pwned > {outside}/x; echo rc=$?")
         out = await t.aexecute("job_output", {"job_id": job["job_id"], "wait_seconds": 10})   # waits for the first line
-        assert not (outside / "x").exists() and "rc=1" in out["output"]
+        # the write must fail (bash/Seatbelt: rc=1, dash on Linux: rc=2) and leave nothing behind
+        assert not (outside / "x").exists() and "rc=0" not in out["output"] and "rc=" in out["output"]
         await s.jobs.stop_all()
     finally:
         import shutil

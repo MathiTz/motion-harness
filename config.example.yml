@@ -66,7 +66,23 @@ embedding:
   dimension: 128
 
 # ── Optional behaviour (all keys below are optional) ─────────────────────────
+# stall_timeout: 180           # fail a turn after this long without model output (0 = off)
+# (per-model option: lenient_streams: true  accepts gateways that never send a stream terminator)
+# fallback_providers: [ollama-cloud/deepseek-v4-flash, claude]   # switch here if the current provider fails
+# hooks:                       # your commands around tool calls
+#   pre_tool:                  # non-zero exit blocks the call
+#     - {match: "write_file|edit_files", command: "./scripts/guard.sh", timeout: 10}
+#   post_tool:
+#     - {match: "write_file|edit_files", command: "ruff format ."}
+# budget:                      # per-turn limits (all optional)
+#   max_steps: 12
+#   max_tokens: 150000
+#   max_cost_usd: 0.50
+#   max_seconds: 180
 # sandbox: auto                # OS write sandbox for shell/Python (auto | off)
+# sandbox_allow_read: []       # e.g. ["~/.aws"] to let commands read AWS credentials again
+# sandbox_deny_read: []        # e.g. ["~/.ssh"] to hide more folders
+# sandbox_network: allow       # deny = no network for commands
 # show_diffs: true             # inline colored diffs for edits
 # remember_turns_headless: false
 # default_agent_mode: plan     # plan (discuss first) | build (writes/runs; risky commands still ask)

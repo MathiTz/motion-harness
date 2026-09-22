@@ -297,3 +297,52 @@ async def test_subagent_steps_appear_in_the_leads_trajectory_labelled(tmp_path: 
     subs = [r for r in recs if r["agent"] == "sub:alpha"]
     assert len(subs) == 2 and subs[0]["tools"][0]["name"] == "read_file" and subs[1]["prompt_tokens"] == 400
     assert "sub:alpha" in traj.render(recs)
+
+
+# ── state files never reach the user's commits; /effort ─────────────────────
+
+async def test_trajectory_and_skills_land_in_a_self_ignoring_state_dir(tmp_path, monkeypatch):
+    import subprocess
+
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    async with tui_app(tmp_path, monkeypatch, [call("1", "read_file", path="a.txt"), text("ok")]) as (app, pilot):
+        await two_step_turn(app, pilot, tmp_path)
+        await send(app, pilot, "/trajectory save full")
+        await pilot.pause(0.1)
+    assert (tmp_path / ".motion" / ".gitignore").read_text() == "*\n"
+    saved = next((tmp_path / ".motion" / "trajectories").glob("*.json"))
+    ignored = subprocess.run(["git", "-C", str(tmp_path), "check-ignore", "-q", str(saved)]).returncode
+    assert ignored == 0                                                       # git itself agrees: it can't be committed
+    status = subprocess.run(["git", "-C", str(tmp_path), "status", "--porcelain"], capture_output=True, text=True).stdout
+    assert ".motion" not in status
+    assert tui._skills_dir() == tmp_path / ".motion" / "skills" and (tmp_path / ".motion" / "skills").is_dir()
+
+
+async def test_effort_command_sets_shows_and_clears_the_reasoning_effort(tmp_path, monkeypatch):
+    async with tui_app(tmp_path, monkeypatch, [text("hi")]) as (app, pilot):
+        options = app.state.agent.provider.config.options
+        await send(app, pilot, "/effort low")
+        await pilot.pause(0.1)
+        assert options["reasoning_effort"] == "low" and any("Reasoning effort: low" in t for t in system_lines(app))
+        await send(app, pilot, "/effort")
+        await pilot.pause(0.1)
+        assert any("change it with /effort" in t for t in system_lines(app))
+        await send(app, pilot, "/effort off")
+        await pilot.pause(0.1)
+        assert "reasoning_effort" not in options
+        await send(app, pilot, "/effort turbo")
+        await pilot.pause(0.1)
+        assert any("Usage: /effort" in t for t in system_lines(app)) and "reasoning_effort" not in options
+
+
+async def test_headless_effort_flag_reaches_the_request(tmp_path):
+    from tests.test_headless import factory
+
+    seen = {}
+    def make():
+        agent = factory([text("ok")])()
+        seen["options"] = agent.provider.config.options
+        return agent
+    out = io.StringIO()
+    await run_headless("hi", out=out, err=io.StringIO(), agent_factory=make, workspace=str(tmp_path), effort="low")
+    assert seen["options"]["reasoning_effort"] == "low"

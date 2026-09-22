@@ -205,7 +205,9 @@ async def test_runaway_subagent_hits_its_own_step_cap(tmp_path: Path, monkeypatc
     p = Router(lead=[task("1", "alpha"), text("done")],
                subs={"alpha": [call(str(i), "read_file", path="f.txt") for i in range(10)]})
     await run(make_agent(p), workspace=str(tmp_path))
-    assert "safety limit (3 tool calls)" in tool_msgs(p.lead_requests[1])[0]["content"]
+    result = tool_msgs(p.lead_requests[1])[0]["content"]
+    assert "safety limit (3 tool calls)" in result
+    assert '"status": "hit_step_limit"' in result and "INCOMPLETE" in result and "partial" in result   # never "completed"
 
 
 async def test_hung_subagent_times_out_and_the_lead_continues(tmp_path: Path, monkeypatch):
@@ -277,3 +279,17 @@ def tui_steps():
     import ui.tui as tui
 
     return tui.StepsMessage
+
+
+async def test_a_sub_agent_that_finishes_says_completed_and_stopped_ones_are_flagged_in_the_ui_text(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(loop, "SUBAGENT_MAX_STEPS", 2)
+    (tmp_path / "f.txt").write_text("x")
+    p = Router(lead=[calls(("1", "task", {"description": "ok one", "prompt": "Investigate ok"}),
+                           ("2", "task", {"description": "runaway", "prompt": "Investigate runaway"})), text("done")],
+               subs={"ok": [text("all good")], "runaway": [call(str(i), "read_file", path="f.txt") for i in range(5)]})
+    _, chunks, _ = await run(make_agent(p), workspace=str(tmp_path))
+    results = [m["content"] for m in tool_msgs(p.lead_requests[1])]
+    assert '"status": "completed"' in results[0] and "INCOMPLETE" not in results[0]
+    assert '"status": "hit_step_limit"' in results[1]
+    assert any("STOPPED EARLY" in c and "runaway" in c for c in chunks)       # the transcript says so too
+    assert not any("STOPPED EARLY" in c and "ok one" in c for c in chunks)

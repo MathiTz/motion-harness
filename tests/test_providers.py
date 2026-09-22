@@ -398,3 +398,150 @@ async def test_the_agent_does_not_blame_the_network_for_a_credentials_problem(tm
     resp, _, _ = await run(make_agent(provider), "hi", workspace=str(tmp_path))
     assert "No API key configured for ollama.com" in resp and "motion auth login" in resp
     assert "check your connection" not in resp.lower()
+
+
+# ── Anthropic conversation caching ──────────────────────────────────────────
+
+def test_conversation_cache_breakpoint_goes_on_the_last_block_only():
+    from core.providers import _with_conversation_cache_breakpoint as mark
+
+    msgs = [{"role": "user", "content": "first"},
+            {"role": "assistant", "content": [{"type": "text", "text": "ok"}, {"type": "tool_use", "id": "1", "name": "x", "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "1", "content": "res"}]}]
+    out = mark(msgs)
+    assert out[-1]["content"][-1]["cache_control"] == {"type": "ephemeral"}
+    assert not any("cache_control" in str(m) for m in out[:-1])
+    assert "cache_control" not in str(msgs)                                     # the input was not mutated
+    as_text = mark([{"role": "user", "content": "a"}, {"role": "user", "content": "the question"}])
+    assert as_text[-1]["content"] == [{"type": "text", "text": "the question", "cache_control": {"type": "ephemeral"}}]
+
+
+@pytest.mark.parametrize("msgs", [
+    [{"role": "user", "content": "only one message: nothing to reuse yet"}],
+    [{"role": "user", "content": "a"}, {"role": "assistant", "content": [{"type": "thinking", "thinking": "hm"}]}],
+    [{"role": "user", "content": "a"}, {"role": "user", "content": "   "}],
+    [{"role": "user", "content": "a"}, {"role": "user", "content": []}],
+])
+def test_no_breakpoint_where_anthropic_would_reject_or_it_cannot_pay_off(msgs):
+    from core.providers import _with_conversation_cache_breakpoint as mark
+
+    assert mark(msgs) == msgs and "cache_control" not in str(mark(msgs))
+
+
+async def test_the_anthropic_request_carries_three_breakpoints_and_counts_cache_tokens():
+    seen = {}
+
+    def handler(request):
+        seen["payload"] = json.loads(request.content)
+        return httpx.Response(200, text=_sse(
+            {"type": "message_start", "message": {"usage": {"input_tokens": 50, "cache_read_input_tokens": 4000, "cache_creation_input_tokens": 100}}},
+            {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+            {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "hi"}},
+            {"type": "message_delta", "usage": {"output_tokens": 7}},
+            {"type": "message_stop"},
+            done=False,
+        ))
+
+    p = _provider(CloudProvider, handler, endpoint="https://api.anthropic.com")
+    res = await p.chat([{"role": "user", "content": "q1"}, {"role": "assistant", "content": "a1"}, {"role": "user", "content": "q2"}],
+                       system_prompt="sys", tools=TOOLS)
+    payload = seen["payload"]
+    assert payload["system"][0]["cache_control"] and payload["tools"][-1]["cache_control"]
+    assert payload["messages"][-1]["content"][-1]["cache_control"] == {"type": "ephemeral"}
+    assert str(payload).count("cache_control") == 3                              # Anthropic allows 4
+    assert res.usage["prompt_tokens"] == 50 + 4000 + 100                         # cached tokens still count toward prompt size
+
+
+# ── a connection that closes early is not a finished answer ─────────────────
+
+from core.providers import StreamCutError  # noqa: E402
+
+
+def _raw(body: str):
+    return lambda request: httpx.Response(200, text=body)
+
+
+def _oai(*chunks, done=True):
+    return "".join(f"data: {json.dumps(c)}\n\n" for c in chunks) + ("data: [DONE]\n\n" if done else "")
+
+
+TEXT = {"choices": [{"delta": {"content": "The answer is fo"}}]}
+TOOL_START = {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "c1", "function": {"name": "read_file", "arguments": '{"path": "sr'}}]}}]}
+FINISH = {"choices": [{"delta": {}, "finish_reason": "stop"}]}
+
+
+async def test_openai_stream_cut_mid_text_is_an_error_not_a_short_answer():
+    with pytest.raises(StreamCutError) as exc:
+        await _collect(_provider(CloudProvider, _raw(_oai(TEXT, done=False))), [{"role": "user", "content": "x"}])
+    assert "closed before the model finished" in str(exc.value) and "incomplete" in str(exc.value)
+    assert isinstance(exc.value, ProviderError) and isinstance(exc.value, httpx.HTTPError)
+
+
+async def test_openai_stream_cut_mid_tool_call_never_yields_the_partial_call():
+    p = _provider(CloudProvider, _raw(_oai(TOOL_START, done=False)))
+    got = []
+    with pytest.raises(StreamCutError):
+        async for ev in p.chat_stream([{"role": "user", "content": "x"}], tools=TOOLS):
+            got.append(ev)
+    assert not [e for e in got if e.kind == "tool_call"]                        # nothing half-formed reaches the loop
+
+
+async def test_an_empty_response_is_an_error_too():
+    with pytest.raises(StreamCutError):
+        await _collect(_provider(CloudProvider, _raw("")), [{"role": "user", "content": "x"}])
+
+
+@pytest.mark.parametrize("body", [
+    _oai({"choices": [{"delta": {"content": "hi"}}]}),                            # [DONE] only
+    _oai({"choices": [{"delta": {"content": "hi"}, "finish_reason": "stop"}]}, done=False),   # finish_reason only
+    _oai({"choices": [{"delta": {"content": "hi"}}]}, FINISH),                   # both
+])
+async def test_either_terminator_marks_an_openai_stream_complete(body):
+    assert (await _collect(_provider(CloudProvider, _raw(body)), [{"role": "user", "content": "x"}])).text == "hi"
+
+
+async def test_lenient_streams_accepts_gateways_that_never_send_a_terminator():
+    p = _provider(CloudProvider, _raw(_oai({"choices": [{"delta": {"content": "hi"}}]}, done=False)), lenient_streams=True)
+    assert (await _collect(p, [{"role": "user", "content": "x"}])).text == "hi"
+
+
+async def test_local_ollama_stream_needs_its_done_marker():
+    def ndjson(*items):
+        return "".join(json.dumps(i) + "\n" for i in items)
+
+    cut = ndjson({"message": {"content": "par"}, "done": False})
+    ok = ndjson({"message": {"content": "full"}, "done": False}, {"message": {}, "done": True, "prompt_eval_count": 5, "eval_count": 2})
+    p = _provider(LocalProvider, _raw(cut), endpoint="http://localhost:11434", ptype="local")
+    with pytest.raises(StreamCutError):
+        await _collect(p, [{"role": "user", "content": "x"}])
+    good = _provider(LocalProvider, _raw(ok), endpoint="http://localhost:11434", ptype="local")
+    assert (await _collect(good, [{"role": "user", "content": "x"}])).text == "full"
+
+
+async def test_anthropic_stream_needs_message_stop_and_a_cut_tool_use_is_not_dropped_silently():
+    start = {"type": "message_start", "message": {"usage": {"input_tokens": 5}}}
+    text = [{"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+            {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Let me look"}},
+            {"type": "content_block_stop", "index": 0}]
+    tool_open = [{"type": "content_block_start", "index": 1, "content_block": {"type": "tool_use", "id": "t1", "name": "read_file"}},
+                 {"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": '{"path": "a'}}]
+    anth = lambda events: _provider(CloudProvider, _raw(_sse(*events, done=False)), endpoint="https://api.anthropic.com")
+    with pytest.raises(StreamCutError):                                            # cut mid tool_use: used to succeed with just the text
+        await _collect(anth([start, *text, *tool_open]), [{"role": "user", "content": "x"}])
+    with pytest.raises(StreamCutError):
+        await _collect(anth([start, *text]), [{"role": "user", "content": "x"}])
+    done = await _collect(anth([start, *text, {"type": "message_delta", "usage": {"output_tokens": 3}}, {"type": "message_stop"}]),
+                          [{"role": "user", "content": "x"}])
+    assert done.text == "Let me look"
+
+
+async def test_the_agent_reports_a_cut_stream_and_a_configured_fallback_takes_over(tmp_path):
+    from tests.test_agent_loop import Scripted, make_agent, run, text
+    from tests.test_failover import arm
+
+    resp, _, _ = await run(make_agent(Scripted([StreamCutError("the connection closed before the model finished (x)")])), "hi", workspace=str(tmp_path))
+    assert "closed before the model finished" in resp
+    backup = Scripted([text("recovered on the backup")])
+    agent = arm(make_agent(Scripted([StreamCutError("the connection closed before the model finished (x)")])), backup)
+    resp2, _, _ = await run(agent, "hi", workspace=str(tmp_path))
+    assert resp2 == "recovered on the backup"

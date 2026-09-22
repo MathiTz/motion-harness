@@ -36,9 +36,10 @@ import httpx
 
 from core.context import compact_messages, messages_tokens, trim_old_tool_results
 from core.trajectory import preview_args
+from core.budget import Budget
 from core.instructions import build_context_blocks
 from core.permissions import CommandPolicy
-from core.providers import BaseProvider, NativeToolsUnsupported, ToolCall
+from core.providers import BaseProvider, NativeToolsUnsupported, StreamCutError, ToolCall
 from core.sandbox import Sandbox, default_protected_paths
 from core.skills import SkillLibrary
 from core.tool_specs import ALL_TOOL_NAMES, MUTATING_TOOLS
@@ -66,6 +67,12 @@ CONTINUE_PROMPT = "Continue the task using the tool result above."
 
 # After this many consecutive read-only steps, tell the model to answer or batch what's missing.
 # Every step re-sends the whole conversation, so open-ended exploring is what makes runs expensive.
+BUDGET_WRAPUP = (
+    "Budget reached: {reason}. Do not call any more tools. Answer now with the best result you can give from what "
+    "you have already gathered, and say plainly what you did not get to."
+)
+BUDGET_NOTE = "\n\n⚠️ Stopped early: this turn's budget was reached ({reason}). Ask me to continue, or raise the budget."
+
 EXPLORATION_NUDGE_EVERY = 6
 EXPLORATION_NUDGE = (
     "You have now spent {n} consecutive steps only reading. If you can answer well with what you already "
@@ -102,6 +109,48 @@ class Outcome:
     failed: bool = False
     nudge: Optional[str] = None
     duration_s: float = 0.0
+
+
+DEFAULT_STALL_TIMEOUT = 180.0
+
+
+async def _stall_guard(stream: Any, timeout: float) -> Any:
+    """Yield the stream's events, failing if none arrives for ``timeout`` seconds.
+
+    httpx's read timeout resets on ANY bytes, so a provider that keeps a stalled response alive with keepalive
+    pings/comments would hang the turn forever; only real events (text, reasoning, tool calls, usage) count here.
+    """
+    iterator = stream.__aiter__()
+    try:
+        while True:
+            try:
+                event = await (asyncio.wait_for(iterator.__anext__(), timeout) if timeout else iterator.__anext__())
+            except StopAsyncIteration:
+                return
+            except asyncio.TimeoutError:
+                raise httpx.ReadTimeout(
+                    f"no model output for {timeout:.0f}s: the connection is open but the stream has stalled"
+                ) from None
+            yield event
+    finally:
+        closer = getattr(iterator, "aclose", None)
+        if closer is not None:
+            try:
+                await closer()
+            except Exception:
+                pass
+
+
+_MOTION_TOOL_BLOCK = re.compile(r"<motion_tool>.*?(?:</motion_tool>|$)", re.DOTALL)
+
+
+def _strip_tool_markup(text: str) -> str:
+    """Remove tool-call markup from a forced final answer (a wrap-up step must not execute or show it)."""
+    from core.workspace_tools import DIRECT_TOOL_PATTERN, DSML_TOOL_PATTERN
+
+    for pattern in (_MOTION_TOOL_BLOCK, DIRECT_TOOL_PATTERN, DSML_TOOL_PATTERN):
+        text = pattern.sub("", text)
+    return text.strip() or "(no answer could be produced within the budget)"
 
 
 class _ToolTagFilter:
@@ -215,6 +264,7 @@ class TurnRunner:
         self.turn_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         self._pending_images: List[Dict[str, str]] = []
         self.tool_call_count = 0
+        self.hit_step_cap = False  # the turn ended because it ran out of steps, not because it finished
         self.first_ttft: Optional[float] = None
         self.trajectory: List[Dict[str, Any]] = []
 
@@ -339,7 +389,7 @@ class TurnRunner:
             skills=SkillLibrary.for_workspace(self.workspace),
             notes=getattr(agent, "notes", None),
             enforce_read_before_write=True,
-            sandbox=Sandbox(self.workspace, getattr(agent, "sandbox_mode", "auto"), default_protected_paths()),
+            sandbox=self._make_sandbox(),
             subagents=self.depth == 0 and isinstance(agent.provider, BaseProvider),
         )
 
@@ -389,10 +439,15 @@ class TurnRunner:
             return StepResult(text=text or "", usage=usage)
 
         res = StepResult()
+        # Tools stay declared even on the budget wrap-up step: Anthropic rejects a request whose history contains
+        # tool_use blocks but declares no tools. A tool call the model makes anyway is ignored (see run()).
         tools_arg = self.tools.tool_schemas() if self.mode == "native" else None  # type: ignore[union-attr]
         tag_filter = _ToolTagFilter() if self.mode == "xml" else None
         started = time.monotonic()
-        async for ev in provider.chat_stream(self.messages, system_prompt=self.system_prompt, tools=tools_arg):
+        stall = float(getattr(self.agent, "stall_timeout", DEFAULT_STALL_TIMEOUT) or 0)
+        async for ev in _stall_guard(
+            provider.chat_stream(self.messages, system_prompt=self.system_prompt, tools=tools_arg), stall
+        ):
             if ev.kind == "text":
                 if res.ttft is None:
                     res.ttft = time.monotonic() - started
@@ -519,6 +574,14 @@ class TurnRunner:
                 ),
             )
 
+        hooks = getattr(self.agent, "hooks", None)
+        if hooks:
+            verdict = await hooks.run("pre_tool", name, arguments, self.workspace)
+            if verdict.blocked:
+                await self.trace("hook_blocked", f"pre_tool hook blocked {name}: {verdict.output[:160]}", tool=name)
+                text = await self._fail(name, WorkspaceToolError(f"blocked by a pre_tool hook: {verdict.output}"), "")
+                return Outcome(text, failed=True)
+
         path = str(arguments.get("path", "") or "").strip()
         tools = self.tools
         assert tools is not None
@@ -554,6 +617,12 @@ class TurnRunner:
             except Exception as exc:
                 return Outcome(await self._fail(name, exc, path), failed=True)
             break
+
+        if hooks and name != "task":
+            after = await hooks.run("post_tool", name, arguments, self.workspace, result=result)
+            if after.output:
+                result["hook_output"] = after.output
+                await self.trace("hook_output", f"post_tool hook after {name}: {after.output[:160]}", tool=name)
 
         path = str(result.get("path") or path or "").strip()
         operation, stream_text = self._describe(name, arguments, result, path)
@@ -591,6 +660,11 @@ class TurnRunner:
         if name == "write_file":
             delta = f", +{result.get('lines_added', 0)} −{result.get('lines_removed', 0)}" if "lines_added" in result else ""
             return f"wrote `{path}`", f"wrote `{path}` ({result.get('bytes_written', 0)} bytes{delta})"
+        if name == "edit_files":
+            names = ", ".join(f"`{f['path']}`" for f in result.get("files", [])[:4])
+            more = f" +{len(result['files']) - 4} more" if len(result.get("files", [])) > 4 else ""
+            op = f"edited {len(result.get('files', []))} file(s): {names}{more} ({result.get('edits', 0)} edits)"
+            return op, op + f" (+{result.get('lines_added', 0)} −{result.get('lines_removed', 0)})"
         if name == "replace_in_file":
             op = f"updated `{path}`"
             delta = f" (+{result.get('lines_added', 0)} −{result.get('lines_removed', 0)})" if "lines_added" in result else ""
@@ -613,7 +687,8 @@ class TurnRunner:
             op = f"`{name}` -> {result.get('status', result.get('count', ''))}"
             return op, op
         if name == "task":
-            op = f"sub-agent `{str(arguments.get('description', ''))[:50]}` finished ({result.get('tool_calls', 0)} tool calls)"
+            how = "finished" if result.get("status", "completed") == "completed" else "STOPPED EARLY (step limit)"
+            op = f"sub-agent `{str(arguments.get('description', ''))[:50]}` {how} ({result.get('tool_calls', 0)} tool calls)"
             return op, op
         if name == "job_start":
             op = f"started background job `{result.get('job_id', '')}` ({str(arguments.get('command', ''))[:60]})"
@@ -637,6 +712,55 @@ class TurnRunner:
             return op, op
         op = f"ran `{name}`"
         return op, op
+
+    @staticmethod
+    def _failover_worthy(exc: Exception) -> bool:
+        """Errors another provider could plausibly avoid: unavailable, overloaded, or a credentials problem.
+        Never 400/404/422: those are about the request and would fail anywhere."""
+        if isinstance(exc, (httpx.TimeoutException, httpx.TransportError, StreamCutError)):
+            return True
+        status = getattr(exc, "status_code", None)
+        return status in (401, 403, 429) or (isinstance(status, int) and status >= 500)
+
+    async def _try_failover(self, exc: Exception) -> bool:
+        """Switch the agent to the next configured fallback provider. True if a switch happened."""
+        agent = self.agent
+        builder = getattr(agent, "provider_builder", None)
+        pending = getattr(agent, "fallback_ids", None)
+        if not builder or not pending or not self._failover_worthy(exc):
+            return False
+        old = agent.provider
+        old_name = getattr(getattr(old, "config", None), "name", "provider")
+        while pending:
+            candidate_id = pending.pop(0)
+            new = builder(candidate_id)
+            if new is None:
+                await self.trace("failover_skipped", f"Fallback {candidate_id} is unusable (unknown id or no API key)")
+                continue
+            reason = str(exc).splitlines()[0][:140]
+            agent.provider = new
+            agent.failovers.append((old_name, candidate_id, reason))
+            await self.emit(f"_tool_ ⚠️ {old_name} failed ({reason}); switching to {candidate_id} for this session")
+            await self.trace("failover", f"{old_name} → {candidate_id}: {reason}", provider=candidate_id, error=reason)
+            try:
+                closer = getattr(old, "close", None)
+                if closer:
+                    result = closer()
+                    if asyncio.iscoroutine(result):
+                        await asyncio.wait_for(result, timeout=2)
+            except Exception:
+                pass
+            return True
+        return False
+
+    def _make_sandbox(self) -> Sandbox:
+        opts = getattr(self.agent, "sandbox_options", None) or {}
+        return Sandbox(
+            self.workspace,
+            opts.get("mode", getattr(self.agent, "sandbox_mode", "auto")),
+            default_protected_paths(opts.get("allow_read", ()), opts.get("deny_read", ())),
+            network=opts.get("network", True),
+        )
 
     def _parallel_ok(self, call: ToolCall) -> bool:
         """Read-only tools and read-only (explore) sub-agents may run concurrently."""
@@ -679,10 +803,11 @@ class TurnRunner:
                 asyncio.ensure_future(self.emit(f"_tool_ ↳ [{label}] {chunk[7:]}"))
 
         def on_trace(stage: str, payload: Dict[str, Any]) -> None:
-            if stage == "usage":  # sub-agent tokens count toward the turn's usage and cost
-                asyncio.ensure_future(self.trace("usage", f"sub-agent usage ({label})", **{
-                    k: payload[k] for k in ("prompt_tokens", "completion_tokens", "total_tokens") if k in payload
-                }))
+            if stage == "usage":  # sub-agent tokens count toward the turn's usage, cost and budget
+                sub_usage = {k: payload[k] for k in ("prompt_tokens", "completion_tokens", "total_tokens") if k in payload}
+                for k in self.turn_usage:  # synchronously: the budget check must never miss it
+                    self.turn_usage[k] += int(sub_usage.get(k) or 0)
+                asyncio.ensure_future(self.trace("usage", f"sub-agent usage ({label})", **sub_usage))
             elif stage == "model_step":
                 forwarded["steps"] = payload.get("step", forwarded["steps"])
             elif stage == "step_record":
@@ -715,8 +840,15 @@ class TurnRunner:
         report = (report or "").strip() or "(the sub-agent returned no report)"
         if len(report) > SUBAGENT_REPORT_CHARS:
             report = report[:SUBAGENT_REPORT_CHARS] + "\n…[report truncated]"
+        stopped = runner.hit_step_cap
+        if stopped:
+            report = (
+                f"[INCOMPLETE: this sub-agent ran out of its {SUBAGENT_MAX_STEPS}-step limit before finishing; "
+                f"treat the report below as partial.]\n{report}"
+            )
         return {
             "description": label, "mode": mode, "report": report,
+            "status": "hit_step_limit" if stopped else "completed",
             "tool_calls": runner.tool_call_count, "steps": forwarded["steps"],
         }
 
@@ -783,7 +915,19 @@ class TurnRunner:
         final_streamed = False
         empty_retries = 0
 
+        budget: Budget = getattr(agent, "budget", None) or Budget()
+        wrapping_up = False
         for tool_step in range(self.max_steps):
+            if budget.active and tool_step > 0 and not wrapping_up and self.depth == 0:
+                pcfg = getattr(self.provider, "config", None)
+                reason = budget.exceeded(
+                    steps=tool_step, usage=self.turn_usage, elapsed=time.monotonic() - t_turn,
+                    provider_type=getattr(pcfg, "provider_type", "cloud"), options=getattr(pcfg, "options", {}) or {},
+                )
+                if reason:
+                    wrapping_up, budget_reason = True, reason
+                    self.messages.append({"role": "user", "content": BUDGET_WRAPUP.format(reason=reason)})
+                    await self.trace("budget_hit", f"Budget reached: {reason}", reason=reason)
             trim_old_tool_results(self.messages)
             if compact_messages(self.messages, self.system_prompt, window, prompt_index):
                 await self.trace("context_compacted", "Trimmed older tool steps to stay within the context window")
@@ -801,6 +945,11 @@ class TurnRunner:
                 self.system_prompt = self._compose_system_prompt(memory_text, context_blocks)
                 continue
             except httpx.TimeoutException as exc:
+                if await self._try_failover(exc):
+                    self.mode = self._pick_mode()
+                    self.system_prompt = self._compose_system_prompt(memory_text, context_blocks)
+                    window = int(getattr(self.provider, "context_window", 32768) or 32768)
+                    continue
                 error_msg = (
                     f"Provider {self.provider_type} timed out ({self.endpoint}). "
                     "The model did not respond within the configured timeout."
@@ -812,6 +961,11 @@ class TurnRunner:
                     "check your connection, or select a different provider."
                 )
             except httpx.HTTPError as exc:
+                if await self._try_failover(exc):
+                    self.mode = self._pick_mode()
+                    self.system_prompt = self._compose_system_prompt(memory_text, context_blocks)
+                    window = int(getattr(self.provider, "context_window", 32768) or 32768)
+                    continue
                 error_msg = f"Provider {self.provider_type} request failed ({self.endpoint}): {exc}"
                 await self.trace("provider_error", error_msg, provider=self.provider_type, error=str(exc))
                 if getattr(exc, "status_code", None) in (401, 403):
@@ -835,6 +989,12 @@ class TurnRunner:
             )
 
             candidate = step.text
+            if wrapping_up:
+                # the forced answer: whatever it said is the response; any tool call is ignored
+                tool_response = _strip_tool_markup(candidate) + BUDGET_NOTE.format(reason=budget_reason)
+                final_streamed = False
+                await self._record_step(tool_step + 1, step, step_secs, ctx_tokens)
+                break
             calls: List[ToolCall]
             if self.mode == "native":
                 calls = list(step.tool_calls)
@@ -947,6 +1107,7 @@ class TurnRunner:
                 })
         else:
             hit_cap = True
+            self.hit_step_cap = True
 
         if hit_cap:
             # Never discard real progress: if tools actually ran before the cap

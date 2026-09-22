@@ -69,6 +69,7 @@ from core.context import estimate_tokens
 from core.orchestrator import TaskManager, TaskRequest
 from core.pricing import format_cost, turn_cost
 from core import trajectory as traj
+from core.session import state_dir
 from core.providers import ModelConfig
 from core.session import SessionStore, state_dir
 from core.skills import SkillLibrary, slugify
@@ -224,7 +225,9 @@ class AppState:
         agent = MotionAgent(model_config, mcp_manager=self.mcp_manager)
         agent.auto_skill_synthesis = self.auto_synthesis_enabled
         agent.permissions_config = self.config_manager.data
-        agent.sandbox_mode = str(self.config_manager.get("sandbox", "auto"))
+        from core.agent_config import configure_agent
+
+        configure_agent(agent, self.config_manager.get, self.config_manager)
         agent.auto_remember = bool(self.config_manager.get("remember_turns", True))
         try:
             agent.recall_timeout = float(self.config_manager.get("recall_timeout", 2.0))
@@ -418,7 +421,7 @@ def _slugify_name(name: str) -> str:
 
 def _skills_dir() -> Path:
     """Where /skill save writes: project-local, under the self-ignoring .motion/."""
-    return Path(WORKSPACE) / ".motion" / "skills"
+    return state_dir(WORKSPACE, "skills")
 
 
 # Phrases that count as an explicit go-ahead to start creating/editing files.
@@ -655,6 +658,8 @@ class ChatComposer(Static, can_focus=True):
         ("/diff", "show the last turn's edits (on|off toggles inline diffs)"),
         ("/trajectory", "steps, tokens and tools of the last turn (copy|save|all)"),
         ("/tracking", "save session transcripts locally (on|off)"),
+        ("/effort", "reasoning effort for the model (low|medium|high|off)"),
+        ("/budget", "per-turn limits (steps N | tokens N | cost X | seconds N | off)"),
         ("/new", "start a fresh conversation"),
         ("/resume", "list or reload a saved session"),
         ("/todos", "show the agent's task list"),
@@ -2963,8 +2968,7 @@ class ChatPane(Vertical):
         )
         if everything:
             doc["steps"], doc["summary"], doc["insights"] = recs, traj.totals(recs), traj.insights(recs)
-        directory = Path(WORKSPACE) / ".motion" / "trajectories"
-        directory.mkdir(parents=True, exist_ok=True)
+        directory = state_dir(WORKSPACE, "trajectories")  # self-ignoring: never lands in the user's commits
         name = f"session-{datetime.now():%Y%m%d-%H%M%S}.json" if everything else f"turn-{recs[0].get('turn', 0)}-{datetime.now():%H%M%S}.json"
         path = directory / name
         path.write_text(json.dumps(doc, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
@@ -3235,7 +3239,7 @@ class ChatPane(Vertical):
         if text.startswith("/tools") or text.strip() == "/help":
             await self._handle_tools_command()
             return
-        if text.split()[0] in ("/compact", "/undo", "/new", "/resume", "/todos", "/mcp", "/diff", "/jobs", "/trajectory", "/tracking"):
+        if text.split()[0] in ("/compact", "/undo", "/new", "/resume", "/todos", "/mcp", "/diff", "/jobs", "/trajectory", "/tracking", "/effort", "/budget"):
             await self._handle_session_command(text, log)
             log.scroll_end(animate=False)
             return
@@ -3359,6 +3363,11 @@ class ChatPane(Vertical):
         "subagent_start": "🧩 subagent.start",
         "subagent_done": "🧩 subagent.done",
         "exploration_nudge": "💡 nudge",
+        "budget_hit": "⏱ budget.hit",
+        "hook_blocked": "🪝 hook.blocked",
+        "hook_output": "🪝 hook.output",
+        "failover": "🔀 failover",
+        "failover_skipped": "🔀 failover.skipped",
     }
     TRACE_BUFFER_MAX = 400
     TRACE_WIDGET_MAX = 250
@@ -3660,6 +3669,9 @@ class ChatPane(Vertical):
                 return detail
 
             detail = ""
+            if event_type == "failover" and payload.get("provider"):
+                self.state.current_provider_id = str(payload["provider"])  # the status line follows the switch
+                self.notify(f"Switched to {payload['provider']} (the previous provider failed)", severity="warning", timeout=8)
             if event_type == "step_record":
                 record = dict(payload.get("record") or {})
                 if record:
@@ -3926,6 +3938,8 @@ class ChatPane(Vertical):
             "  /diff [on|off]              show the last turn's edits / toggle inline diffs",
             "  /trajectory [copy|save|all] steps, tokens and tool results of the last turn (F10 copies the trace log)",
             "  /tracking [on|off]          save session transcripts locally (asked once at first launch)",
+            "  /effort [low|medium|high|off]  how hard reasoning models think (lower = faster and cheaper)",
+            "  /budget [steps N|tokens N|cost X|seconds N|off]  stop a turn that uses more than this",
             "  /new                        start a fresh conversation",
             "  /resume [id]                list saved sessions / reload one",
             "  /todos                      show the agent's task list",
@@ -4024,6 +4038,54 @@ class ChatPane(Vertical):
 
         if cmd == "/trajectory":
             self._trajectory_command(arg, log)
+            return
+
+        if cmd == "/budget":
+            from core.budget import Budget
+
+            budget = self.state.agent.budget or Budget()
+            words = arg.lower().split()
+            fields = {"steps": ("max_steps", int), "tokens": ("max_tokens", int), "cost": ("max_cost_usd", float),
+                      "seconds": ("max_seconds", float)}
+            if words == ["off"]:
+                budget = Budget()
+            elif words:
+                if len(words) != 2 or words[0] not in fields:
+                    log.mount(SystemMessage("Usage: /budget [steps N | tokens N | cost X | seconds N | off]"))
+                    return
+                name, kind = fields[words[0]]
+                try:
+                    value = kind(words[1].lstrip("$"))
+                    if value <= 0:
+                        raise ValueError
+                except ValueError:
+                    log.mount(SystemMessage(f"Usage: /budget {words[0]} <positive number>"))
+                    return
+                setattr(budget, name, value)
+            self.state.agent.budget = budget
+            log.mount(SystemMessage(
+                f"⏱ Per-turn budget: {budget.describe()}"
+                + (" — a turn that reaches it gets one last tool-free step to answer." if budget.active else
+                   " — set one with /budget steps 12 (or tokens / cost / seconds).")
+            ))
+            return
+
+        if cmd == "/effort":
+            options = self.state.agent.provider.config.options
+            level = arg.lower()
+            if level in ("low", "medium", "high"):
+                options["reasoning_effort"] = level
+            elif level in ("off", "default", "none"):
+                options.pop("reasoning_effort", None)
+            elif level:
+                log.mount(SystemMessage("Usage: /effort [low|medium|high|off]"))
+                return
+            current = options.get("reasoning_effort")
+            log.mount(SystemMessage(
+                f"🧠 Reasoning effort: {current or 'model default'}"
+                + ("" if level else " — change it with /effort low|medium|high|off")
+                + " (only models that support it act on this; others ignore it)"
+            ))
             return
 
         if cmd == "/tracking":

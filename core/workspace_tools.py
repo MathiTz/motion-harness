@@ -502,6 +502,9 @@ answer that follow-up directly.
         if name == "replace_in_file":
             self._require_write_access()
             return self._replace_in_file(arguments)
+        if name == "edit_files":
+            self._require_write_access()
+            return self._edit_files(arguments)
         if name == "run_command":
             self._require_write_access()
             return self._run_command(arguments)
@@ -1042,6 +1045,67 @@ answer that follow-up directly.
             "lines_added": added,
             "lines_removed": removed,
             "_diff": diff,
+        }
+
+    MAX_EDITS = 50
+
+    def _edit_files(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Apply several replacements atomically: validate every edit against the in-memory result of
+        the previous ones, and only then write anything."""
+        edits = arguments.get("edits")
+        if not isinstance(edits, list) or not edits:
+            raise WorkspaceToolError("edits must be a non-empty list of {path, old, new}")
+        if len(edits) > self.MAX_EDITS:
+            raise WorkspaceToolError(f"too many edits in one call ({len(edits)}; max {self.MAX_EDITS})")
+        originals: dict[Path, str] = {}
+        current: dict[Path, str] = {}
+        counts: dict[Path, int] = {}
+        for i, edit in enumerate(edits, 1):
+            where = f"edit {i}"
+            if not isinstance(edit, dict):
+                raise WorkspaceToolError(f"{where}: must be an object with path, old and new")
+            old, new = edit.get("old"), edit.get("new")
+            if not isinstance(old, str) or not old:
+                raise WorkspaceToolError(f"{where}: old must be a non-empty string; nothing was written")
+            if not isinstance(new, str):
+                raise WorkspaceToolError(f"{where}: new must be a string; nothing was written")
+            path = self._resolve(edit.get("path", ""))  # may raise OutOfWorkspaceError -> the loop asks the user
+            display = self._display_path(path)
+            if not path.is_file():
+                raise WorkspaceToolError(f"{where}: file does not exist: {display}; nothing was written")
+            if path not in current:
+                self._guard_overwrite(path, display)
+                originals[path] = current[path] = path.read_text(encoding="utf-8")
+                counts[path] = 0
+            found = current[path].count(old)
+            replace_all = bool(edit.get("replace_all"))
+            if found == 0:
+                raise WorkspaceToolError(
+                    f"{where} ({display}): old text was not found (check whitespace/indentation, and that an earlier "
+                    "edit did not already change it); nothing was written"
+                )
+            if found != 1 and not replace_all:
+                raise WorkspaceToolError(
+                    f"{where} ({display}): old text occurs {found} times; add context or set replace_all; nothing was written"
+                )
+            current[path] = current[path].replace(old, new) if replace_all else current[path].replace(old, new, 1)
+            counts[path] += found if replace_all else 1
+        files, diffs, added_total, removed_total = [], [], 0, 0
+        for path, updated in current.items():
+            if updated == originals[path]:
+                continue
+            display = self._display_path(path)
+            self.session.checkpoints.record(path, "edit_files")
+            path.write_text(updated, encoding="utf-8")
+            self.session.read_files.add(path)
+            diff, added, removed = self._diff(originals[path], updated, display)
+            files.append({"path": display, "replacements": counts[path], "lines_added": added, "lines_removed": removed})
+            diffs.append(diff)
+            added_total += added
+            removed_total += removed
+        return {
+            "edits": len(edits), "files": files, "lines_added": added_total, "lines_removed": removed_total,
+            "path": files[0]["path"] if len(files) == 1 else "", "_diff": "\n".join(d for d in diffs if d),
         }
 
     # ── sync command tools (tests / scripts; the agent uses aexecute) ────
