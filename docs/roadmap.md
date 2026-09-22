@@ -135,6 +135,12 @@ without hallucinating or faking content.
 - Principle: **never pretend to read a file.** If the active model can't ingest a
   modality, surface a clear message and inform the user.
 
+## Native search (fd-backed file enumeration)
+
+`core/workspace_tools.py`'s `_walk_files` uses `fd` (https://github.com/sharkdp/fd) when it's installed, purely to speed up enumerating files - not a rewrite of any tool logic, and every result still goes through the same `IgnoreMatcher` used by the pure-Python fallback, so which files show up never depends on whether `fd` happens to be present. This was measured, not assumed: profiling showed Python's own `os.walk` (and, in an earlier version of this change, an unconditional per-file ancestor-directory check) as the actual bottleneck on a large tree, not network or subprocess cost - the usual place an agent's wall-clock time goes. `fd`'s own `--exclude` prunes the same directories `os.walk` prunes (the fixed vendor/cache list, plus any bare-name `.gitignore` directory pattern); a rare path-qualified directory-only pattern is the one case still checked in Python, gated so a project with none of those (the common case) pays nothing for it. `MOTION_DISABLE_NATIVE_SEARCH=1` forces the fallback; content matching (`grep`'s regex) stays pure Python regardless, since ripgrep's regex dialect isn't identical to Python's `re` and correctness mattered more here than the extra speed.
+
+A full rewrite of the harness in a faster language was considered and is not planned: an agent turn's wall-clock time is dominated by LLM round-trip latency (seconds) and subprocess I/O (git, test runners - already native binaries), neither of which a faster host language changes. File enumeration on a large tree was the one place raw language speed actually showed up as the bottleneck, and shelling out to an existing, already-fast tool for that one piece was the right-sized fix.
+
 ## Verifying providers live
 
 `python scripts/live_check.py [provider-id | --all]` streams a few tiny requests through a real provider and checks text streaming, token usage, the system prompt and a full tool-call round trip. Verified against Ollama Cloud; run it with an Anthropic or OpenAI key to close the "mock-tested only" item above.
