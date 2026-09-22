@@ -135,6 +135,39 @@ without hallucinating or faking content.
 - Principle: **never pretend to read a file.** If the active model can't ingest a
   modality, surface a clear message and inform the user.
 
+## CLI delegates (Claude Code / Codex without an API key)
+
+`core/cli_delegate.py`: a provider that shells out to an already-installed, already-logged-in `claude`
+or `codex` binary instead of calling an HTTP API, so a Claude Pro/Max or ChatGPT subscription works
+without a separate API key. Each vendor documents this exact automation pattern (Claude Code:
+`claude -p ... --output-format stream-json`, without `--bare` so the subscription login is used, per
+https://code.claude.com/docs/en/headless, which shows this from an npm script; Codex CLI: `codex exec`
+reusing `codex login`'s cached credentials, per https://learn.chatgpt.com/codex/auth) - never a reused
+OAuth client id or a stored token of our own.
+
+A delegate is architecturally different from every other provider: it runs its OWN agent internally
+(own tools, own edits, directly in the workspace) in ONE call, not our per-step tool-calling loop -
+`TurnRunner.run()` in `core/agent_loop.py` short-circuits to `_run_delegate_call` when
+`provider.is_delegate`. Consequences stated plainly to the user at the start of a delegate turn: our
+sandbox, budget and hooks do not gate what happens inside the call (the CLI's own `--permission-mode`/
+`--sandbox` flags do, mapped from plan/build mode), and `/undo` - which only records around the
+harness's OWN tool calls - does not cover its edits. Session continuity uses each CLI's own resume
+mechanism (`--resume`/`codex exec resume`) rather than replaying the conversation as one growing
+prompt. Codex's resume syntax is inferred, not as firmly documented as Claude's; a wrong guess there
+degrades to a fresh thread rather than failing the turn.
+
+Availability (`core/config.py: has_api_key`/`unavailable_reason`) is PATH presence, not a stored key -
+extending the same "local providers need no key" special case that already existed. An unavailable
+provider (missing key OR missing CLI) now shows in the model picker with the specific reason and fix
+instead of silently disappearing (`ModelDialog._collect_entries` in `ui/tui.py`), and offers the CLI
+delegate as an alternative when it is genuinely available.
+
+Tested against stand-in scripts on `PATH` (streaming, session continuity, cancellation, timeouts, both
+failure shapes), never the real binaries or a real login - neither is installed in this environment.
+Not yet exercised against the real `claude`/`codex` CLIs; Claude's stream-json event shapes are
+implemented from Anthropic's own documented format (this harness already parses that format for its
+own Anthropic provider), Codex's from its documented `--json` event shapes.
+
 ## Native search (fd-backed file enumeration)
 
 `core/workspace_tools.py`'s `_walk_files` uses `fd` (https://github.com/sharkdp/fd) when it's installed, purely to speed up enumerating files - not a rewrite of any tool logic, and every result still goes through the same `IgnoreMatcher` used by the pure-Python fallback, so which files show up never depends on whether `fd` happens to be present. This was measured, not assumed: profiling showed Python's own `os.walk` (and, in an earlier version of this change, an unconditional per-file ancestor-directory check) as the actual bottleneck on a large tree, not network or subprocess cost - the usual place an agent's wall-clock time goes. `fd`'s own `--exclude` prunes the same directories `os.walk` prunes (the fixed vendor/cache list, plus any bare-name `.gitignore` directory pattern); a rare path-qualified directory-only pattern is the one case still checked in Python, gated so a project with none of those (the common case) pays nothing for it. `MOTION_DISABLE_NATIVE_SEARCH=1` forces the fallback; content matching (`grep`'s regex) stays pure Python regardless, since ripgrep's regex dialect isn't identical to Python's `re` and correctness mattered more here than the extra speed.
