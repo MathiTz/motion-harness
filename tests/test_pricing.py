@@ -95,3 +95,30 @@ def test_user_model_entry_does_not_erase_catalog_pricing_or_context_window():
     assert "glm-5.2" in merged["ollama-cloud"]["models"]                  # other catalog models remain
     custom = merge_catalog({"ollama-cloud": {"models": {"my-new-model": {"temperature": 1}}}})
     assert custom["ollama-cloud"]["models"]["my-new-model"] == {"temperature": 1}
+
+
+def test_every_catalog_model_has_pricing_and_a_context_window():
+    """Claude and OpenAI models used to have neither: cost showed 'n/a' for every user of them, and the
+    agent fell back to a 32k context window even for models with far larger real ones."""
+    from core.catalog import BUILTIN_CATALOG
+
+    missing = [
+        f"{pid}/{name}" for pid, cfg in BUILTIN_CATALOG.items()
+        for name, opts in (cfg.get("models") or {}).items()
+        if "input_mtok" not in opts or "output_mtok" not in opts or "context_window" not in opts
+    ]
+    assert missing == []
+
+
+def test_claude_and_openai_prices_are_sane_and_distinct_by_tier():
+    from core.catalog import BUILTIN_CATALOG
+
+    claude = BUILTIN_CATALOG["claude"]["models"]
+    openai = BUILTIN_CATALOG["openai"]["models"]
+    # output is always pricier than input, and nothing is free or absurd
+    for name, opts in {**claude, **openai}.items():
+        assert 0 < opts["input_mtok"] <= opts["output_mtok"] <= 1000, name
+        assert opts["context_window"] >= 100_000, name
+    # a flagship costs more than its mini/haiku sibling
+    assert claude["claude-opus-5"]["input_mtok"] > claude["claude-haiku-4-5"]["input_mtok"]
+    assert openai["gpt-5"]["input_mtok"] > openai["gpt-5-nano"]["input_mtok"]

@@ -636,3 +636,41 @@ def test_ask_rules_also_fire_on_any_segment_and_segment_splitting_is_sane():
     parts = split_segments("make 2>&1 | tee log &> out")
     assert parts[0] == "make" and parts[1].startswith("tee log") and len(parts) == 2   # 2>&1 and &> are not separators
     assert split_segments("") == [] and split_segments("  ;; ") == []
+
+
+# ── system prompt split for cross-turn caching ──────────────────────────────
+
+async def test_the_static_part_of_the_system_prompt_is_identical_across_turns(tmp_path: Path):
+    """The point of the split: the static (cacheable) part must not change just because memory recall
+    or workspace context (git status, the date) differs between turns."""
+    from core.providers import split_system_prompt
+
+    class VaryingRecall:
+        def __init__(self):
+            self.n = 0
+
+        async def retrieve(self, q, top_k=5):
+            self.n += 1
+            return [{"content": f"memory item from call {self.n}"}]
+
+    agent = make_agent(Scripted([text("first"), text("second")]))
+    agent.retriever = VaryingRecall()
+    await run(agent, "one", workspace=str(tmp_path))
+    await run(agent, "two", workspace=str(tmp_path))
+    prompts = [r["system"] for r in agent.provider.requests]
+    statics = [split_system_prompt(p)[0] for p in prompts]
+    dynamics = [split_system_prompt(p)[1] for p in prompts]
+    assert statics[0] == statics[1]                                          # identical: cacheable across turns
+    assert dynamics[0] != dynamics[1]                                        # the memory recall really did differ
+    assert "memory item from call 1" in dynamics[0] and "memory item from call 2" in dynamics[1]
+
+
+async def test_the_static_part_does_not_change_across_steps_of_one_tool_loop(tmp_path: Path):
+    from core.providers import split_system_prompt
+
+    (tmp_path / "a.txt").write_text("x")
+    steps = [call("1", "read_file", path="a.txt"), call("2", "read_file", path="a.txt"), text("done")]
+    agent = make_agent(Scripted(steps))
+    await run(agent, workspace=str(tmp_path))
+    statics = {split_system_prompt(r["system"])[0] for r in agent.provider.requests}
+    assert len(statics) == 1                                                 # one static prefix reused for the whole turn

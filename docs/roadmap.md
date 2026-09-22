@@ -70,8 +70,8 @@ Speed, correctness and safety work that the chat UX sits on.
 - [x] Sub-agents (`task` tool): isolated context, parallel read-only, guarded general mode
 
 ### Still open
+- [x] Sandbox on Linux verified in CI: the runner has bubblewrap and unprivileged user namespaces enabled (`kernel.apparmor_restrict_unprivileged_userns=0`), and the write/read confinement tests run there for real, not just on macOS
 - [ ] Sandbox: Windows backend; hiding *all* of $HOME (only credential stores and harness secrets are hidden today)
-- [ ] Sandbox on Linux is implemented but only exercised where bubblewrap works (CI runners often lack user namespaces)
 - [ ] Recorded-provider evals against real models
 - [ ] Live verification of the Anthropic and OpenAI wire formats (mock-tested only; `scripts/live_check.py` is ready, Ollama Cloud passes)
 

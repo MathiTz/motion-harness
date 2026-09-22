@@ -39,7 +39,7 @@ from core.trajectory import preview_args
 from core.budget import Budget
 from core.instructions import build_context_blocks
 from core.permissions import CommandPolicy
-from core.providers import BaseProvider, NativeToolsUnsupported, StreamCutError, ToolCall
+from core.providers import SYSTEM_CACHE_SPLIT, BaseProvider, NativeToolsUnsupported, StreamCutError, ToolCall
 from core.sandbox import Sandbox, default_protected_paths
 from core.skills import SkillLibrary
 from core.tool_specs import ALL_TOOL_NAMES, MUTATING_TOOLS
@@ -400,10 +400,18 @@ class TurnRunner:
         return "native" if provider.native_tools else "xml"
 
     def _compose_system_prompt(self, memory_text: str, context_blocks: str) -> str:
+        """STATIC part (persona + tool instructions: identical for every step of this turn and every
+        turn of the session) then SYSTEM_CACHE_SPLIT then DYNAMIC part (workspace context + recalled
+        memory: different almost every turn). Providers that cache the system prompt (core.providers.
+        CloudProvider for Anthropic) split on that marker so the large static part is actually reused
+        across a session instead of a changing tail invalidating the whole cached block every turn;
+        every other provider just sees the two parts joined back into one plain string."""
         instructions = self.tools.system_instructions(native=self.mode == "native")  # type: ignore[union-attr]
-        extra = f"\n\n{context_blocks}" if context_blocks else ""
         sub = f"\n\n{self.extra_system}" if self.extra_system else ""
-        return f"You are Motion Agent.{sub}\n\n{instructions}{extra}\n\nMemory Context:\n{memory_text}"
+        static = f"You are Motion Agent.{sub}\n\n{instructions}"
+        dynamic_parts = [p for p in (context_blocks, f"Memory Context:\n{memory_text}") if p and p.strip()]
+        dynamic = "\n\n".join(dynamic_parts)
+        return f"{static}{SYSTEM_CACHE_SPLIT}{dynamic}" if dynamic else static
 
     def _user_message(self) -> Dict[str, Any]:
         if not self.images:

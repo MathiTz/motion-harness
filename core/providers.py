@@ -179,7 +179,7 @@ def _images_of(content: Any) -> List[Dict[str, str]]:
 def _to_openai_messages(messages: List[Dict[str, Any]], system_prompt: str) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     if system_prompt:
-        out.append({"role": "system", "content": system_prompt})
+        out.append({"role": "system", "content": join_system_prompt(system_prompt)})
     for m in messages:
         role = m.get("role")
         if role == "tool":
@@ -273,7 +273,7 @@ def _to_anthropic_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any
 def _to_ollama_messages(messages: List[Dict[str, Any]], system_prompt: str) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     if system_prompt:
-        out.append({"role": "system", "content": system_prompt})
+        out.append({"role": "system", "content": join_system_prompt(system_prompt)})
     for m in messages:
         role = m.get("role")
         if role == "tool":
@@ -779,6 +779,31 @@ def _with_conversation_cache_breakpoint(messages: List[Dict[str, Any]]) -> List[
     return [*messages[:-1], last]
 
 
+# Separates the STATIC part of a system prompt (tool instructions - the same for every step of a
+# turn, and for every turn of a session) from the DYNAMIC part (retrieved memory, git status, the
+# date - different almost every turn). Anthropic's system block can only be cached as a whole, so if
+# the two are concatenated as one string the dynamic tail invalidates the cache on every single
+# request; splitting lets the large static part actually get reused across a session. Composed by
+# core.agent_loop._compose_system_prompt; a plain string with no marker (every other provider, and
+# any caller that never splits it) behaves exactly as before.
+SYSTEM_CACHE_SPLIT = "\n<<MOTION-DYNAMIC-C1F2A9>>\n"
+
+
+def split_system_prompt(system_prompt: str) -> "tuple[str, str]":
+    """(static, dynamic); dynamic is '' when the caller never split the prompt."""
+    if SYSTEM_CACHE_SPLIT not in system_prompt:
+        return system_prompt, ""
+    static, _, dynamic = system_prompt.partition(SYSTEM_CACHE_SPLIT)
+    return static, dynamic
+
+
+def join_system_prompt(system_prompt: str) -> str:
+    """The prompt as one string, for providers that cannot use the split (OpenAI-compatible, Ollama,
+    legacy completion)."""
+    static, dynamic = split_system_prompt(system_prompt)
+    return f"{static}\n\n{dynamic}" if dynamic else static
+
+
 async def _raise_stream(exc: Exception) -> AsyncIterator[StreamEvent]:
     """An async iterator that fails on first use (matches how real streams surface errors)."""
     raise exc
@@ -837,8 +862,19 @@ class CloudProvider(_OpenAICompatMixin, BaseProvider):
         elif opts.get("temperature") is not None:
             payload["temperature"] = opts["temperature"]
         if system_prompt:
-            # Cache the (large, stable) system prompt across the tool loop.
-            payload["system"] = [{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}]
+            static, dynamic = split_system_prompt(system_prompt)
+            # The static part (tool instructions) is identical for every step of this turn and every
+            # turn of the session, so it gets its own cache breakpoint; the dynamic part (memory, git
+            # status, the date) changes almost every turn and would invalidate a shared block, so it
+            # is sent plainly, appended after. See SYSTEM_CACHE_SPLIT above. (Anthropic rejects an
+            # empty text block, so a caller that split with nothing before the marker just sends the
+            # dynamic part, uncached.)
+            blocks = []
+            if static:
+                blocks.append({"type": "text", "text": static, "cache_control": {"type": "ephemeral"}})
+            if dynamic:
+                blocks.append({"type": "text", "text": dynamic})
+            payload["system"] = blocks or [{"type": "text", "text": system_prompt}]
         if tools:
             specs = [
                 {
