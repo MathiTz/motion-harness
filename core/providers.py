@@ -720,6 +720,39 @@ def _env_key_for(endpoint: str) -> str:
     return os.environ.get("MOTION_API_KEY", "")
 
 
+_UNCACHEABLE_BLOCKS = ("thinking", "redacted_thinking")
+
+
+def _with_conversation_cache_breakpoint(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Mark the end of the conversation so Anthropic caches everything before it.
+
+    Every step of a tool loop re-sends the whole conversation; with a breakpoint on the last block, the
+    next step reads the previous prefix at ~10% of the input price instead of paying for it again.
+    (System prompt and tools carry their own breakpoints, so this makes 3 of the 4 allowed.) Only done
+    once there is something to reuse (more than one message), and never on thinking blocks or empty text.
+    """
+    if len(messages) < 2:
+        return messages
+    last = dict(messages[-1])
+    content = last.get("content")
+    if isinstance(content, str):
+        if not content.strip():
+            return messages
+        last["content"] = [{"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}]
+    elif isinstance(content, list) and content:
+        blocks = [dict(b) if isinstance(b, dict) else b for b in content]
+        tail = blocks[-1]
+        if not isinstance(tail, dict) or tail.get("type") in _UNCACHEABLE_BLOCKS:
+            return messages
+        if tail.get("type") == "text" and not str(tail.get("text", "")).strip():
+            return messages
+        tail["cache_control"] = {"type": "ephemeral"}
+        last["content"] = blocks
+    else:
+        return messages
+    return [*messages[:-1], last]
+
+
 async def _raise_stream(exc: Exception) -> AsyncIterator[StreamEvent]:
     """An async iterator that fails on first use (matches how real streams surface errors)."""
     raise exc
@@ -769,7 +802,7 @@ class CloudProvider(_OpenAICompatMixin, BaseProvider):
         payload: Dict[str, Any] = {
             "model": opts.get("model", "claude-sonnet-5"),
             "max_tokens": opts.get("max_tokens", 4096),
-            "messages": _to_anthropic_messages(messages),
+            "messages": _with_conversation_cache_breakpoint(_to_anthropic_messages(messages)),
             "stream": True,
         }
         thinking_budget = opts.get("thinking_budget")
