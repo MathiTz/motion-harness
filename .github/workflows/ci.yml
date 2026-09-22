@@ -29,6 +29,14 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      - name: Install shells and sandbox tooling
+        # Without these the installer's per-shell tests and the bubblewrap sandbox tests silently skip on Linux.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq zsh ksh tcsh csh fish bubblewrap dash
+          # Ubuntu 24.04 blocks unprivileged user namespaces, which bubblewrap needs
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+
       - name: Install dependencies
         run: pip install -r requirements-dev.txt
 
