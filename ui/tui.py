@@ -227,7 +227,7 @@ class AppState:
         agent.permissions_config = self.config_manager.data
         from core.agent_config import configure_agent
 
-        configure_agent(agent, self.config_manager.get)
+        configure_agent(agent, self.config_manager.get, self.config_manager)
         agent.auto_remember = bool(self.config_manager.get("remember_turns", True))
         try:
             agent.recall_timeout = float(self.config_manager.get("recall_timeout", 2.0))
@@ -3366,6 +3366,8 @@ class ChatPane(Vertical):
         "budget_hit": "⏱ budget.hit",
         "hook_blocked": "🪝 hook.blocked",
         "hook_output": "🪝 hook.output",
+        "failover": "🔀 failover",
+        "failover_skipped": "🔀 failover.skipped",
     }
     TRACE_BUFFER_MAX = 400
     TRACE_WIDGET_MAX = 250
@@ -3667,6 +3669,9 @@ class ChatPane(Vertical):
                 return detail
 
             detail = ""
+            if event_type == "failover" and payload.get("provider"):
+                self.state.current_provider_id = str(payload["provider"])  # the status line follows the switch
+                self.notify(f"Switched to {payload['provider']} (the previous provider failed)", severity="warning", timeout=8)
             if event_type == "step_record":
                 record = dict(payload.get("record") or {})
                 if record:

@@ -66,6 +66,7 @@ embedding:
   dimension: 128
 
 # ── Optional behaviour (all keys below are optional) ─────────────────────────
+# fallback_providers: [ollama-cloud/deepseek-v4-flash, claude]   # switch here if the current provider fails
 # hooks:                       # your commands around tool calls
 #   pre_tool:                  # non-zero exit blocks the call
 #     - {match: "write_file|edit_files", command: "./scripts/guard.sh", timeout: 10}

@@ -111,6 +111,9 @@ The JSON result has `ok`, `result`, `error`, `provider`, `model`, `mode`, `steps
 ## config.yml reference (optional keys)
 
 ```yaml
+fallback_providers:          # tried in order if the current provider is down / rate-limited / rejects the key
+  - ollama-cloud/deepseek-v4-flash
+  - claude
 hooks:                       # your commands around tool calls (JSON on stdin; see README)
   pre_tool:                  # non-zero exit blocks the call and tells the model why
     - match: "write_file|replace_in_file|edit_files"   # regex on the tool name

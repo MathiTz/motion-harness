@@ -63,7 +63,7 @@ def build_agent(provider_id: Optional[str]):
     agent.permissions_config = cm.data
     from core.agent_config import configure_agent
 
-    configure_agent(agent, cm.get)
+    configure_agent(agent, cm.get, cm)
     # One-shot runs (often in CI) shouldn't write to the long-term memory DB
     # unless the user opts in explicitly.
     agent.auto_remember = bool(cm.get("remember_turns_headless", False))

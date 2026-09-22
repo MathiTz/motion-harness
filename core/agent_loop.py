@@ -677,6 +677,46 @@ class TurnRunner:
         op = f"ran `{name}`"
         return op, op
 
+    @staticmethod
+    def _failover_worthy(exc: Exception) -> bool:
+        """Errors another provider could plausibly avoid: unavailable, overloaded, or a credentials problem.
+        Never 400/404/422: those are about the request and would fail anywhere."""
+        if isinstance(exc, (httpx.TimeoutException, httpx.TransportError)):
+            return True
+        status = getattr(exc, "status_code", None)
+        return status in (401, 403, 429) or (isinstance(status, int) and status >= 500)
+
+    async def _try_failover(self, exc: Exception) -> bool:
+        """Switch the agent to the next configured fallback provider. True if a switch happened."""
+        agent = self.agent
+        builder = getattr(agent, "provider_builder", None)
+        pending = getattr(agent, "fallback_ids", None)
+        if not builder or not pending or not self._failover_worthy(exc):
+            return False
+        old = agent.provider
+        old_name = getattr(getattr(old, "config", None), "name", "provider")
+        while pending:
+            candidate_id = pending.pop(0)
+            new = builder(candidate_id)
+            if new is None:
+                await self.trace("failover_skipped", f"Fallback {candidate_id} is unusable (unknown id or no API key)")
+                continue
+            reason = str(exc).splitlines()[0][:140]
+            agent.provider = new
+            agent.failovers.append((old_name, candidate_id, reason))
+            await self.emit(f"_tool_ ⚠️ {old_name} failed ({reason}); switching to {candidate_id} for this session")
+            await self.trace("failover", f"{old_name} → {candidate_id}: {reason}", provider=candidate_id, error=reason)
+            try:
+                closer = getattr(old, "close", None)
+                if closer:
+                    result = closer()
+                    if asyncio.iscoroutine(result):
+                        await asyncio.wait_for(result, timeout=2)
+            except Exception:
+                pass
+            return True
+        return False
+
     def _make_sandbox(self) -> Sandbox:
         opts = getattr(self.agent, "sandbox_options", None) or {}
         return Sandbox(
@@ -862,6 +902,11 @@ class TurnRunner:
                 self.system_prompt = self._compose_system_prompt(memory_text, context_blocks)
                 continue
             except httpx.TimeoutException as exc:
+                if await self._try_failover(exc):
+                    self.mode = self._pick_mode()
+                    self.system_prompt = self._compose_system_prompt(memory_text, context_blocks)
+                    window = int(getattr(self.provider, "context_window", 32768) or 32768)
+                    continue
                 error_msg = (
                     f"Provider {self.provider_type} timed out ({self.endpoint}). "
                     "The model did not respond within the configured timeout."
@@ -873,6 +918,11 @@ class TurnRunner:
                     "check your connection, or select a different provider."
                 )
             except httpx.HTTPError as exc:
+                if await self._try_failover(exc):
+                    self.mode = self._pick_mode()
+                    self.system_prompt = self._compose_system_prompt(memory_text, context_blocks)
+                    window = int(getattr(self.provider, "context_window", 32768) or 32768)
+                    continue
                 error_msg = f"Provider {self.provider_type} request failed ({self.endpoint}): {exc}"
                 await self.trace("provider_error", error_msg, provider=self.provider_type, error=str(exc))
                 if getattr(exc, "status_code", None) in (401, 403):

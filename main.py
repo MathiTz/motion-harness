@@ -43,6 +43,9 @@ class MotionAgent:
         self.sandbox_mode = "auto"
         self.budget = None  # core.budget.Budget: per-turn limits (steps/tokens/cost/time)
         self.hooks = None   # core.hooks.Hooks: user commands run before/after tool calls
+        self.fallback_ids: list = []        # providers to switch to when this one is unavailable
+        self.provider_builder = None        # callable(provider_id) -> provider | None
+        self.failovers: list = []           # (from, to, reason) switches made this session
         self.sandbox_options: dict = {}  # allow_read / deny_read / network (see core/sandbox.py)
         # Memory recall must never stall a turn: give up after this many seconds.
         self.recall_timeout = 2.0
