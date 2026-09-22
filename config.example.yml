@@ -66,6 +66,8 @@ embedding:
   dimension: 128
 
 # ── Optional behaviour (all keys below are optional) ─────────────────────────
+# stall_timeout: 180           # fail a turn after this long without model output (0 = off)
+# (per-model option: lenient_streams: true  accepts gateways that never send a stream terminator)
 # fallback_providers: [ollama-cloud/deepseek-v4-flash, claude]   # switch here if the current provider fails
 # hooks:                       # your commands around tool calls
 #   pre_tool:                  # non-zero exit blocks the call

@@ -37,6 +37,10 @@ def configure_agent(agent: Any, get: Callable[..., Any], config_manager: Any = N
     agent.sandbox_mode = agent.sandbox_options["mode"]
     agent.budget = Budget.from_config(get)
     agent.hooks = Hooks.from_config(get)
+    try:
+        agent.stall_timeout = max(0.0, float(get("stall_timeout", 180) or 0))  # seconds without model output; 0 = off
+    except (TypeError, ValueError):
+        agent.stall_timeout = 180.0
     fallbacks = get("fallback_providers", None) or []
     agent.fallback_ids = [fallbacks] if isinstance(fallbacks, str) else [str(f) for f in fallbacks]
     agent.provider_builder = make_provider_builder(config_manager) if config_manager is not None else None

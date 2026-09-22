@@ -39,7 +39,7 @@ from core.trajectory import preview_args
 from core.budget import Budget
 from core.instructions import build_context_blocks
 from core.permissions import CommandPolicy
-from core.providers import BaseProvider, NativeToolsUnsupported, ToolCall
+from core.providers import BaseProvider, NativeToolsUnsupported, StreamCutError, ToolCall
 from core.sandbox import Sandbox, default_protected_paths
 from core.skills import SkillLibrary
 from core.tool_specs import ALL_TOOL_NAMES, MUTATING_TOOLS
@@ -109,6 +109,36 @@ class Outcome:
     failed: bool = False
     nudge: Optional[str] = None
     duration_s: float = 0.0
+
+
+DEFAULT_STALL_TIMEOUT = 180.0
+
+
+async def _stall_guard(stream: Any, timeout: float) -> Any:
+    """Yield the stream's events, failing if none arrives for ``timeout`` seconds.
+
+    httpx's read timeout resets on ANY bytes, so a provider that keeps a stalled response alive with keepalive
+    pings/comments would hang the turn forever; only real events (text, reasoning, tool calls, usage) count here.
+    """
+    iterator = stream.__aiter__()
+    try:
+        while True:
+            try:
+                event = await (asyncio.wait_for(iterator.__anext__(), timeout) if timeout else iterator.__anext__())
+            except StopAsyncIteration:
+                return
+            except asyncio.TimeoutError:
+                raise httpx.ReadTimeout(
+                    f"no model output for {timeout:.0f}s: the connection is open but the stream has stalled"
+                ) from None
+            yield event
+    finally:
+        closer = getattr(iterator, "aclose", None)
+        if closer is not None:
+            try:
+                await closer()
+            except Exception:
+                pass
 
 
 _MOTION_TOOL_BLOCK = re.compile(r"<motion_tool>.*?(?:</motion_tool>|$)", re.DOTALL)
@@ -234,6 +264,7 @@ class TurnRunner:
         self.turn_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         self._pending_images: List[Dict[str, str]] = []
         self.tool_call_count = 0
+        self.hit_step_cap = False  # the turn ended because it ran out of steps, not because it finished
         self.first_ttft: Optional[float] = None
         self.trajectory: List[Dict[str, Any]] = []
 
@@ -413,7 +444,10 @@ class TurnRunner:
         tools_arg = self.tools.tool_schemas() if self.mode == "native" else None  # type: ignore[union-attr]
         tag_filter = _ToolTagFilter() if self.mode == "xml" else None
         started = time.monotonic()
-        async for ev in provider.chat_stream(self.messages, system_prompt=self.system_prompt, tools=tools_arg):
+        stall = float(getattr(self.agent, "stall_timeout", DEFAULT_STALL_TIMEOUT) or 0)
+        async for ev in _stall_guard(
+            provider.chat_stream(self.messages, system_prompt=self.system_prompt, tools=tools_arg), stall
+        ):
             if ev.kind == "text":
                 if res.ttft is None:
                     res.ttft = time.monotonic() - started
@@ -653,7 +687,8 @@ class TurnRunner:
             op = f"`{name}` -> {result.get('status', result.get('count', ''))}"
             return op, op
         if name == "task":
-            op = f"sub-agent `{str(arguments.get('description', ''))[:50]}` finished ({result.get('tool_calls', 0)} tool calls)"
+            how = "finished" if result.get("status", "completed") == "completed" else "STOPPED EARLY (step limit)"
+            op = f"sub-agent `{str(arguments.get('description', ''))[:50]}` {how} ({result.get('tool_calls', 0)} tool calls)"
             return op, op
         if name == "job_start":
             op = f"started background job `{result.get('job_id', '')}` ({str(arguments.get('command', ''))[:60]})"
@@ -682,7 +717,7 @@ class TurnRunner:
     def _failover_worthy(exc: Exception) -> bool:
         """Errors another provider could plausibly avoid: unavailable, overloaded, or a credentials problem.
         Never 400/404/422: those are about the request and would fail anywhere."""
-        if isinstance(exc, (httpx.TimeoutException, httpx.TransportError)):
+        if isinstance(exc, (httpx.TimeoutException, httpx.TransportError, StreamCutError)):
             return True
         status = getattr(exc, "status_code", None)
         return status in (401, 403, 429) or (isinstance(status, int) and status >= 500)
@@ -805,8 +840,15 @@ class TurnRunner:
         report = (report or "").strip() or "(the sub-agent returned no report)"
         if len(report) > SUBAGENT_REPORT_CHARS:
             report = report[:SUBAGENT_REPORT_CHARS] + "\n…[report truncated]"
+        stopped = runner.hit_step_cap
+        if stopped:
+            report = (
+                f"[INCOMPLETE: this sub-agent ran out of its {SUBAGENT_MAX_STEPS}-step limit before finishing; "
+                f"treat the report below as partial.]\n{report}"
+            )
         return {
             "description": label, "mode": mode, "report": report,
+            "status": "hit_step_limit" if stopped else "completed",
             "tool_calls": runner.tool_call_count, "steps": forwarded["steps"],
         }
 
@@ -1065,6 +1107,7 @@ class TurnRunner:
                 })
         else:
             hit_cap = True
+            self.hit_step_cap = True
 
         if hit_cap:
             # Never discard real progress: if tools actually ran before the cap

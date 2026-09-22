@@ -43,6 +43,7 @@ class MotionAgent:
         self.sandbox_mode = "auto"
         self.budget = None  # core.budget.Budget: per-turn limits (steps/tokens/cost/time)
         self.hooks = None   # core.hooks.Hooks: user commands run before/after tool calls
+        self.stall_timeout: float = 180.0   # seconds with no model output before a turn fails (keepalives don't count)
         self.fallback_ids: list = []        # providers to switch to when this one is unavailable
         self.provider_builder = None        # callable(provider_id) -> provider | None
         self.failovers: list = []           # (from, to, reason) switches made this session

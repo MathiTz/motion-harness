@@ -85,6 +85,20 @@ class ProviderError(httpx.HTTPError):
         self.body = body
 
 
+class StreamCutError(ProviderError):
+    """The connection closed before the provider said the response was complete (no [DONE] / finish_reason /
+    done / message_stop). Whatever arrived is partial: text may be cut mid-sentence and a tool call's arguments
+    incomplete, so it must never be treated as a finished answer. ``lenient_streams: true`` in a model's
+    options accepts such streams for gateways that never send a terminator."""
+
+
+def _cut_error(events: int, what: str) -> StreamCutError:
+    return StreamCutError(
+        f"the connection closed before the model finished ({what}; {events} stream events received). "
+        "The reply is incomplete: try again, or switch provider."
+    )
+
+
 class NativeToolsUnsupported(ProviderError):
     """The endpoint/model rejected the native ``tools`` parameter."""
 
@@ -537,11 +551,13 @@ class _OpenAICompatMixin:
     async def _openai_parse(self, url: str, payload: Dict[str, Any], headers: Dict[str, str]) -> AsyncIterator[StreamEvent]:
         acc: Dict[int, Dict[str, str]] = {}
         usage: Optional[Dict[str, int]] = None
+        finished, events = False, 0
         async for line in self._stream_lines(url, payload, headers):  # type: ignore[attr-defined]
             if not line or not line.startswith("data:"):
                 continue
             data_str = line[5:].strip()
             if data_str == "[DONE]":
+                finished = True
                 break
             try:
                 data = json.loads(data_str)
@@ -555,6 +571,9 @@ class _OpenAICompatMixin:
             choices = data.get("choices") or []
             if not choices:
                 continue
+            events += 1
+            if choices[0].get("finish_reason"):
+                finished = True
             delta = choices[0].get("delta") or {}
             reasoning = delta.get("reasoning_content") or delta.get("reasoning")
             if reasoning:
@@ -572,6 +591,8 @@ class _OpenAICompatMixin:
                     slot["name"] = fn["name"]
                 if fn.get("arguments"):
                     slot["args"] += fn["arguments"]
+        if not finished and not self.config.options.get("lenient_streams"):  # type: ignore[attr-defined]
+            raise _cut_error(events, "no [DONE] or finish_reason")  # before any partial tool call is emitted
         for idx in sorted(acc):
             slot = acc[idx]
             if slot["name"]:
@@ -609,6 +630,7 @@ class LocalProvider(BaseProvider):
             payload["tools"] = oa_tools
 
         n = 0
+        done_seen, events_seen = False, 0
         try:
             async for line in self._stream_lines(url, payload):
                 if not line:
@@ -619,6 +641,7 @@ class LocalProvider(BaseProvider):
                     continue
                 if data.get("error"):
                     raise ProviderError(f"ollama error: {data['error']}", body=str(data["error"]))
+                events_seen += 1
                 msg = data.get("message") or {}
                 if msg.get("thinking"):
                     yield StreamEvent("reasoning", text=msg["thinking"])
@@ -636,10 +659,13 @@ class LocalProvider(BaseProvider):
                     if call.name:
                         yield StreamEvent("tool_call", tool_call=call)
                 if data.get("done"):
+                    done_seen = True
                     usage = _ollama_usage(data)
                     if usage:
                         self.last_usage = usage
                         yield StreamEvent("usage", usage=usage)
+            if not done_seen and not self.config.options.get("lenient_streams"):
+                raise _cut_error(events_seen, "no done marker")
         except ProviderError as exc:
             if oa_tools and _tool_rejection(exc):
                 raise NativeToolsUnsupported(str(exc), exc.status_code, exc.body) from exc
@@ -828,6 +854,7 @@ class CloudProvider(_OpenAICompatMixin, BaseProvider):
         blocks: Dict[int, Dict[str, Any]] = {}
         in_tokens = 0
         out_tokens = 0
+        stopped, seen = False, 0
         try:
             async for line in self._stream_lines(self._anthropic_url(), payload, headers):
                 if not line.startswith("data:"):
@@ -837,6 +864,9 @@ class CloudProvider(_OpenAICompatMixin, BaseProvider):
                 except Exception:
                     continue
                 etype = data.get("type")
+                seen += 1
+                if etype == "message_stop":
+                    stopped = True
                 if etype == "message_start":
                     u = (data.get("message") or {}).get("usage") or {}
                     in_tokens = (
@@ -876,6 +906,9 @@ class CloudProvider(_OpenAICompatMixin, BaseProvider):
                         f"anthropic stream error: {err.get('type', 'error')}: {err.get('message', '')}",
                         body=json.dumps(data)[:1000],
                     )
+            if not stopped and not opts.get("lenient_streams"):
+                # includes a tool_use block cut before content_block_stop, which would otherwise vanish silently
+                raise _cut_error(seen, "no message_stop")
         except ProviderError as exc:
             if tools and _tool_rejection(exc):
                 raise NativeToolsUnsupported(str(exc), exc.status_code, exc.body) from exc
