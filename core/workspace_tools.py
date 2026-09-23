@@ -266,6 +266,18 @@ def safe_env() -> dict[str, str]:
     return {k: v for k, v in os.environ.items() if not _SECRET_ENV.search(k)}
 
 
+# Every run_command/run_script/run_python child is wrapped in core/command_watchdog.py (POSIX only)
+# so it cannot outlive the harness process itself - verified with a real `kill -9`, not just a caught
+# CancelledError, before this existed. MOTION_DISABLE_COMMAND_WATCHDOG=1 opts out (e.g. if the extra
+# ~20ms process launch ever matters more than the guarantee, or for a hard-to-anticipate edge case).
+_WATCHDOG_SCRIPT = Path(__file__).resolve().parent / "command_watchdog.py"
+_WATCHDOG_POLL_SECONDS = 2.0
+
+
+def _watchdog_enabled() -> bool:
+    return os.name == "posix" and not os.environ.get("MOTION_DISABLE_COMMAND_WATCHDOG")
+
+
 def _kill_process_tree(proc: "asyncio.subprocess.Process") -> None:
     try:
         if os.name == "posix":
@@ -875,8 +887,24 @@ answer that follow-up directly.
         sandboxed = self.sandbox is not None and self.sandbox.active
         try:
             if sandboxed:
-                argv = self.sandbox.wrap(target, shell=shell, extra_writable=self.allowed_paths)  # type: ignore[union-attr]
-                proc = await asyncio.create_subprocess_exec(*argv, **kwargs)
+                inner_argv = self.sandbox.wrap(target, shell=shell, extra_writable=self.allowed_paths)  # type: ignore[union-attr]
+            elif shell:
+                inner_argv = ["/bin/sh", "-c", str(target)] if os.name == "posix" else None
+            else:
+                inner_argv = [str(a) for a in target]  # type: ignore[union-attr]
+            if inner_argv is not None and _watchdog_enabled():
+                # A clean cancellation (Esc/timeout) already kills this whole tree via
+                # _kill_process_tree below, which works because everything here shares one
+                # process group. This additionally protects against the harness ITSELF being
+                # killed uncatchably (kill -9, OOM, a crash): verified live, an unwrapped child
+                # survives that as an orphan indefinitely. See core/command_watchdog.py.
+                outer_argv = [
+                    sys.executable, str(_WATCHDOG_SCRIPT), str(os.getpid()), str(_WATCHDOG_POLL_SECONDS),
+                    "--", *inner_argv,
+                ]
+                proc = await asyncio.create_subprocess_exec(*outer_argv, **kwargs)
+            elif inner_argv is not None:
+                proc = await asyncio.create_subprocess_exec(*inner_argv, **kwargs)
             elif shell:
                 proc = await asyncio.create_subprocess_shell(str(target), **kwargs)
             else:
