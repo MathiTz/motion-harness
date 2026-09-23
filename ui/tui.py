@@ -71,7 +71,7 @@ from core.pricing import format_cost, turn_cost
 from core import trajectory as traj
 from core.session import state_dir
 from core.providers import ModelConfig
-from core.session import SessionStore, state_dir
+from core.session import INTERRUPTED_MARKER, SessionStore, state_dir
 from core.skills import SkillLibrary, slugify
 from core.toolstate import ToolSession
 from core import auth
@@ -397,20 +397,40 @@ class AppState:
         cm = ConfigManager()
         return cm.list_providers()
 
-    def log_interaction(self, prompt: str, response: str) -> None:
+    def start_turn(self, prompt: str) -> Optional[str]:
+        """Record that a turn is starting, before any tool call runs, so a turn that never
+        reaches log_interaction (the harness process gets killed mid-tool-call) still leaves a
+        trace - see SessionStore.start_turn. Returns the turn_id to pass to log_interaction, or
+        None if tracking is off (nothing recorded, matching log_interaction's own gate)."""
+        if not self.config_manager.get("track_interactions"):
+            return None
+        try:
+            if self._session_store is None:
+                self._session_store = SessionStore(WORKSPACE)
+            return self._session_store.start_turn(prompt)
+        except Exception:
+            return None
+
+    def log_interaction(self, prompt: str, response: str, turn_id: Optional[str] = None) -> None:
         """Append one turn (prompt + full response) to this session's JSONL
         transcript under <workspace>/.motion/sessions/, if the user has opted
-        into tracking. The same transcript powers /resume."""
+        into tracking. The same transcript powers /resume. `turn_id` (from
+        start_turn) lets SessionStore._read reconcile this with that turn's
+        start record instead of the two looking like separate turns."""
         if not self.config_manager.get("track_interactions"):
             return
         try:
             if self._session_store is None:
                 self._session_store = SessionStore(WORKSPACE)
-            self._session_store.append({
+            record: Dict[str, Any] = {
                 "provider": self.current_provider_id,
                 "prompt": prompt,
                 "response": response,
-            })
+            }
+            if turn_id:
+                record["type"] = "turn_end"
+                record["turn_id"] = turn_id
+            self._session_store.append(record)
         except Exception:
             pass
 
@@ -3565,6 +3585,7 @@ class ChatPane(Vertical):
                 timeout=8,
             )
         self._append_trace("interaction_start", prompt[:120])
+        turn_id = self.state.start_turn(display_prompt or prompt)
 
         def render_live(answer: str):
             # Re-parsing a long Markdown document on every token is quadratic;
@@ -3898,7 +3919,7 @@ class ChatPane(Vertical):
             recorded = display_prompt or prompt
             self.state.conversation_turns.append((recorded, self.state.last_agent_response))
             self.state.update_session_context(recorded, self.state.last_agent_response)
-            self.state.log_interaction(recorded, self.state.last_agent_response)
+            self.state.log_interaction(recorded, self.state.last_agent_response, turn_id)
             log.scroll_end(animate=False)
             self._refresh_status()
             main_screen = self.screen
@@ -3913,6 +3934,9 @@ class ChatPane(Vertical):
                 "interaction_cancelled",
                 "user interrupted",
                 prompt_preview=prompt[:120],
+            )
+            self.state.log_interaction(
+                display_prompt or prompt, "[cancelled by user before completion]", turn_id
             )
             return True
         except Exception as e:
@@ -3932,6 +3956,7 @@ class ChatPane(Vertical):
                 model=model_name,
                 prompt_preview=prompt[:120],
             )
+            self.state.log_interaction(display_prompt or prompt, f"[turn failed: {error_detail}]", turn_id)
             if "provider" in error_detail.lower() and "timed out" in error_detail.lower():
                 log.mount(SystemMessage(
                     "💡 Provider timed out. Try again, check your connection, "
