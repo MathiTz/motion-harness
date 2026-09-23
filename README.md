@@ -20,7 +20,7 @@
 
 **Motion Harness** isn't just another agent wrapper; it is a cognitive infrastructure. While standard agents suffer from "context drift" and token inefficiency, Motion Harness implements a persistent **Cognitive Memory Loop**. 
 
-It treats every successful task trajectory as a learning event, crystallizing experience into reusable skills and compressing communication to the absolute theoretical minimum.
+It treats every successful task trajectory as a learning event, crystallizing experience into reusable skills.
 
 ### ⚡ The Core Edge
 
@@ -43,7 +43,7 @@ Get the harness running in under 60 seconds.
 
 **2. Clone and install the harness:**
 ```bash
-git clone <your-repo-url> motion-harness
+git clone https://github.com/MathiTz/motion-harness.git motion-harness
 cd motion-harness
 chmod +x install.sh && ./install.sh
 ```
