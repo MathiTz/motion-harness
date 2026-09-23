@@ -340,6 +340,67 @@ async def test_resume_explains_when_history_is_off(tmp_path, monkeypatch):
         assert any("history is off" in t for t in system_lines(app))
 
 
+async def test_resuming_a_session_does_not_re_run_a_side_effecting_command(tmp_path, monkeypatch):
+    """/resume only replays the saved prompt/response text into conversation history for a NEW
+    turn - it never re-invokes a tool call from a past turn. Proven here, not assumed: a command
+    that leaves a countable side effect is run once, the session is resumed, and the side effect
+    must still show exactly one occurrence."""
+    counter = tmp_path / "count.txt"
+    steps = [call("1", "run_command", command=f"echo x >> {counter}"), text("done")]
+    async with tui_app(tmp_path, monkeypatch, steps, track=True) as (app, pilot):
+        await send(app, pilot, "run it")
+        await wait_idle(app, pilot)
+        assert counter.read_text().count("x") == 1
+        sid = list((tmp_path / ".motion" / "sessions").glob("*.jsonl"))[0].stem
+        await send(app, pilot, "/new")
+        await pilot.pause(0.1)
+        await send(app, pilot, f"/resume {sid}")
+        await pilot.pause(0.2)
+        assert app.state.conversation_turns == [("run it", "done")]
+        assert counter.read_text().count("x") == 1  # unchanged - resume did not re-run the command
+
+
+async def test_cancelling_a_turn_still_leaves_a_visible_record_not_a_silent_gap(tmp_path, monkeypatch):
+    """Before this, cancelling or erroring out of a turn wrote nothing to the transcript at all -
+    the turn just vanished, same as a hard crash would. Every exit path now finalizes a turn_end,
+    so /resume shows what happened instead of silently dropping the turn."""
+    pidfile = tmp_path / "pid"
+    steps = [call("1", "run_command", command=f"echo $$ > {pidfile}; sleep 30"), text("never")]
+    async with tui_app(tmp_path, monkeypatch, steps, track=True) as (app, pilot):
+        await send(app, pilot, "long")
+        for _ in range(60):
+            await pilot.pause(0.05)
+            if pidfile.exists() and pidfile.read_text().strip():
+                break
+        await pilot.press("escape")
+        await wait_idle(app, pilot)
+        sid = list((tmp_path / ".motion" / "sessions").glob("*.jsonl"))[0].stem
+        turns = tui.SessionStore.load(tmp_path, sid)
+        assert len(turns) == 1
+        assert turns[0]["prompt"] == "long"
+        assert "cancelled" in turns[0]["response"].lower()
+        assert not turns[0].get("interrupted")  # a clean cancel is recorded, not a bare "vanished"
+
+
+async def test_a_turn_killed_before_it_can_finish_shows_up_as_interrupted_on_resume(tmp_path, monkeypatch):
+    """The actual crash case: the process dies between start_turn (written before any tool runs)
+    and the code that would write its turn_end - nothing further executes, so this simulates that
+    boundary directly (a real kill -9 of the whole test process can't be scripted from inside it;
+    core/command_watchdog.py's own tests cover that failure mode for run_command's child process
+    at the OS level). /resume must show an explicit interrupted turn, not silently skip it."""
+    async with tui_app(tmp_path, monkeypatch, [text("unused")], track=True) as (app, pilot):
+        app.state.start_turn("started but the harness died right here")
+        sid = list((tmp_path / ".motion" / "sessions").glob("*.jsonl"))[0].stem
+        await send(app, pilot, "/resume")
+        await pilot.pause(0.1)
+        assert any(sid in t and "1 turn(s)" in t for t in system_lines(app))
+        await send(app, pilot, f"/resume {sid}")
+        await pilot.pause(0.2)
+        assert app.state.conversation_turns == [
+            ("started but the harness died right here", tui.INTERRUPTED_MARKER)
+        ]
+
+
 async def test_help_lists_new_commands_and_autocomplete_knows_them(tmp_path, monkeypatch):
     async with tui_app(tmp_path, monkeypatch, [text("x")]) as (app, pilot):
         await send(app, pilot, "/help")
