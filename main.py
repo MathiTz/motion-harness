@@ -276,7 +276,12 @@ async def test_compression():
     assert user_output == fluffy_response
     assert "Certainly!" not in agent_output
     assert len(agent_output) < len(fluffy_response)
-    print("\n✅ Caveman integration verified: Tokens reduced for internal communication!")
+    # The round trip must be exact - this used to only be printed, never checked, which is how a
+    # whitespace-collapse bug and a fragment-reordering bug both shipped without being caught here.
+    assert decompressed == fluffy_response, (
+        f"Caveman round trip is not exact:\nOriginal:      {fluffy_response!r}\nDecompressed:  {decompressed!r}"
+    )
+    print("\n✅ Caveman integration verified: Tokens reduced for internal communication, and the round trip is exact!")
 
 
 async def interactive_chat(provider_id: str | None = None):
