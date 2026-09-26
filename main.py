@@ -208,6 +208,10 @@ def _load_dotenv(config_dir: str) -> None:
             if line and not line.startswith("#") and "=" in line:
                 key, _, value = line.partition("=")
                 key, value = key.strip(), value.strip()
+                if key == "MOTION_DEFAULT_PROVIDER":
+                    # .env.example ships a default here; exporting it as the real override would beat
+                    # the model the user picked in the TUI on every launch (see get_default_provider).
+                    key = "MOTION_DOTENV_DEFAULT_PROVIDER"
                 if key and value:
                     os.environ.setdefault(key, value)
 

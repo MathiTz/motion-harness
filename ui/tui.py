@@ -177,6 +177,7 @@ class AppState:
             "prompt_tokens_est": 0,
             "output_tokens_est": 0,
             "total_tokens_est": 0,
+            "cached_tokens_est": 0,
             "estimated_cost_usd": 0.0,
             "unpriced_turns": 0,
         }
@@ -473,6 +474,39 @@ def _is_build_trigger(text: str) -> bool:
     return any(pattern.search(text) for pattern in _BUILD_TRIGGER_PATTERNS)
 
 
+def _fmt_tok(n: "int | float") -> str:
+    n = int(n or 0)
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    return f"{n / 1000:.1f}k" if n >= 1000 else str(n)
+
+
+_TOOL_LABELS = {
+    "run_command": "running a command", "run_script": "running a script", "run_python": "running Python",
+    "read_file": "reading a file", "read_image": "looking at an image", "list_files": "listing files",
+    "grep": "searching the code", "write_file": "writing a file", "replace_in_file": "editing a file",
+    "edit_files": "editing files", "web_fetch": "fetching a page", "web_search": "searching the web",
+    "task": "working with a sub-agent", "job_start": "starting a background job",
+    "job_output": "reading job output", "job_stop": "stopping a job", "todo_write": "updating the todo list",
+    "ask_user": "asking you", "use_skill": "loading a skill",
+}
+
+
+def _tool_label(tool: str) -> str:
+    """Human phrase for a tool name ("running a command", not "run_command")."""
+    if tool in _TOOL_LABELS:
+        return _TOOL_LABELS[tool]
+    if tool.startswith("mcp__") or tool == "mcp_call":
+        return "calling an MCP tool"
+    return tool.replace("_", " ") or "working"
+
+
+def _one_line(text: str, width: int = 110) -> str:
+    """First line of ``text`` on a single line, cut to ``width`` with an ellipsis."""
+    line = " ".join((text or "").strip().split("\n", 1)[0].split())
+    return line if len(line) <= width else line[: width - 1] + "…"
+
+
 def _extract_reasoning_and_answer(text: str, streaming: bool = False) -> tuple[str, str]:
     """Extract <think>...</think> blocks if present; return (reasoning, answer).
 
@@ -518,9 +552,9 @@ class ReasoningMessage(Static):
     """opencode-style Thinking block — muted header + dim italic body."""
     DEFAULT_CSS = """
     ReasoningMessage {
-        background: $panel;
-        color: $text-muted;
-        border-left: solid $warning;
+        background: transparent;
+        color: $text;
+        text-opacity: 55%;
         padding: 0 2;
         margin: 0 0 1 1;
     }
@@ -536,16 +570,16 @@ class ThinkingMessage(Static):
     """
     DEFAULT_CSS = """
     ThinkingMessage {
-        background: $panel;
-        color: $text-muted;
-        border-left: solid $secondary;
+        background: transparent;
+        color: $text;
+        text-opacity: 55%;
         padding: 0 2;
         margin: 0 0 1 1;
     }
     """
 
 class StepsMessage(Static):
-    """Always-visible live view of tool activity (list/read/write/replace).
+    """Live view of tool activity (list/read/write/replace), removed when the turn ends.
 
     Unlike ThinkingMessage (the model's free-form intermediate text, opt-in
     via show_thinking), this shows concrete tool operations - "wrote x.py",
@@ -554,11 +588,14 @@ class StepsMessage(Static):
     """
     DEFAULT_CSS = """
     StepsMessage {
-        background: $panel;
-        color: $text-muted;
-        border-left: solid $success;
+        background: transparent;
+        color: $text;
+        text-opacity: 45%;
         padding: 0 2;
-        margin: 0 0 1 1;
+        margin: 0 0 0 1;
+        height: auto;
+        text-wrap: nowrap;
+        text-overflow: ellipsis;
     }
     """
 
@@ -1182,7 +1219,9 @@ class ContextPanel(Vertical):
             if existing is not None:
                 existing.remove()
             return
-        text = "[bold]Current turn[/]\n" + "\n".join(f"• {s}" for s in lines[-8:])
+        from rich.markup import escape
+
+        text = "[bold]Current turn[/]\n" + "\n".join(f"• {escape(_one_line(s, 48))}" for s in lines[-6:])
         if existing is not None:
             existing.update(text)
         else:
@@ -2624,9 +2663,9 @@ class MainScreen(Screen):
         provider_hint = self.state.current_provider_id or "unknown"
         text = (
             f"Session · turns={s.get('turns', 0)} · "
-            f"prompt≈{s.get('prompt_tokens_est', 0)} tok · "
-            f"output≈{s.get('output_tokens_est', 0)} tok · "
-            f"total≈{s.get('total_tokens_est', 0)} tok · "
+            f"in {_fmt_tok(s.get('prompt_tokens_est', 0))}"
+            f"{' (' + _fmt_tok(s['cached_tokens_est']) + ' cached)' if s.get('cached_tokens_est') else ''} · "
+            f"out {_fmt_tok(s.get('output_tokens_est', 0))} · "
             f"cost≈${s.get('estimated_cost_usd', 0.0):.4f} · "
             f"provider={provider_hint}"
         )
@@ -3198,8 +3237,6 @@ class ChatPane(Vertical):
             return
         m = self.state.last_turn_metrics or {}
         s = self.state.session_metrics or {}
-        last_total = m.get("total_tokens_est", 0)
-        session_total = s.get("total_tokens_est", 0)
         turns = s.get("turns", 0)
         cost = s.get("estimated_cost_usd", 0.0)
         if isinstance(cost, (int, float)) and cost > 0:
@@ -3219,8 +3256,10 @@ class ChatPane(Vertical):
                 bits.append(f"step {t['step']}")
             if t.get("ttft") is not None:
                 bits.append(f"first token {t['ttft']:.1f}s")
-            if t.get("tokens"):
-                bits.append(f"{self._fmt_tokens(t['tokens'])} tok")
+            if t.get("ctx"):
+                bits.append(f"ctx {_fmt_tok(t['ctx'])}")
+            if t.get("out_tokens"):
+                bits.append(f"out {_fmt_tok(t['out_tokens'])}")
             if self.state.message_queue:
                 bits.append(f"{len(self.state.message_queue)} queued")
             running_jobs = len(self.state.tool_session.jobs.running())
@@ -3244,12 +3283,29 @@ class ChatPane(Vertical):
             running_jobs = len(self.state.tool_session.jobs.running())
             if running_jobs:
                 timing += f"⚙ {running_jobs} job{'s' if running_jobs != 1 else ''} (/jobs)  [dim]·[/]  "
-            status_text.update(
-                f"{timing}"
-                f"[dim]turns[/] {turns}  [dim]·[/]  "
-                f"[dim]last[/] {self._fmt_tokens(last_total)} tok  [dim]·[/]  "
-                f"[dim]session[/] {self._fmt_tokens(session_total)} tok{cost_part}"
+            # ctx = what the model saw on its last request (the number to compare with other tools);
+            # in = input tokens summed over every request of the turn (each one re-sends the context),
+            # of which "cached" were served from the provider's prompt cache at a discount.
+            def tokens(prefix: str, ctx: int, tin: int, cached: int, tout: int, real: bool) -> str:
+                approx = "" if real else "≈"
+                parts = []
+                if ctx:
+                    parts.append(f"ctx {_fmt_tok(ctx)}")
+                parts.append(f"in {approx}{_fmt_tok(tin)}" + (f" ({_fmt_tok(cached)} cached)" if cached else ""))
+                parts.append(f"out {approx}{_fmt_tok(tout)}")
+                return f"[dim]{prefix}[/] " + " · ".join(parts)
+
+            last = tokens(
+                "last", m.get("context_tokens", 0), m.get("prompt_tokens_est", 0), m.get("cached_tokens", 0),
+                m.get("output_tokens_est", 0), m.get("tokens_are_real", True),
             )
+            if m.get("tool_calls"):
+                last += f" · {m['tool_calls']} tool calls"
+            sess = tokens(
+                "session", 0, s.get("prompt_tokens_est", 0), s.get("cached_tokens_est", 0),
+                s.get("output_tokens_est", 0), True,
+            )
+            status_text.update(f"{timing}[dim]turns[/] {turns}  [dim]·[/]  {last}  [dim]·[/]  {sess}{cost_part}")
 
     async def on_composer_submitted(self, event: ComposerSubmitted) -> None:
         await self._submit_composer(event.text)
@@ -3509,11 +3565,13 @@ class ChatPane(Vertical):
                     self._queued_notices.pop(0).remove()
                 live_response = AgentMessage("")
                 log.mount(live_response)
-                log.scroll_end(animate=False)
+                if getattr(self, "_following", True):
+                    log.scroll_end(animate=False)
         finally:
             self.state.busy = False
             self._refresh_status()
-            log.scroll_end(animate=False)
+            if getattr(self, "_following", True):  # not while the user is reading further up
+                log.scroll_end(animate=False)
 
     async def _maybe_auto_compact(self, log: VerticalScroll) -> None:
         """Summarize older turns when the history nears the model's window,
@@ -3571,9 +3629,12 @@ class ChatPane(Vertical):
         step_lines: list[str] = []
         # Real provider-reported usage accumulated across every request made
         # during this turn (each tool-loop step + the final completion).
-        turn_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        turn_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "cached_tokens": 0}
         has_real_usage = False
         summary_info: dict = {}
+        # Only auto-scroll while the user is already at the bottom: scrolling up to
+        # read the thinking must not be yanked back down on every streamed token.
+        following = self._following = True
         self.state.turn_diffs = []
         self.state.trajectory_turn += 1
         if not self.state.seen_first_turn_hint:
@@ -3586,6 +3647,11 @@ class ChatPane(Vertical):
             )
         self._append_trace("interaction_start", prompt[:120])
         turn_id = self.state.start_turn(display_prompt or prompt)
+
+        def near_bottom() -> bool:
+            nonlocal following
+            following = self._following = log.max_scroll_y - log.scroll_y <= 3
+            return following
 
         def render_live(answer: str):
             # Re-parsing a long Markdown document on every token is quadratic;
@@ -3601,6 +3667,7 @@ class ChatPane(Vertical):
                 return
             thinking_steps.append(text)
             if self.state.show_thinking:
+                near_bottom()
                 if thinking_widget is None:
                     thinking_widget = ThinkingMessage("")
                     log.mount(thinking_widget, before=live_response)
@@ -3610,6 +3677,7 @@ class ChatPane(Vertical):
         def flush() -> None:
             nonlocal dirty, reasoning_widget
             dirty = False
+            stick = near_bottom()
             raw = "".join(committed) + step_buf
             inline_reasoning, answer = _extract_reasoning_and_answer(raw, streaming=True)
             reasoning = think_buf
@@ -3621,7 +3689,8 @@ class ChatPane(Vertical):
                     log.mount(reasoning_widget, before=live_response)
                 reasoning_widget.update(Text(reasoning[-1500:], style="dim italic"))
             live_response.update(render_live(answer))
-            log.scroll_end(animate=False)
+            if stick:
+                log.scroll_end(animate=False)
 
         async def renderer() -> None:
             # Coalesce token-rate updates into ~12 renders/second.
@@ -3658,7 +3727,9 @@ class ChatPane(Vertical):
                 dirty = True
                 return
             if chunk.startswith("_out_ "):
-                st["out"] = chunk[6:]
+                line = chunk[6:]
+                head, sep, rest = line.partition(": ")
+                st["out"] = rest if sep and head.replace("_", "").isalnum() and head.islower() else line  # drop "run_command: "
                 return
             # Internal progress markers from the tool loop. "_tool_" (concrete
             # operations like "wrote x.py") is always shown inline so long tasks
@@ -3668,7 +3739,7 @@ class ChatPane(Vertical):
                 step_text = chunk[len("_step_ "):].strip()
                 self._append_trace("tool_progress", step_text[:220])
                 show_thinking_step(step_text)
-                if self.state.show_thinking:
+                if self.state.show_thinking and following:
                     log.scroll_end(animate=False)
                 return
             if chunk.startswith("_tool_ "):
@@ -3676,13 +3747,15 @@ class ChatPane(Vertical):
                 self._append_trace("tool_progress", tool_text[:220])
                 st["out"] = ""
                 if tool_text:
-                    step_lines.append(tool_text)
+                    step_lines.append(_one_line(tool_text))
+                    stick = near_bottom()
                     if steps_widget is None:
                         steps_widget = StepsMessage("")
                         log.mount(steps_widget, before=live_response)
-                    preview = "\n".join(f"• {s}" for s in step_lines[-8:])
-                    steps_widget.update(Text(preview[:3000], style="dim"))
-                    log.scroll_end(animate=False)
+                    preview = "\n".join(f"• {s}" for s in step_lines[-3:])
+                    steps_widget.update(Text(preview, style="dim", no_wrap=True, overflow="ellipsis"))
+                    if stick:
+                        log.scroll_end(animate=False)
                     try:
                         main_screen = self.screen
                         if isinstance(main_screen, MainScreen):
@@ -3705,7 +3778,8 @@ class ChatPane(Vertical):
                 event_type = str(payload.get("stage") or payload.get("event") or "trace")
 
             def _tool_detail(prefix: str, tool: str, path: str, error: str = "") -> str:
-                detail = f"{tool or 'tool'} {prefix}"
+                label = _tool_label(tool or "tool")
+                detail = {"about to run": label, "finished": f"done: {label}", "failed": f"failed: {label}"}.get(prefix, label)
                 if path:
                     detail += f" on `{path}`"
                 if error:
@@ -3727,10 +3801,15 @@ class ChatPane(Vertical):
                 turn_usage["prompt_tokens"] += int(payload.get("prompt_tokens") or 0)
                 turn_usage["completion_tokens"] += int(payload.get("completion_tokens") or 0)
                 turn_usage["total_tokens"] += int(payload.get("total_tokens") or 0)
+                turn_usage["cached_tokens"] += int(payload.get("cached_tokens") or 0)
                 st["tokens"] = turn_usage["total_tokens"]
+                st["out_tokens"] = turn_usage["completion_tokens"]
+                if "sub-agent" not in str(payload.get("message", "")):
+                    st["ctx"] = int(payload.get("prompt_tokens") or 0)  # what the model sees right now
+                cached_note = f" ({payload['cached_tokens']} cached)" if payload.get("cached_tokens") else ""
                 self._append_trace(
                     event_type,
-                    f"+{payload.get('prompt_tokens', 0)} prompt / +{payload.get('completion_tokens', 0)} completion",
+                    f"+{payload.get('prompt_tokens', 0)} in{cached_note} / +{payload.get('completion_tokens', 0)} out",
                 )
                 return
             if event_type == "model_step":
@@ -3753,7 +3832,7 @@ class ChatPane(Vertical):
                 path = payload.get("path", "")
                 error = payload.get("error", "")
                 if event_type == "tool_start":
-                    st["phase"] = f"running {tool}"
+                    st["phase"] = _tool_label(tool)
                     detail = _tool_detail("about to run", tool, path)
                 elif event_type == "tool_done":
                     st["phase"] = "thinking"
@@ -3763,10 +3842,12 @@ class ChatPane(Vertical):
                         added, removed = int(payload.get("added") or 0), int(payload.get("removed") or 0)
                         self.state.turn_diffs.append((path, diff, added, removed))
                         if self.state.show_diffs:
+                            stick = near_bottom()
                             widget = DiffMessage("")
                             widget.show(path, diff, added, removed, self._theme_code_style(self.app.theme))
                             log.mount(widget, before=live_response)
-                            log.scroll_end(animate=False)
+                            if stick:
+                                log.scroll_end(animate=False)
                 else:
                     st["phase"] = "thinking"
                     detail = _tool_detail("failed", tool, path, error)
@@ -3863,6 +3944,7 @@ class ChatPane(Vertical):
                 images=images or None,
             )
             renderer_task.cancel()
+            stick_final = near_bottom()
             reasoning, answer = _extract_reasoning_and_answer(response or "")
             self.state.last_agent_response = answer or ""
             live_response.update(self._render_agent_markdown(header_ts, answer or ""))
@@ -3902,6 +3984,8 @@ class ChatPane(Vertical):
                 "estimated_cost_usd": est_cost_usd,
                 "provider_type": provider_type,
                 "tokens_are_real": has_real_usage,
+                "context_tokens": st.get("ctx", 0),
+                "cached_tokens": turn_usage["cached_tokens"] if has_real_usage else 0,
                 "elapsed_s": elapsed,
                 "ttft_s": st["ttft"],
                 "tool_calls": summary_info.get("tool_calls", 0),
@@ -3911,6 +3995,9 @@ class ChatPane(Vertical):
             session["prompt_tokens_est"] += est_prompt_tokens
             session["output_tokens_est"] += est_output_tokens
             session["total_tokens_est"] += est_prompt_tokens + est_output_tokens
+            session["cached_tokens_est"] = session.get("cached_tokens_est", 0) + (
+                turn_usage["cached_tokens"] if has_real_usage else 0
+            )
             if isinstance(est_cost_usd, (int, float)):
                 session["estimated_cost_usd"] += float(est_cost_usd)
             else:
@@ -3920,7 +4007,8 @@ class ChatPane(Vertical):
             self.state.conversation_turns.append((recorded, self.state.last_agent_response))
             self.state.update_session_context(recorded, self.state.last_agent_response)
             self.state.log_interaction(recorded, self.state.last_agent_response, turn_id)
-            log.scroll_end(animate=False)
+            if stick_final:
+                log.scroll_end(animate=False)
             self._refresh_status()
             main_screen = self.screen
             if isinstance(main_screen, MainScreen):
@@ -3967,6 +4055,11 @@ class ChatPane(Vertical):
             renderer_task.cancel()
             status_timer.stop()
             self._turn = {}
+            if steps_widget is not None:
+                try:
+                    steps_widget.remove()
+                except Exception:
+                    pass
 
     async def _handle_tools_command(self) -> None:
         """Show the available tools and commands (opencode-style /tools | /help)."""

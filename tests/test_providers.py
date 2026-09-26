@@ -226,7 +226,7 @@ async def test_anthropic_streams_thinking_text_tools_and_usage():
     assert res.text == "Reading."
     assert res.reasoning == "plan..."
     assert res.tool_calls[0].arguments == {"path": "a.py"} and res.tool_calls[0].id == "tu1"
-    assert res.usage == {"prompt_tokens": 25, "completion_tokens": 42, "total_tokens": 67}
+    assert res.usage == {"prompt_tokens": 25, "completion_tokens": 42, "total_tokens": 67, "cached_tokens": 5}
     assert seen["url"] == "https://api.anthropic.com/v1/messages"
     assert seen["payload"]["stream"] is True  # required for very large max_tokens
     assert seen["payload"]["system"][0]["cache_control"] == {"type": "ephemeral"}
@@ -627,3 +627,13 @@ async def test_empty_static_part_falls_back_to_an_uncached_single_block():
     await _collect(p, [{"role": "user", "content": "x"}], system=f"{SYSTEM_CACHE_SPLIT}only dynamic")
     blocks = seen["payload"]["system"]
     assert [b["text"] for b in blocks] == ["only dynamic"] and "cache_control" not in blocks[0]
+
+
+def test_cached_prompt_tokens_are_reported_separately_but_stay_inside_the_prompt_count():
+    from core.providers import _anthropic_usage, _openai_usage
+
+    openai = _openai_usage({"usage": {"prompt_tokens": 1000, "completion_tokens": 10, "prompt_tokens_details": {"cached_tokens": 800}}})
+    assert openai == {"prompt_tokens": 1000, "completion_tokens": 10, "total_tokens": 1010, "cached_tokens": 800}
+    assert "cached_tokens" not in _openai_usage({"usage": {"prompt_tokens": 5, "completion_tokens": 1}})
+    anthropic = _anthropic_usage({"usage": {"input_tokens": 50, "cache_read_input_tokens": 4000, "cache_creation_input_tokens": 100, "output_tokens": 7}})
+    assert anthropic == {"prompt_tokens": 4150, "completion_tokens": 7, "total_tokens": 4157, "cached_tokens": 4000}

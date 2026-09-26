@@ -687,10 +687,17 @@ class TurnRunner:
             op = f"searched `{str(arguments.get('pattern', ''))[:40]}` ({result.get('count', 0)} matches)"
             return op, op
         if name == "run_command":
-            op = f"ran `{str(arguments.get('command', '')).strip()}` (exit {result.get('exit_code')})"
+            # first line only, capped: a heredoc or a long pipeline must not flood the transcript or UI
+            cmd = " ".join(str(arguments.get("command", "")).strip().split("\n", 1)[0].split())
+            cmd = cmd if len(cmd) <= 100 else cmd[:99] + "…"
+            op = f"ran `{cmd}` (exit {result.get('exit_code')})"
             return op, op
-        if name in ("run_script", "run_python"):
-            return f"ran `{name}` (exit {result.get('exit_code')})", f"{name} finished (exit {result.get('exit_code')})"
+        if name == "run_python":
+            op = f"ran a Python snippet (exit {result.get('exit_code')})"
+            return op, op
+        if name == "run_script":
+            op = f"ran script `{path}` (exit {result.get('exit_code')})"
+            return op, op
         if name in ("web_fetch", "web_search"):
             op = f"`{name}` -> {result.get('status', result.get('count', ''))}"
             return op, op

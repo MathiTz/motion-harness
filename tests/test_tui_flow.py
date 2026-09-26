@@ -160,7 +160,8 @@ async def test_live_status_shows_phase_elapsed_and_command_output(tmp_path, monk
             if not app.state.busy and app.state.conversation_turns:
                 break
         blob = "\n".join(seen)
-        assert "running run_command" in blob and "Esc cancels" in blob
+        assert "running a command" in blob and "Esc cancels" in blob
+        assert "run_command" not in blob  # human wording, not the tool's internal name
         assert "working" in blob  # latest line of the command's output
         await wait_idle(app, pilot)
 
@@ -596,3 +597,59 @@ def _text_of_group(widget) -> str:
     console = Console(width=120, record=True, file=open(os.devnull, "w"))
     console.print(widget.renderable if hasattr(widget, "renderable") else widget.content)
     return console.export_text()
+
+
+# ── readability: thinking, steps, scrolling, token perception ───────────────
+
+def test_human_tool_labels_and_one_line_truncation():
+    assert tui._tool_label("run_command") == "running a command"
+    assert tui._tool_label("mcp__github__x") == "calling an MCP tool"
+    assert tui._tool_label("some_new_tool") == "some new tool"  # unknown names still read as words
+    long = "echo start\n" + "x" * 300
+    assert tui._one_line(long) == "echo start"
+    assert len(tui._one_line("y" * 300)) == 110 and tui._one_line("y" * 300).endswith("…")
+    assert (tui._fmt_tok(950), tui._fmt_tok(18_250), tui._fmt_tok(2_400_000)) == ("950", "18.2k", "2.4M")
+
+
+async def test_command_steps_are_one_short_line_and_gone_after_the_turn(tmp_path, monkeypatch):
+    heredoc = "cat <<'EOF' > /dev/null\n" + "line\n" * 40 + "EOF"
+    steps = [call("1", "run_command", command=heredoc), text("done")]
+    async with tui_app(tmp_path, monkeypatch, steps) as (app, pilot):
+        await send(app, pilot, "go")
+        await wait_idle(app, pilot)
+        assert not list(app.screen.query(tui.StepsMessage))  # nothing left cluttering the chat
+        pane = app.screen.query_one(tui.ChatPane)
+        progress = [ln for ln in pane._trace_lines if "tool.progress" in ln]
+        assert progress and "line" not in progress[0]  # only the first line of the heredoc reached the UI
+
+
+async def test_status_reports_context_size_separately_from_summed_input(tmp_path, monkeypatch):
+    async with tui_app(tmp_path, monkeypatch, [text("hi")]) as (app, pilot):
+        await send(app, pilot, "q")
+        await wait_idle(app, pilot)
+        app.state.last_turn_metrics.update(
+            context_tokens=18_250, prompt_tokens_est=220_000, cached_tokens=190_000,
+            output_tokens_est=3_000, tokens_are_real=True, tool_calls=6,
+        )
+        app.state.session_metrics.update(prompt_tokens_est=220_000, cached_tokens_est=190_000, output_tokens_est=3_000)
+        app.screen.query_one(tui.ChatPane)._refresh_status()
+        status = _text_of(app.screen.query_one("#chat_status_text"))
+        assert "ctx 18.2k" in status and "in 220.0k (190.0k cached)" in status and "out 3.0k" in status
+        assert "6 tool calls" in status
+
+
+async def test_streaming_does_not_yank_the_view_back_while_you_read_above(tmp_path, monkeypatch):
+    steps = [call("1", "run_command", command="sleep 1"), text(*[f"chunk {i}\n\n" for i in range(60)])]
+    async with tui_app(tmp_path, monkeypatch, steps) as (app, pilot):
+        log = app.screen.query_one("#chat_log")
+        for i in range(80):
+            await log.mount(tui.SystemMessage(f"filler {i}"))
+        await send(app, pilot, "go")
+        for _ in range(40):
+            await pilot.pause(0.05)
+            if app.state.busy:
+                break
+        log.scroll_to(y=0, animate=False)  # the user scrolls up to read
+        await pilot.pause(0.1)
+        await wait_idle(app, pilot)
+        assert log.scroll_y == 0
