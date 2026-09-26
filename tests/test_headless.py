@@ -318,3 +318,28 @@ def test_cli_config_permissions_can_preapprove_a_command(cli, tmp_path):
         fake2.close()
     assert proc.returncode == 0, proc.stderr
     assert not (tmp_path / "ws" / "keep").exists()
+
+
+# ── default provider precedence (the saved model must survive a restart) ────
+
+def test_saved_model_beats_the_dotenv_default_but_not_a_real_env_pin(tmp_path, monkeypatch):
+    import main
+    from core.config import ConfigManager
+
+    cfg = tmp_path / "config.yml"
+    cfg.write_text("last_provider: ollama-cloud/deepseek-v4.1-flash\n")
+    (tmp_path / ".env").write_text("MOTION_DEFAULT_PROVIDER=ollama-cloud\n")
+    for var in ("MOTION_DEFAULT_PROVIDER", "MOTION_DOTENV_DEFAULT_PROVIDER"):
+        monkeypatch.delenv(var, raising=False)
+    main._load_dotenv(str(tmp_path))
+    try:
+        cm = ConfigManager(str(cfg))
+        assert cm.get_default_provider() == "ollama-cloud/deepseek-v4.1-flash"  # not reset by .env
+        monkeypatch.setenv("MOTION_DEFAULT_PROVIDER", "claude")  # an explicit shell pin still wins
+        assert cm.get_default_provider() == "claude"
+        monkeypatch.delenv("MOTION_DEFAULT_PROVIDER")
+        cfg.write_text("{}\n")  # nothing saved yet: the .env default applies
+        assert ConfigManager(str(cfg)).get_default_provider() == "ollama-cloud"
+    finally:
+        monkeypatch.delenv("MOTION_DOTENV_DEFAULT_PROVIDER", raising=False)
+        monkeypatch.delenv("MOTION_DEFAULT_PROVIDER", raising=False)

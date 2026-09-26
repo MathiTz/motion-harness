@@ -174,13 +174,15 @@ class ConfigManager:
 
     def get_default_provider(self) -> str:
         """Resolve which provider/model to launch with, in priority order:
-        an explicit env override, the last model the user switched to in
-        the TUI (persisted via ``last_provider``), then the catalog's
-        configured default.
+        MOTION_DEFAULT_PROVIDER set in the real environment (an explicit pin, e.g. for
+        scripts/CI), the last model the user switched to in the TUI (``last_provider``), the
+        default written in ``.env`` (see ``main._load_dotenv``: a template value, so it must
+        not outrank the user's own choice), then the catalog's configured default.
         """
         return (
             os.environ.get("MOTION_DEFAULT_PROVIDER")
             or self.data.get("last_provider")
+            or os.environ.get("MOTION_DOTENV_DEFAULT_PROVIDER")
             or self.data.get("providers", {}).get("default", "ollama-cloud")
         )
 
