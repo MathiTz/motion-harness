@@ -536,7 +536,18 @@ def _extract_reasoning_and_answer(text: str, streaming: bool = False) -> tuple[s
 
 # ─── Chat message widgets ─────────────────────────────────────────────────────
 
-class UserMessage(Static):
+class _FadeIn:
+    """New chat messages ease in instead of popping, so the transcript feels alive rather than jumpy."""
+
+    def on_mount(self) -> None:
+        try:
+            self.styles.opacity = 0.0
+            self.styles.animate("opacity", 1.0, duration=0.18, easing="out_cubic")
+        except Exception:
+            self.styles.opacity = 1.0
+
+
+class UserMessage(_FadeIn, Static):
     """User message — thin primary left accent bar, no box."""
     DEFAULT_CSS = """
     UserMessage {
@@ -624,7 +635,7 @@ class DiffMessage(Static):
         self.update(Group(header, Syntax(body, "diff", theme=code_theme, word_wrap=True, background_color="default")))
 
 
-class AgentMessage(Static):
+class AgentMessage(_FadeIn, Static):
     """Agent reply — no box, clean text flow, spaced below the user prompt.
 
     The color is intentionally unset so the Rich Markdown visual keeps its
@@ -638,7 +649,7 @@ class AgentMessage(Static):
     }
     """
 
-class SystemMessage(Static):
+class SystemMessage(_FadeIn, Static):
     """System/info message — muted, single-line."""
     DEFAULT_CSS = """
     SystemMessage {
@@ -1259,8 +1270,8 @@ class ContextPanel(Vertical):
         if getattr(self.state, "todos", None):
             self.update_todos(self.state.todos)
 
-        summary = self.state.context_summary()
-        container.mount(Static(f"[dim]session · {summary}[/]", classes="context_turn"))
+        if getattr(self.state, "_context_turns", None):
+            container.mount(Static(f"[dim]session · {self.state.context_summary()}[/]", classes="context_turn"))
 
         # Resolve the theme primary to a hex for Rich markup.
         try:
@@ -1876,7 +1887,6 @@ class ModelDialog(Screen):
                         pane = screen.query_one(ChatPane)
                         pane._refresh_meta()
                         pane._refresh_connection_line()
-                        screen.refresh_session_footer()
                         break
             except Exception:
                 pass
@@ -2601,14 +2611,6 @@ class MainScreen(Screen):
 
     CSS = """
     #main_shell { height: 1fr; background: $background; }
-    #session_metrics_footer {
-        height: auto;
-        color: $text-muted;
-        background: $background;
-        border-top: blank;
-        padding: 0 2;
-        text-style: dim;
-    }
     """
 
     BINDINGS = [
@@ -2630,13 +2632,11 @@ class MainScreen(Screen):
         with Horizontal(id="main_shell"):
             yield ChatPane(self.state)
             yield ContextPanel(self.state, id="context_panel")
-        yield Label("", id="session_metrics_footer")
         yield Footer()
 
     def on_mount(self) -> None:
         if not self.state.show_activity_rail:
             self.query_one("#context_panel", ContextPanel).styles.display = "none"
-        self.refresh_session_footer()
         self.refresh_context_panel()
 
     def refresh_context_panel(self) -> None:
@@ -2657,22 +2657,6 @@ class MainScreen(Screen):
 
     def action_open_theme_menu(self) -> None:
         self.app.push_screen(ThemeMenuScreen(self))
-
-    def refresh_session_footer(self) -> None:
-        s = self.state.session_metrics or {}
-        provider_hint = self.state.current_provider_id or "unknown"
-        text = (
-            f"Session · turns={s.get('turns', 0)} · "
-            f"in {_fmt_tok(s.get('prompt_tokens_est', 0))}"
-            f"{' (' + _fmt_tok(s['cached_tokens_est']) + ' cached)' if s.get('cached_tokens_est') else ''} · "
-            f"out {_fmt_tok(s.get('output_tokens_est', 0))} · "
-            f"cost≈${s.get('estimated_cost_usd', 0.0):.4f} · "
-            f"provider={provider_hint}"
-        )
-        try:
-            self.query_one("#session_metrics_footer", Label).update(text)
-        except Exception:
-            pass
 
     def set_theme(self, theme_id: str) -> None:
         """Apply a theme and persist it so it's restored on the next launch."""
@@ -2827,7 +2811,7 @@ class ChatPane(Vertical):
     def on_mount(self) -> None:
         log = self.query_one("#chat_log", VerticalScroll)
         log.mount(SystemMessage("⚡ Motion Harness", id="connection_line"))
-        log.mount(SystemMessage("Tip: Ctrl+K commands · Ctrl+O model · Tab agent · F7 thinking · F8 trace · F9 copy · /skill save <name>"))
+        log.mount(SystemMessage("Tip: Ctrl+K commands · Ctrl+O model · Tab plan/build · F8 trace · ? all shortcuts"))
         self._refresh_connection_line()
         self._append_trace("session_start", f"provider={self.state.current_provider_id}")
         self._set_trace_panel_visible(self.state.show_trace_panel)
@@ -3274,7 +3258,7 @@ class ChatPane(Vertical):
             timing = ""
             if m.get("elapsed_s") is not None:
                 timing = f"[dim]last turn[/] {m['elapsed_s']:.1f}s"
-                if m.get("ttft_s") is not None:
+                if (m.get("ttft_s") or 0) >= 1.0:  # only worth a mention when the wait was noticeable
                     timing += f" [dim](first token {m['ttft_s']:.1f}s)[/]"
                 last_cost = m.get("estimated_cost_usd")
                 if isinstance(last_cost, (int, float)) and last_cost > 0:
@@ -3293,19 +3277,22 @@ class ChatPane(Vertical):
                     parts.append(f"ctx {_fmt_tok(ctx)}")
                 parts.append(f"in {approx}{_fmt_tok(tin)}" + (f" ({_fmt_tok(cached)} cached)" if cached else ""))
                 parts.append(f"out {approx}{_fmt_tok(tout)}")
-                return f"[dim]{prefix}[/] " + " · ".join(parts)
+                return (f"[dim]{prefix}[/] " if prefix else "") + " · ".join(parts)
 
             last = tokens(
-                "last", m.get("context_tokens", 0), m.get("prompt_tokens_est", 0), m.get("cached_tokens", 0),
+                "", m.get("context_tokens", 0), m.get("prompt_tokens_est", 0), m.get("cached_tokens", 0),
                 m.get("output_tokens_est", 0), m.get("tokens_are_real", True),
             )
             if m.get("tool_calls"):
                 last += f" · {m['tool_calls']} tool calls"
             sess = tokens(
-                "session", 0, s.get("prompt_tokens_est", 0), s.get("cached_tokens_est", 0),
-                s.get("output_tokens_est", 0), True,
+                f"session · {turns} turn{'s' if turns != 1 else ''} ·", 0, s.get("prompt_tokens_est", 0),
+                s.get("cached_tokens_est", 0), s.get("output_tokens_est", 0), True,
             )
-            status_text.update(f"{timing}[dim]turns[/] {turns}  [dim]·[/]  {last}  [dim]·[/]  {sess}{cost_part}")
+            if m:
+                status_text.update(f"{timing}{last}  [dim]│[/]  {sess}{cost_part}")
+            else:
+                status_text.update(f"[dim]ready · {sess}[/]")
 
     async def on_composer_submitted(self, event: ComposerSubmitted) -> None:
         await self._submit_composer(event.text)
@@ -3635,6 +3622,7 @@ class ChatPane(Vertical):
         # Only auto-scroll while the user is already at the bottom: scrolling up to
         # read the thinking must not be yanked back down on every streamed token.
         following = self._following = True
+        answered = False  # True once real answer text is streaming; until then a live activity line shows
         self.state.turn_diffs = []
         self.state.trajectory_turn += 1
         if not self.state.seen_first_turn_hint:
@@ -3653,7 +3641,23 @@ class ChatPane(Vertical):
             following = self._following = log.max_scroll_y - log.scroll_y <= 3
             return following
 
+        def activity() -> Text:
+            elapsed = time.monotonic() - st["started"]
+            frame = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"[int(elapsed * 10) % 10]
+            phase = str(st.get("phase") or "working")
+            return Text.assemble((f"{frame} ", "bold"), f"{phase[:1].upper()}{phase[1:]}…", (f"  {elapsed:.0f}s", "dim"), style="dim")
+
+        def tick_activity() -> None:
+            if answered:
+                return
+            try:
+                live_response.update(activity())
+            except Exception:
+                pass
+
         def render_live(answer: str):
+            if not answer.strip():
+                return activity()
             # Re-parsing a long Markdown document on every token is quadratic;
             # past a few KB show plain text until the final render.
             if len(answer) > 5000:
@@ -3675,7 +3679,7 @@ class ChatPane(Vertical):
                 thinking_widget.update(Text(preview[:3000], style="dim italic"))
 
         def flush() -> None:
-            nonlocal dirty, reasoning_widget
+            nonlocal dirty, reasoning_widget, answered
             dirty = False
             stick = near_bottom()
             raw = "".join(committed) + step_buf
@@ -3688,6 +3692,7 @@ class ChatPane(Vertical):
                     reasoning_widget = ReasoningMessage("")
                     log.mount(reasoning_widget, before=live_response)
                 reasoning_widget.update(Text(reasoning[-1500:], style="dim italic"))
+            answered = bool(answer.strip())
             live_response.update(render_live(answer))
             if stick:
                 log.scroll_end(animate=False)
@@ -3912,6 +3917,7 @@ class ChatPane(Vertical):
 
         renderer_task = asyncio.create_task(renderer())
         status_timer = self.set_interval(0.25, self._refresh_status)
+        activity_timer = self.set_interval(0.1, tick_activity)
         try:
             await self._maybe_auto_compact(log)
             # Reference prior conversation so the model isn't left to guess:
@@ -3944,6 +3950,7 @@ class ChatPane(Vertical):
                 images=images or None,
             )
             renderer_task.cancel()
+            answered = True
             stick_final = near_bottom()
             reasoning, answer = _extract_reasoning_and_answer(response or "")
             self.state.last_agent_response = answer or ""
@@ -4012,7 +4019,6 @@ class ChatPane(Vertical):
             self._refresh_status()
             main_screen = self.screen
             if isinstance(main_screen, MainScreen):
-                main_screen.refresh_session_footer()
                 main_screen.refresh_context_panel()
             return False
         except asyncio.CancelledError:
@@ -4054,6 +4060,7 @@ class ChatPane(Vertical):
         finally:
             renderer_task.cancel()
             status_timer.stop()
+            activity_timer.stop()
             self._turn = {}
             if steps_widget is not None:
                 try:

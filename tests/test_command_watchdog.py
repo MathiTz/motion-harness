@@ -28,6 +28,21 @@ REAL_SANDBOX = Sandbox(".").active
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
+async def assert_process_gone(pid: int, timeout: float = 5.0) -> None:
+    """A SIGKILLed process can linger briefly as a zombie until its parent (or init, once it is
+    reparented) reaps it, and `kill(pid, 0)` still succeeds on a zombie. Poll instead of checking
+    once, or a slow machine flakes this test even though the kill worked."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        if asyncio.get_running_loop().time() > deadline:
+            pytest.fail(f"process {pid} still exists {timeout:.0f}s after it was killed")
+        await asyncio.sleep(0.05)
+
+
 @pytest.fixture
 def spy_exec(monkeypatch):
     """Records the argv of every asyncio.create_subprocess_exec call while still running it for
@@ -58,9 +73,7 @@ async def test_timeout_kills_the_real_command_not_just_the_watchdog(tmp_path: Pa
         await WorkspaceTools(tmp_path).aexecute(
             "run_command", {"command": f"echo $$ > {pidfile}; sleep 20", "timeout": 1}
         )
-    pid = int(pidfile.read_text().strip())
-    with pytest.raises(ProcessLookupError):
-        os.kill(pid, 0)
+    await assert_process_gone(int(pidfile.read_text().strip()))
 
 
 @needs_posix
@@ -78,9 +91,7 @@ async def test_task_cancellation_still_kills_the_real_command(tmp_path: Path):
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
-    await asyncio.sleep(0.2)
-    with pytest.raises(ProcessLookupError):
-        os.kill(pid, 0)
+    await assert_process_gone(pid)
 
 
 @needs_posix
