@@ -294,7 +294,7 @@ async def test_run_command_captures_output_exit_code_and_truncates(tmp_path: Pat
     ok = await tools.aexecute("run_command", {"command": "echo out; echo err 1>&2; exit 3"})
     assert (ok["exit_code"], ok["stdout"].strip(), ok["stderr"].strip()) == (3, "out", "err")
     big = await tools.aexecute("run_command", {"command": "yes x | head -c 100000"})
-    assert big["truncated"] and len(big["stdout"]) == 20_000
+    assert big["truncated"] and len(big["stdout"]) <= 20_000 and "characters omitted" in big["stdout"]
     # stdin is closed, so a command waiting for input returns instead of hanging
     quiet = await asyncio.wait_for(tools.aexecute("run_command", {"command": "cat"}), 5)
     assert quiet["exit_code"] == 0
