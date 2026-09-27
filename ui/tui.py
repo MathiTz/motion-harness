@@ -36,6 +36,7 @@ import json
 import logging
 import os
 import re
+import textwrap
 import time
 from datetime import datetime
 from pathlib import Path
@@ -60,6 +61,7 @@ from textual.widgets import (
     ListItem,
     ListView,
     LoadingIndicator,
+    RichLog,
     Select,
     Static,
 )
@@ -501,6 +503,26 @@ def _tool_label(tool: str) -> str:
     return tool.replace("_", " ") or "working"
 
 
+LIVE_WINDOW_ROWS = 5
+
+
+def _tail_window(text: str, width: int, rows: int = LIVE_WINDOW_ROWS) -> str:
+    """The last ``rows`` wrapped lines of ``text`` - a fixed-size window onto streaming text.
+
+    Live thinking used to grow the transcript by up to ~15 lines on every refresh; each height change
+    relayouts the whole chat (cost grows with history) and forced a scroll to the bottom, which made
+    scrolling stutter during a long reasoning. A window whose size never changes repaints only itself.
+    """
+    width = max(20, width)
+    total = len(text)
+    lines: list[str] = []
+    for para in text[-(rows * width * 3):].splitlines():
+        lines.extend(textwrap.wrap(para, width) or [""])
+    body = lines[-(rows - 1):]
+    head = f"thinking… {_fmt_tok(total)} chars" if total >= 1000 else "thinking…"
+    return "\n".join([head] + body + [""] * (rows - 1 - len(body)))
+
+
 def _one_line(text: str, width: int = 110) -> str:
     """First line of ``text`` on a single line, cut to ``width`` with an ellipsis."""
     line = " ".join((text or "").strip().split("\n", 1)[0].split())
@@ -547,6 +569,33 @@ class _FadeIn:
             self.styles.opacity = 1.0
 
 
+class _LiveRender:
+    """Paint fixed-size live content (a thinking window, an activity line) without a layout pass.
+
+    ``Static.update()`` always re-lays-out the parent, and every layout pass walks every message in the
+    chat: with a few hundred messages that is ~5 ms each, and streaming did it 10-20 times a second, which
+    is what made scrolling stutter during a long reasoning. Content whose size never changes is painted
+    through ``render()`` + ``refresh()`` instead, which repaints only this widget. The widget gets an
+    explicit height while live and goes back to ``auto`` (one layout) when the real content replaces it.
+    """
+
+    _live = None
+
+    def show_live(self, content, rows: int) -> None:
+        if self._live is None:
+            self.styles.height = rows
+        self._live = content
+        self.refresh()
+
+    def end_live(self) -> None:
+        if self._live is not None:
+            self._live = None
+            self.styles.height = "auto"
+
+    def render(self):
+        return self._live if self._live is not None else super().render()
+
+
 class UserMessage(_FadeIn, Static):
     """User message — thin primary left accent bar, no box."""
     DEFAULT_CSS = """
@@ -559,7 +608,7 @@ class UserMessage(_FadeIn, Static):
     }
     """
 
-class ReasoningMessage(Static):
+class ReasoningMessage(_LiveRender, Static):
     """The model's thinking, shown as dim text. After a turn it becomes a one-line summary of the
     process ("thought for 3.0s · 4 steps") that a click expands to the full thinking and the steps
     the agent took, and collapses again. Mouse-only on purpose: making it focusable would take
@@ -583,6 +632,7 @@ class ReasoningMessage(Static):
 
     def set_process(self, summary: str, detail: str, expanded: bool = False) -> None:
         self._summary, self._detail, self._expanded = summary, detail, expanded
+        self.end_live()  # the fixed-height live window is over
         self._draw()
 
     def _draw(self) -> None:
@@ -601,7 +651,7 @@ class ReasoningMessage(Static):
             self._expanded = not self._expanded
             self._draw()
 
-class ThinkingMessage(Static):
+class ThinkingMessage(_LiveRender, Static):
     """Opt-in live view of the agent's intermediate tool-loop responses.
 
     Distinct from ReasoningMessage (which renders <think> blocks from the
@@ -665,7 +715,7 @@ class DiffMessage(Static):
         self.update(Group(header, Syntax(body, "diff", theme=code_theme, word_wrap=True, background_color="default")))
 
 
-class AgentMessage(_FadeIn, Static):
+class AgentMessage(_LiveRender, _FadeIn, Static):
     """Agent reply — no box, clean text flow, spaced below the user prompt.
 
     The color is intentionally unset so the Rich Markdown visual keeps its
@@ -2759,12 +2809,8 @@ class ChatPane(Vertical):
     #trace_log {
         height: 1fr;
         scrollbar-size: 1 1;
-        padding-top: 1;
-    }
-    #trace_log > * {
-        border-top: blank;
-        padding-top: 0;
-        margin-top: 0;
+        padding: 1 1 0 1;
+        background: transparent;
     }
     #trace_summary_chip {
         height: auto;
@@ -2823,7 +2869,10 @@ class ChatPane(Vertical):
             yield VerticalScroll(id="chat_log")
             with Vertical(id="trace_panel"):
                 yield Label("Interaction Trace", id="trace_header")
-                yield VerticalScroll(id="trace_log")
+                # One virtual-scrolling widget rather than a widget per event: appends and scrolling stay cheap
+                # however many events there are (250 mounted widgets cost ~12 ms per event and ~60 ms per scroll step).
+                yield RichLog(id="trace_log", markup=True, wrap=True, highlight=False, auto_scroll=True,
+                              min_width=20, max_lines=self.TRACE_WIDGET_MAX * 2)
         yield Label("", id="trace_summary_chip")
         yield ChatComposer(
             self.state,
@@ -3447,52 +3496,57 @@ class ChatPane(Vertical):
         return self._consume_attachments(text)[0]
 
     _TRACE_LABELS = {
-        "memory_recall_start": "🧠 memory.recall.start",
-        "memory_recall_done": "🧠 memory.recall.done",
-        "memory_recall_timeout": "🧠 memory.recall.timeout",
-        "model_start": "🤖 model.start",
-        "model_step": "⏱ model.step",
-        "model_done": "🤖 model.done",
-        "turn_start": "▶ turn.start",
-        "turn_done": "🏁 turn.done",
-        "finalize": "✅ finalize",
-        "skill_synthesis_start": "🎓 skill.synthesis.start",
-        "skill_synthesis_done": "🎓 skill.synthesis.done",
-        "skill_synthesis_error": "🎓 skill.synthesis.error",
-        "session_start": "⚡ session.start",
-        "interaction_start": "▶ interaction.start",
-        "interaction_error": "❌ interaction.error",
-        "interaction_cancelled": "⏹ interaction.cancelled",
-        "tool_start": "🔧 about to run",
-        "tool_done": "✅ finished",
-        "tool_error": "❌ failed",
-        "tool_progress": "📶 tool.progress",
-        "provider_error": "⛔ provider.error",
-        "usage": "🧮 usage",
-        "step_cap_hit": "⚠️ step_cap.hit",
-        "loop_warning": "⚠️ loop.warning",
-        "permission_request": "🔐 permission",
-        "context_compacted": "🗜 context.compacted",
-        "native_tools_disabled": "🔁 native_tools.disabled",
-        "todo_update": "☑ todo.update",
-        "sandbox": "🧱 sandbox",
-        "subagent_start": "🧩 subagent.start",
-        "subagent_done": "🧩 subagent.done",
-        "exploration_nudge": "💡 nudge",
-        "budget_hit": "⏱ budget.hit",
-        "hook_blocked": "🪝 hook.blocked",
-        "hook_output": "🪝 hook.output",
-        "failover": "🔀 failover",
-        "failover_skipped": "🔀 failover.skipped",
+        "session_start": "⚡ Session started",
+        "interaction_start": "▶ You asked",
+        "interaction_error": "❌ Error",
+        "interaction_cancelled": "⏹ Cancelled",
+        "memory_recall_done": "🧠 Memory checked",
+        "memory_recall_timeout": "🧠 Memory too slow, skipped",
+        "model_step": "🤖 Model replied",
+        "turn_done": "🏁 Done",
+        "usage": "🧮 Tokens",
+        "tool_start": "🔧 Started",
+        "tool_done": "✅ Finished",
+        "tool_error": "❌ Failed",
+        "tool_progress": "▫ Step",
+        "provider_error": "⛔ Provider error",
+        "step_cap_hit": "⚠️ Step limit reached",
+        "loop_warning": "⚠️ Going in circles",
+        "permission_request": "🔐 Permission",
+        "context_compacted": "🗜 Context trimmed",
+        "native_tools_disabled": "🔁 Switched to text tools",
+        "todo_update": "☑ Todo list updated",
+        "sandbox": "🧱 Sandbox",
+        "subagent_start": "🧩 Sub-agent started",
+        "subagent_done": "🧩 Sub-agent finished",
+        "exploration_nudge": "💡 Nudge",
+        "budget_hit": "⏱ Budget reached",
+        "hook_blocked": "🪝 Hook blocked it",
+        "hook_output": "🪝 Hook says",
+        "failover": "🔀 Switched provider",
+        "failover_skipped": "🔀 Fallback skipped",
+        "skill_synthesis_start": "🎓 Learning a skill",
+        "skill_synthesis_done": "🎓 Skill learned",
+        "skill_synthesis_error": "🎓 Skill not learned",
+    }
+    # Internal bookkeeping events with nothing a person needs to read ("Turn started", "Post-processing completed").
+    _TRACE_HIDDEN = frozenset({"turn_start", "model_start", "model_done", "finalize", "memory_recall_start"})
+    # Boilerplate in the event's message that the label already says.
+    _TRACE_DETAIL = {
+        "memory_recall_done": lambda d: "",
+        "session_start": lambda d: d.removeprefix("provider="),
+        "turn_done": lambda d: d.removeprefix("Turn finished "),
     }
     TRACE_BUFFER_MAX = 400
     TRACE_WIDGET_MAX = 250
 
     def _append_trace(self, event_type: str, detail: str = "", **extra) -> None:
-        if event_type == "stream_chunk":  # one per token: pure noise
+        if event_type == "stream_chunk" or event_type in self._TRACE_HIDDEN:  # one per token / pure bookkeeping
             return
         ts = datetime.now().strftime("%H:%M:%S")
-        label = self._TRACE_LABELS.get(event_type, event_type)
+        label = self._TRACE_LABELS.get(event_type) or event_type.replace("_", " ").capitalize()
+        if event_type in self._TRACE_DETAIL:
+            detail = self._TRACE_DETAIL[event_type](detail or "")
         safe_detail = (detail or "").replace("[", "\\[").replace("]", "\\]")
         line = f"[dim]{ts}[/] {label}"
         if safe_detail:
@@ -3520,12 +3574,9 @@ class ChatPane(Vertical):
 
     def _mount_trace_line(self, line: str) -> None:
         try:
-            trace_log = self.query_one("#trace_log", VerticalScroll)
-            trace_log.mount(SystemMessage(line))
-            children = list(trace_log.children)
-            for old in children[: -self.TRACE_WIDGET_MAX]:
-                old.remove()
-            trace_log.scroll_end(animate=False)
+            trace_log = self.query_one("#trace_log", RichLog)
+            trace_log.write(line)
+            trace_log.write("")  # a blank line between events, as the per-event widgets used to have
             self.query_one("#trace_header", Label).update(f"Interaction Trace ({self._trace_count})")
         except Exception:
             pass
@@ -3533,12 +3584,11 @@ class ChatPane(Vertical):
 
     def _rebuild_trace_panel(self) -> None:
         try:
-            trace_log = self.query_one("#trace_log", VerticalScroll)
-            for child in list(trace_log.children):
-                child.remove()
+            trace_log = self.query_one("#trace_log", RichLog)
+            trace_log.clear()
             for line in self._trace_lines[-self.TRACE_WIDGET_MAX:]:
-                trace_log.mount(SystemMessage(line))
-            trace_log.scroll_end(animate=False)
+                trace_log.write(line)
+                trace_log.write("")
             self.query_one("#trace_header", Label).update(f"Interaction Trace ({self._trace_count})")
         except Exception:
             pass
@@ -3681,13 +3731,11 @@ class ChatPane(Vertical):
             if answered:
                 return
             try:
-                live_response.update(activity())
+                live_response.show_live(activity(), 1)
             except Exception:
                 pass
 
         def render_live(answer: str):
-            if not answer.strip():
-                return activity()
             # Re-parsing a long Markdown document on every token is quadratic;
             # past a few KB show plain text until the final render.
             if len(answer) > 5000:
@@ -3706,7 +3754,7 @@ class ChatPane(Vertical):
                     thinking_widget = ThinkingMessage("")
                     log.mount(thinking_widget, before=live_response)
                 preview = "\n\n".join(f"› {s}" for s in thinking_steps[-6:])
-                thinking_widget.update(Text(preview[:3000], style="dim italic"))
+                thinking_widget.show_live(Text(_tail_window(preview, log.size.width - 8), style="dim italic"), LIVE_WINDOW_ROWS)
 
         def flush() -> None:
             nonlocal dirty, reasoning_widget, answered
@@ -3721,9 +3769,11 @@ class ChatPane(Vertical):
                 if reasoning_widget is None:
                     reasoning_widget = ReasoningMessage("")
                     log.mount(reasoning_widget, before=live_response)
-                reasoning_widget.update(Text(reasoning[-1500:], style="dim italic"))
+                reasoning_widget.show_live(Text(_tail_window(reasoning, log.size.width - 8), style="dim italic"), LIVE_WINDOW_ROWS)
             answered = bool(answer.strip())
-            live_response.update(render_live(answer))
+            if answered:  # until real text arrives the activity line owns this widget (see tick_activity)
+                live_response.end_live()
+                live_response.update(render_live(answer))
             if stick:
                 log.scroll_end(animate=False)
 
@@ -3814,7 +3864,7 @@ class ChatPane(Vertical):
 
             def _tool_detail(prefix: str, tool: str, path: str, error: str = "") -> str:
                 label = _tool_label(tool or "tool")
-                detail = {"about to run": label, "finished": f"done: {label}", "failed": f"failed: {label}"}.get(prefix, label)
+                detail = label
                 if path:
                     detail += f" on `{path}`"
                 if error:
@@ -3946,6 +3996,7 @@ class ChatPane(Vertical):
                 pass
 
         renderer_task = asyncio.create_task(renderer())
+        tick_activity()
         status_timer = self.set_interval(0.25, self._refresh_status)
         activity_timer = self.set_interval(0.1, tick_activity)
         try:
@@ -3981,6 +4032,7 @@ class ChatPane(Vertical):
             )
             renderer_task.cancel()
             answered = True
+            live_response.end_live()
             stick_final = near_bottom()
             reasoning, answer = _extract_reasoning_and_answer(response or "")
             self.state.last_agent_response = answer or ""
