@@ -268,8 +268,12 @@ async def test_tui_shows_subagent_progress_and_undo_reverts_its_edits(tmp_path, 
         await send(app, pilot, "delegate it")
         await wait_idle(app, pilot)
         assert (tmp_path / "made.txt").exists()
-        steps = "\n".join(_text_of(w) for w in app.screen.query(tui_steps())).replace("\\[", "[")  # undo markup escaping
-        assert "↳ [alpha]" in steps and "sub-agent `alpha` finished" in steps
+        # the live steps line disappears with the turn; the trace keeps the record
+        assert not list(app.screen.query(tui_steps()))
+        import ui.tui as tui
+
+        trace = "\n".join(app.screen.query_one(tui.ChatPane)._trace_lines).replace("\\[", "[").replace("\\]", "]")  # undo markup escaping
+        assert "↳ [alpha]" in trace and "sub-agent `alpha` finished" in trace
         await send(app, pilot, "/undo")
         await pilot.pause(0.1)
         assert not (tmp_path / "made.txt").exists() and any("Reverted" in t for t in system_lines(app))

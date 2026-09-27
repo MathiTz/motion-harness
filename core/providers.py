@@ -121,11 +121,15 @@ def _openai_usage(data: Dict[str, Any]) -> Optional[Dict[str, int]]:
         return None
     prompt = int(prompt or 0)
     completion = int(completion or 0)
-    return {
+    out = {
         "prompt_tokens": prompt,
         "completion_tokens": completion,
         "total_tokens": int(usage.get("total_tokens") or (prompt + completion)),
     }
+    cached = int(((usage.get("prompt_tokens_details") or {}).get("cached_tokens")) or 0)
+    if cached:
+        out["cached_tokens"] = cached  # already part of prompt_tokens; billed at a discount
+    return out
 
 
 def _anthropic_usage(data: Dict[str, Any]) -> Optional[Dict[str, int]]:
@@ -137,9 +141,13 @@ def _anthropic_usage(data: Dict[str, Any]) -> Optional[Dict[str, int]]:
     completion = usage.get("output_tokens")
     if prompt is None and completion is None:
         return None
-    prompt = int(prompt or 0)
+    cached = int(usage.get("cache_read_input_tokens") or 0)
+    prompt = int(prompt or 0) + int(usage.get("cache_creation_input_tokens") or 0) + cached
     completion = int(completion or 0)
-    return {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": prompt + completion}
+    out = {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": prompt + completion}
+    if cached:
+        out["cached_tokens"] = cached
+    return out
 
 
 def _ollama_usage(data: Dict[str, Any]) -> Optional[Dict[str, int]]:
@@ -890,6 +898,7 @@ class CloudProvider(_OpenAICompatMixin, BaseProvider):
         blocks: Dict[int, Dict[str, Any]] = {}
         in_tokens = 0
         out_tokens = 0
+        cached_tokens = 0
         stopped, seen = False, 0
         try:
             async for line in self._stream_lines(self._anthropic_url(), payload, headers):
@@ -905,10 +914,11 @@ class CloudProvider(_OpenAICompatMixin, BaseProvider):
                     stopped = True
                 if etype == "message_start":
                     u = (data.get("message") or {}).get("usage") or {}
+                    cached_tokens = int(u.get("cache_read_input_tokens") or 0)
                     in_tokens = (
                         int(u.get("input_tokens") or 0)
                         + int(u.get("cache_creation_input_tokens") or 0)
-                        + int(u.get("cache_read_input_tokens") or 0)
+                        + cached_tokens
                     )
                     out_tokens = int(u.get("output_tokens") or 0)
                 elif etype == "content_block_start":
@@ -951,6 +961,8 @@ class CloudProvider(_OpenAICompatMixin, BaseProvider):
             raise
         if in_tokens or out_tokens:
             usage = {"prompt_tokens": in_tokens, "completion_tokens": out_tokens, "total_tokens": in_tokens + out_tokens}
+            if cached_tokens:
+                usage["cached_tokens"] = cached_tokens
             self.last_usage = usage
             yield StreamEvent("usage", usage=usage)
 
