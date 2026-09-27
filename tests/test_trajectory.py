@@ -218,7 +218,7 @@ async def test_the_trace_log_can_be_copied_as_plain_text(tmp_path, monkeypatch):
         await pilot.press("f10")
         await pilot.pause(0.1)
         assert len(copied) == 1
-        assert "turn.done" in copied[0] and "model.step" in copied[0] and "[dim]" not in copied[0]   # markup stripped
+        assert "Done" in copied[0] and "Model replied" in copied[0] and "[dim]" not in copied[0]   # markup stripped
         assert copied[0].count("\n") >= 3
 
 

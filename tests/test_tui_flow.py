@@ -47,6 +47,9 @@ async def tui_app(tmp_path: Path, monkeypatch, steps, *, mode="build", track=Fal
 
 
 def _text_of(widget) -> str:
+    live = getattr(widget, "_live", None)  # live windows/activity lines are painted, not stored as content
+    if live is not None:
+        return getattr(live, "plain", str(live))
     r = getattr(widget, "renderable", None) or getattr(widget, "content", None)
     return getattr(r, "markup", None) or str(r)
 
@@ -108,13 +111,13 @@ async def test_trace_is_buffered_and_stream_chunks_are_not_traced(tmp_path, monk
         await wait_idle(app, pilot)
         pane = app.screen.query_one(tui.ChatPane)
         joined = "\n".join(pane._trace_lines)
-        assert "model.step" in joined and "turn.done" in joined and "stream.chunk" not in joined
+        assert "Model replied" in joined and "Done" in joined and "stream.chunk" not in joined
         # Panel hidden => no per-event widgets were mounted...
-        assert len(app.screen.query_one("#trace_log").children) == 0
+        assert len(app.screen.query_one("#trace_log").lines) == 0
         # ...and opening it renders the buffered history.
         pane.action_toggle_trace_panel()
         await pilot.pause()
-        assert len(app.screen.query_one("#trace_log").children) == len(pane._trace_lines)
+        assert len(app.screen.query_one("#trace_log").lines) >= len(pane._trace_lines)
 
 
 async def test_trace_buffer_is_bounded(tmp_path, monkeypatch):
@@ -620,7 +623,7 @@ async def test_command_steps_are_one_short_line_and_gone_after_the_turn(tmp_path
         await wait_idle(app, pilot)
         assert not list(app.screen.query(tui.StepsMessage))  # nothing left cluttering the chat
         pane = app.screen.query_one(tui.ChatPane)
-        progress = [ln for ln in pane._trace_lines if "tool.progress" in ln]
+        progress = [ln for ln in pane._trace_lines if "Step" in ln and "ran" in ln]
         assert progress and "line" not in progress[0]  # only the first line of the heredoc reached the UI
 
 
@@ -766,3 +769,90 @@ async def test_with_thinking_turned_on_the_process_starts_expanded(tmp_path, mon
         await send(app, pilot, "q")
         await wait_idle(app, pilot)
         assert "deep thoughts" in _text_of(app.screen.query_one(tui.ReasoningMessage))
+
+
+# ── the trace reads like sentences, not event names ─────────────────────────
+
+async def test_trace_lines_are_plain_language_and_skip_bookkeeping_noise(tmp_path, monkeypatch):
+    steps = [call("1", "run_command", command="echo hi"), text("done")]
+    async with tui_app(tmp_path, monkeypatch, steps) as (app, pilot):
+        await send(app, pilot, "say hi")
+        await wait_idle(app, pilot)
+        from rich.text import Text as RichText
+        pane = app.screen.query_one(tui.ChatPane)
+        lines = [RichText.from_markup(ln).plain for ln in pane._trace_lines]
+        blob = "\n".join(lines)
+        for dev_name in ("session.start", "interaction.start", "turn.start", "turn.done", "model.step",
+                         "memory.recall", "tool.progress", "finalize", "model.done"):
+            assert dev_name not in blob
+        for phrase in ("Session started", "You asked", "Model replied", "Started", "Finished", "Done"):
+            assert phrase in blob
+        assert "say hi" in blob
+        assert not any("Post-processing" in ln or "Turn started" in ln for ln in lines)
+        assert any(ln.rstrip().endswith("Memory checked") for ln in lines)  # no leftover "Memory recall complete"
+        assert any("Done" in ln and " in " in ln for ln in lines)  # "Done · in 0.1s"
+
+
+async def test_unknown_events_still_get_a_readable_label_and_hidden_ones_leave_no_line(tmp_path, monkeypatch):
+    async with tui_app(tmp_path, monkeypatch, [text("x")]) as (app, pilot):
+        pane = app.screen.query_one(tui.ChatPane)
+        before = len(pane._trace_lines)
+        pane._append_trace("brand_new_event", "something happened")
+        pane._append_trace("finalize", "Post-processing completed")
+        added = pane._trace_lines[before:]
+        assert len(added) == 1 and "Brand new event" in added[0] and "something happened" in added[0]
+
+
+# ── long reasoning must not make the transcript re-layout or the scroll stutter ─
+
+def test_tail_window_is_a_fixed_number_of_lines_showing_the_latest_text():
+    text_ = " ".join(f"word{i}" for i in range(3000))
+    out = tui._tail_window(text_, 60)
+    lines = out.split("\n")
+    assert len(lines) == tui.LIVE_WINDOW_ROWS  # constant height however long the reasoning gets
+    assert lines[0].startswith("thinking…") and "chars" in lines[0]
+    assert "word2999" in out and "word0 " not in out
+    assert len(tui._tail_window("short", 60).split("\n")) == tui.LIVE_WINDOW_ROWS  # padded, so the height never changes
+
+
+async def test_live_reasoning_keeps_one_constant_height_and_becomes_a_summary_afterwards(tmp_path, monkeypatch):
+    from core.providers import StreamEvent
+    from tests.test_agent_loop import Scripted
+
+    class Slow(Scripted):
+        async def chat_stream(self, messages, system_prompt="", tools=None, **kw):
+            for ev in self.steps.pop(0):
+                yield ev
+                await asyncio.sleep(0.004)
+
+    words = "weighing option A against option B and the tradeoffs".split()
+    evs = [StreamEvent("reasoning", text=" ".join(words[i % 5:][:6]) + " ") for i in range(400)] + [StreamEvent("text", text="done")]
+    async with tui_app(tmp_path, monkeypatch, [[]]) as (app, pilot):
+        app.state.agent.provider = Slow([evs])
+        await send(app, pilot, "think")
+        heights = set()
+        for _ in range(60):
+            await pilot.pause(0.03)
+            for w in app.screen.query(tui.ReasoningMessage):
+                if w._live is not None:
+                    heights.add(w.size.height)
+            if not app.state.busy and app.state.conversation_turns:
+                break
+        assert heights == {tui.LIVE_WINDOW_ROWS}  # it never grew while streaming
+        await wait_idle(app, pilot)
+        widget = app.screen.query_one(tui.ReasoningMessage)
+        assert widget._live is None and "thought for" in _text_of(widget)  # back to a normal one-line summary
+        assert widget.size.height == 1
+
+
+async def test_the_trace_panel_is_one_widget_however_many_events_arrive(tmp_path, monkeypatch):
+    async with tui_app(tmp_path, monkeypatch, [text("x")]) as (app, pilot):
+        pane = app.screen.query_one(tui.ChatPane)
+        pane.action_toggle_trace_panel()
+        await pilot.pause(0.2)
+        for i in range(600):
+            pane._append_trace("tool_progress", f"ran `echo {i}` (exit 0)")
+        await pilot.pause(0.3)
+        panel = app.screen.query_one("#trace_log")
+        assert len(panel.children) == 0  # virtual lines, not a widget per event
+        assert 0 < len(panel.lines) <= pane.TRACE_WIDGET_MAX * 2 + 2  # bounded
