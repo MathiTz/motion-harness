@@ -560,7 +560,10 @@ class UserMessage(_FadeIn, Static):
     """
 
 class ReasoningMessage(Static):
-    """opencode-style Thinking block — muted header + dim italic body."""
+    """The model's thinking, shown as dim text. After a turn it becomes a one-line summary of the
+    process ("thought for 3.0s · 4 steps") that a click expands to the full thinking and the steps
+    the agent took, and collapses again. Mouse-only on purpose: making it focusable would take
+    keyboard focus away from the composer when clicked (F7 is the keyboard route)."""
     DEFAULT_CSS = """
     ReasoningMessage {
         background: transparent;
@@ -569,7 +572,34 @@ class ReasoningMessage(Static):
         padding: 0 2;
         margin: 0 0 1 1;
     }
+    ReasoningMessage:hover {
+        text-opacity: 85%;
+    }
     """
+
+    _summary = ""
+    _detail = ""
+    _expanded = False
+
+    def set_process(self, summary: str, detail: str, expanded: bool = False) -> None:
+        self._summary, self._detail, self._expanded = summary, detail, expanded
+        self._draw()
+
+    def _draw(self) -> None:
+        if not self._detail:
+            self.update(Text(f"▸ {self._summary}", style="dim italic"))
+            return
+        if self._expanded:
+            text = Text(f"▾ {self._summary}", style="dim italic")
+            text.append("\n\n" + self._detail, style="dim")
+        else:
+            text = Text(f"▸ {self._summary}  (click to expand)", style="dim italic")
+        self.update(text)
+
+    def on_click(self) -> None:
+        if self._detail:
+            self._expanded = not self._expanded
+            self._draw()
 
 class ThinkingMessage(Static):
     """Opt-in live view of the agent's intermediate tool-loop responses.
@@ -3960,17 +3990,27 @@ class ChatPane(Vertical):
             # keeps the full text visible) so the answer stays the focus. This
             # also covers turns that finished before the first render tick.
             all_reasoning = "\n\n".join(x for x in (think_buf, reasoning) if x).strip()
-            if all_reasoning or reasoning_widget is not None:
+            narration = "\n\n".join(thinking_steps).strip()  # the model's text between tool calls
+            if all_reasoning or narration or step_lines or reasoning_widget is not None:
                 if reasoning_widget is None:
                     reasoning_widget = ReasoningMessage("")
                     log.mount(reasoning_widget, before=live_response)
                 secs = (think_last - think_t0) if think_t0 is not None else elapsed
-                if self.state.show_thinking:
-                    reasoning_widget.update(Text(all_reasoning[-2500:], style="dim italic"))
-                else:
-                    reasoning_widget.update(Text(
-                        f"▸ thought for {max(secs, 0.1):.1f}s  (F7 shows reasoning)", style="dim italic"
-                    ))
+                parts = []
+                if all_reasoning or (reasoning_widget is not None and not step_lines and not narration):
+                    parts.append(f"thought for {max(secs, 0.1):.1f}s")
+                if step_lines:
+                    parts.append(f"{len(step_lines)} step{'s' if len(step_lines) != 1 else ''}")
+                sections = []
+                if all_reasoning:
+                    sections.append(all_reasoning[-6000:])
+                if narration:
+                    sections.append(narration[-3000:])
+                if step_lines:
+                    sections.append("Steps\n" + "\n".join(f"• {ln}" for ln in step_lines[-60:]))
+                reasoning_widget.set_process(
+                    " · ".join(parts) or "process", "\n\n".join(sections), expanded=self.state.show_thinking
+                )
             if has_real_usage:
                 est_prompt_tokens = turn_usage["prompt_tokens"]
                 est_output_tokens = turn_usage["completion_tokens"]

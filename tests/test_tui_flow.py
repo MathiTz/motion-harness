@@ -718,3 +718,51 @@ async def test_status_line_fits_and_only_mentions_a_slow_first_token(tmp_path, m
         assert "first token" not in line
         from rich.text import Text as RichText
         assert len(RichText.from_markup(line).plain) < 110  # must fit the chat column without being cut off
+
+
+# ── click the "thought for Ns" line to see the process ──────────────────────
+
+async def test_clicking_the_thought_line_expands_the_reasoning_and_collapses_again(tmp_path, monkeypatch):
+    steps = [reasoning("first I will ", "weigh the options") + text("42")]
+    async with tui_app(tmp_path, monkeypatch, steps) as (app, pilot):
+        await send(app, pilot, "meaning of life?")
+        await wait_idle(app, pilot)
+        widget = app.screen.query_one(tui.ReasoningMessage)
+        assert "thought for" in _text_of(widget) and "click to expand" in _text_of(widget)
+        assert "weigh the options" not in _text_of(widget)
+        await pilot.click(tui.ReasoningMessage)
+        await pilot.pause(0.1)
+        assert "▾" in _text_of(widget) and "first I will weigh the options" in _text_of(widget)
+        await pilot.click(tui.ReasoningMessage)
+        await pilot.pause(0.1)
+        assert "weigh the options" not in _text_of(widget) and "▸" in _text_of(widget)
+
+
+async def test_the_steps_of_a_turn_can_be_reopened_after_they_disappear(tmp_path, monkeypatch):
+    steps = [call("1", "run_command", command="echo one"), call("2", "run_command", command="echo two"), text("done")]
+    async with tui_app(tmp_path, monkeypatch, steps) as (app, pilot):
+        await send(app, pilot, "go")
+        await wait_idle(app, pilot)
+        assert not list(app.screen.query(tui.StepsMessage))  # the live steps line is gone...
+        widget = app.screen.query_one(tui.ReasoningMessage)  # ...but the process is one click away
+        assert "2 steps" in _text_of(widget)
+        await pilot.click(tui.ReasoningMessage)
+        await pilot.pause(0.1)
+        expanded = _text_of(widget)
+        assert "ran `echo one`" in expanded and "ran `echo two`" in expanded
+
+
+async def test_a_plain_answer_with_no_process_shows_no_summary_line(tmp_path, monkeypatch):
+    async with tui_app(tmp_path, monkeypatch, [text("just an answer")]) as (app, pilot):
+        await send(app, pilot, "hi")
+        await wait_idle(app, pilot)
+        assert not list(app.screen.query(tui.ReasoningMessage))
+
+
+async def test_with_thinking_turned_on_the_process_starts_expanded(tmp_path, monkeypatch):
+    steps = [reasoning("deep thoughts") + text("ok")]
+    async with tui_app(tmp_path, monkeypatch, steps) as (app, pilot):
+        app.state.show_thinking = True
+        await send(app, pilot, "q")
+        await wait_idle(app, pilot)
+        assert "deep thoughts" in _text_of(app.screen.query_one(tui.ReasoningMessage))
