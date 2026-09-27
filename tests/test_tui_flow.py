@@ -98,7 +98,8 @@ async def test_streamed_turn_renders_answer_and_reports_timing(tmp_path, monkeyp
         m = app.state.last_turn_metrics
         assert m["elapsed_s"] >= 0 and m["ttft_s"] is not None
         status = _text_of(app.screen.query_one("#chat_status_text"))
-        assert "last turn" in status and "first token" in status
+        assert "last turn" in status and "session · 1 turn" in status
+        assert "first token" not in status  # a fast first token is not worth the screen space
 
 
 async def test_trace_is_buffered_and_stream_chunks_are_not_traced(tmp_path, monkeypatch):
@@ -653,3 +654,67 @@ async def test_streaming_does_not_yank_the_view_back_while_you_read_above(tmp_pa
         await pilot.pause(0.1)
         await wait_idle(app, pilot)
         assert log.scroll_y == 0
+
+
+# ── fluidity: live activity, no duplicated chrome, eased-in messages ────────
+
+async def test_a_live_activity_line_shows_while_working_not_no_response_content(tmp_path, monkeypatch):
+    steps = [call("1", "run_command", command="sleep 1.2"), text("all done")]
+    async with tui_app(tmp_path, monkeypatch, steps) as (app, pilot):
+        await send(app, pilot, "go")
+        seen = set()
+        for _ in range(30):
+            await pilot.pause(0.05)
+            if app.state.busy:
+                seen |= {t for k, t in chat_texts(app) if k == "AgentMessage"}
+        blob = "\n".join(seen)
+        assert "…" in blob and "s" in blob  # e.g. "⠹ Running a command…  1s"
+        assert "No response content" not in blob
+        await wait_idle(app, pilot)
+        assert ("AgentMessage", "all done") in chat_texts(app)  # the activity line is replaced by the answer
+
+
+async def test_a_genuinely_empty_answer_is_still_reported_once_the_turn_ends(tmp_path, monkeypatch):
+    async with tui_app(tmp_path, monkeypatch, [text("")] * 6) as (app, pilot):  # the loop retries empty replies
+        await send(app, pilot, "say nothing")
+        await wait_idle(app, pilot)
+        assert any("No response content" in t for k, t in chat_texts(app) if k == "AgentMessage")
+
+
+async def test_session_totals_live_in_the_status_line_only(tmp_path, monkeypatch):
+    async with tui_app(tmp_path, monkeypatch, [text("hi")]) as (app, pilot):
+        await send(app, pilot, "q")
+        await wait_idle(app, pilot)
+        assert not list(app.screen.query("#session_metrics_footer"))  # no second copy of the same numbers
+        assert "session" in _text_of(app.screen.query_one("#chat_status_text"))
+
+
+async def test_an_empty_session_shows_a_single_empty_state_in_the_side_panel(tmp_path, monkeypatch):
+    async with tui_app(tmp_path, monkeypatch, [text("x")]) as (app, pilot):
+        body = " ".join(_text_of(w) for w in app.screen.query("#context_body Static"))
+        assert body.count("No turns yet") == 1 and "No context yet" not in body
+
+
+async def test_new_messages_ease_in_and_end_fully_visible(tmp_path, monkeypatch):
+    async with tui_app(tmp_path, monkeypatch, [text("hello")]) as (app, pilot):
+        await send(app, pilot, "hi")
+        await wait_idle(app, pilot)
+        await pilot.pause(0.4)
+        messages = list(app.screen.query(tui.UserMessage)) + list(app.screen.query(tui.AgentMessage))
+        assert messages and all(m.styles.opacity == 1.0 for m in messages)
+
+
+async def test_status_line_fits_and_only_mentions_a_slow_first_token(tmp_path, monkeypatch):
+    async with tui_app(tmp_path, monkeypatch, [text("hi")]) as (app, pilot):
+        await send(app, pilot, "q")
+        await wait_idle(app, pilot)
+        pane = app.screen.query_one(tui.ChatPane)
+        app.state.last_turn_metrics.update(ttft_s=4.2, elapsed_s=9.0)
+        pane._refresh_status()
+        assert "first token 4.2s" in _text_of(app.screen.query_one("#chat_status_text"))
+        app.state.last_turn_metrics.update(ttft_s=0.3)
+        pane._refresh_status()
+        line = _text_of(app.screen.query_one("#chat_status_text"))
+        assert "first token" not in line
+        from rich.text import Text as RichText
+        assert len(RichText.from_markup(line).plain) < 110  # must fit the chat column without being cut off
