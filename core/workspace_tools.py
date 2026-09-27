@@ -32,6 +32,7 @@ import httpx
 
 from core.permissions import CommandPolicy
 from core.sandbox import BLOCKED_HINT, Sandbox
+from core.textbound import OutputCapture, bound_text
 from core.tool_specs import ALL_TOOL_NAMES, MUTATING_TOOLS, PARALLEL_SAFE, SPEC_BY_NAME, TOOL_SPECS
 from core.toolstate import ToolSession
 
@@ -914,9 +915,7 @@ answer that follow-up directly.
         except Exception as exc:
             raise WorkspaceToolError(f"failed to start process: {exc}") from exc
 
-        bufs: dict[str, list[str]] = {"stdout": [], "stderr": []}
-        sizes = {"stdout": 0, "stderr": 0}
-        total = {"stdout": 0, "stderr": 0}
+        caps = {"stdout": OutputCapture(COMMAND_OUTPUT_LIMIT), "stderr": OutputCapture(COMMAND_OUTPUT_LIMIT)}
 
         async def pump(stream: "asyncio.StreamReader | None", tag: str) -> None:
             if stream is None:
@@ -926,11 +925,7 @@ answer that follow-up directly.
                 if not chunk:
                     return
                 text = chunk.decode("utf-8", errors="replace")
-                total[tag] += len(text)
-                if sizes[tag] < COMMAND_OUTPUT_LIMIT:
-                    keep = text[: COMMAND_OUTPUT_LIMIT - sizes[tag]]
-                    bufs[tag].append(keep)
-                    sizes[tag] += len(keep)
+                caps[tag].feed(text)
                 if on_output is not None:
                     try:
                         await _maybe_await(on_output(tag, text))
@@ -953,9 +948,9 @@ answer that follow-up directly.
             raise
         result = {
             "exit_code": proc.returncode,
-            "stdout": "".join(bufs["stdout"]),
-            "stderr": "".join(bufs["stderr"]),
-            "truncated": total["stdout"] > COMMAND_OUTPUT_LIMIT or total["stderr"] > COMMAND_OUTPUT_LIMIT,
+            "stdout": caps["stdout"].render(),
+            "stderr": caps["stderr"].render(),
+            "truncated": caps["stdout"].truncated or caps["stderr"].truncated,
         }
         if sandboxed and proc.returncode and re.search(
             r"Operation not permitted|Read-only file system|Permission denied", result["stderr"]
@@ -1315,8 +1310,8 @@ answer that follow-up directly.
         return {
             **extra,
             "exit_code": proc.returncode,
-            "stdout": stdout[:COMMAND_OUTPUT_LIMIT],
-            "stderr": stderr[:COMMAND_OUTPUT_LIMIT],
+            "stdout": bound_text(stdout, COMMAND_OUTPUT_LIMIT),
+            "stderr": bound_text(stderr, COMMAND_OUTPUT_LIMIT),
             "truncated": len(stdout) > COMMAND_OUTPUT_LIMIT or len(stderr) > COMMAND_OUTPUT_LIMIT,
         }
 

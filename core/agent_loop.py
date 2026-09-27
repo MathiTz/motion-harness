@@ -35,6 +35,7 @@ from typing import Any, Dict, List, Optional
 import httpx
 
 from core.context import compact_messages, messages_tokens, trim_old_tool_results
+from core.textbound import bound_text
 from core.trajectory import preview_args
 from core.budget import Budget
 from core.instructions import build_context_blocks
@@ -512,7 +513,9 @@ class TurnRunner:
     def _wrap(self, name: str, result: Optional[dict] = None, error: Optional[str] = None) -> str:
         text = format_tool_result(name, result=result, error=error, wrap=self.mode != "native")
         if len(text) > MAX_RESULT_CHARS:
-            text = text[:MAX_RESULT_CHARS] + "…[result truncated]" + ("</motion_tool_result>" if self.mode != "native" else "")
+            closing = "</motion_tool_result>" if self.mode != "native" else ""
+            # keep the tail too: for a command result that is stderr, the exit status and the "truncated" flag
+            text = bound_text(text[: len(text) - len(closing)] if closing else text, MAX_RESULT_CHARS) + closing
         return text
 
     async def _fail(self, name: str, exc: Exception, failed_path: str) -> str:

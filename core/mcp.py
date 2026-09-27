@@ -29,6 +29,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
+from core.textbound import bound_text
+
 logger = logging.getLogger(__name__)
 
 PROTOCOL_VERSION = "2024-11-05"
@@ -326,7 +328,7 @@ class MCPManager:
         if not text and result.get("structuredContent") is not None:
             text = json.dumps(result["structuredContent"])
         if len(text) > MAX_RESULT_CHARS:
-            text = text[:MAX_RESULT_CHARS] + "…[truncated]"
+            text = bound_text(text, MAX_RESULT_CHARS)
         if result.get("isError"):
             raise MCPError(text or "tool reported an error")
         return {"text": text}

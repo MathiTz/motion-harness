@@ -59,12 +59,13 @@ def trim_old_tool_results(messages: List[Dict[str, Any]], keep_recent: int = 2, 
         if not isinstance(content, str) or len(content) <= max_chars:
             continue
         cut = len(content) - max_chars
-        keep_tail = ""
-        if content.startswith(RESULT_PREFIX):
-            keep_tail = "</motion_tool_result>"
+        closing = "</motion_tool_result>" if content.startswith(RESULT_PREFIX) and content.endswith("</motion_tool_result>") else ""
+        body = content[: len(content) - len(closing)] if closing else content
+        head_n = max_chars // 3
+        tail_n = max_chars - head_n
         messages[i] = {
             **messages[i],
-            "content": f"{content[:max_chars]}…[{cut} chars of older tool output trimmed; re-run the tool if you need it]{keep_tail}",
+            "content": f"{body[:head_n]}…[{cut} chars of older tool output trimmed; re-run the tool if you need it]…{body[-tail_n:]}{closing}",
         }
         removed += cut
     return removed
