@@ -132,8 +132,14 @@ async def _run_headless_capturing(prompt: str, *, provider_id: Optional[str], wo
 
 
 async def run_task(task: Task, *, provider_id: Optional[str], workdir: Path,
-                    keep_workdir: bool = False, agent_factory=None) -> TaskResult:
+                    keep_workdir: bool = False, agent_factory=None, before_run=None) -> TaskResult:
+    """``before_run(workdir)``, if given, runs after fixture staging and before the headless call -
+    e.g. scripts/skill_ab_test.py uses it to drop a candidate skill into the workspace's own
+    .motion/skills/ so a run can be compared with and without it, without evals/lib.py needing to
+    know anything about skills specifically."""
     stage_workspace(task, workdir)
+    if before_run is not None:
+        before_run(workdir)
     summary = await _run_headless_capturing(
         task.prompt, provider_id=provider_id, workspace=str(workdir), agent_factory=agent_factory,
     )
@@ -158,13 +164,15 @@ async def run_task(task: Task, *, provider_id: Optional[str], workdir: Path,
 
 async def run_resume_task(task: Task, *, provider_id: Optional[str], workdir: Path,
                            keep_workdir: bool = False, agent_factory=None,
-                           resume_agent_factory=None) -> TaskResult:
+                           resume_agent_factory=None, before_run=None) -> TaskResult:
     """Two headless calls sharing one workspace: phase 1 is capped to task.phase1_max_steps so it
     cannot finish a multi-part task; phase 2 is a fresh call (headless has no session/history - see
     docs/evals.md) with a prompt that tells the model to check current file state and finish the
     rest. Scores only the end state after both phases. Each phase gets its own agent_factory since
     they are two separate agent.run() calls, possibly against two different scripted providers."""
     stage_workspace(task, workdir)
+    if before_run is not None:
+        before_run(workdir)
     phase1 = await _run_headless_capturing(
         task.prompt, provider_id=provider_id, workspace=str(workdir),
         limits={"max_steps": task.phase1_max_steps} if task.phase1_max_steps else None,

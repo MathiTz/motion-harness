@@ -4616,7 +4616,10 @@ class ChatPane(Vertical):
     async def _handle_skill_command(self, text: str, log: VerticalScroll) -> None:
         parts = text.split(maxsplit=2)
         if len(parts) < 2:
-            log.mount(SystemMessage("Usage: /skill list | show <name> | save <name> | delete <name>"))
+            log.mount(SystemMessage(
+                "Usage: /skill list | show <name> | save <name> | delete <name> | "
+                "candidates | promote <name> | reject <name> | rollback <name>"
+            ))
             return
         action = parts[1].strip().lower()
         if action == "list":
@@ -4625,6 +4628,44 @@ class ChatPane(Vertical):
                 log.mount(SystemMessage("No skills saved yet. Use /skill save <name> after a good reply."))
             for name, desc in index:
                 log.mount(SystemMessage(f"  {name} — {desc}"))
+            pending = SkillLibrary.for_workspace(WORKSPACE).pending()
+            if pending:
+                log.mount(SystemMessage(f"({len(pending)} candidate(s) awaiting review — /skill candidates)"))
+            return
+        if action == "candidates":
+            pending = SkillLibrary.for_workspace(WORKSPACE).pending()
+            if not pending:
+                log.mount(SystemMessage("No skills awaiting review."))
+            for name, desc, meta in pending:
+                prov = meta.get("provenance", {})
+                verified = "verified" if prov.get("verified") else "unverified"
+                log.mount(SystemMessage(
+                    f"  {name} — {desc}  [{meta.get('status')}, v{meta.get('version')}, {verified}, "
+                    f"from prompt: {prov.get('prompt', '')[:60]!r}]"
+                ))
+            return
+        if action in ("promote", "reject", "rollback"):
+            name = parts[2].strip() if len(parts) > 2 else ""
+            if not name:
+                log.mount(SystemMessage(f"Provide a skill name, e.g. /skill {action} refactor_parser"))
+                return
+            path = SkillLibrary.for_workspace(WORKSPACE).resolve_path(name, include_inactive=True)
+            if path is None:
+                log.mount(SystemMessage(f"Skill not found: {name}"))
+                return
+            synthesizer = getattr(self.state.agent, "synthesizer", None)
+            if synthesizer is None:
+                log.mount(SystemMessage("No synthesizer available in this session."))
+                return
+            if action == "promote":
+                ok = await synthesizer.promote(str(path))
+                log.mount(SystemMessage(f"✅ Promoted {name} — now active and recallable." if ok else f"{name} has no candidate state to promote (already a plain saved skill)."))
+            elif action == "reject":
+                ok = synthesizer.reject(str(path))
+                log.mount(SystemMessage(f"🚫 Rejected {name} — removed from recall, kept on disk for provenance." if ok else f"{name} has no candidate state to reject."))
+            else:
+                ok = synthesizer.rollback(str(path))
+                log.mount(SystemMessage(f"↩ Rolled {name} back to its previous version." if ok else f"No previous version of {name} to roll back to."))
             return
         if action == "show":
             name = parts[2].strip() if len(parts) > 2 else ""
@@ -4636,7 +4677,7 @@ class ChatPane(Vertical):
                     log.mount(SystemMessage(f"  {line}"))
             return
         if action not in {"save", "delete"}:
-            log.mount(SystemMessage("Unknown /skill action. Use list, show, save or delete."))
+            log.mount(SystemMessage("Unknown /skill action. Use list, show, save, delete, candidates, promote, reject or rollback."))
             return
         if len(parts) < 3 or not parts[2].strip():
             log.mount(SystemMessage("Provide a skill name, e.g. /skill save refactor_parser"))

@@ -856,3 +856,66 @@ async def test_the_trace_panel_is_one_widget_however_many_events_arrive(tmp_path
         panel = app.screen.query_one("#trace_log")
         assert len(panel.children) == 0  # virtual lines, not a widget per event
         assert 0 < len(panel.lines) <= pane.TRACE_WIDGET_MAX * 2 + 2  # bounded
+
+
+# ── /skill candidates, promote, reject, rollback (issue #16) ────────────────
+
+async def test_skill_candidates_lists_pending_synthesized_skills_not_active_ones(tmp_path, monkeypatch):
+    from core.learning import Trajectory
+
+    async with tui_app(tmp_path, monkeypatch, [text("x")]) as (app, pilot):
+        synthesizer = app.state.agent.synthesizer
+        synthesizer.skills_dir = str(tmp_path / "skills")
+        synthesizer.provider = app.provider  # any object with an async .complete works via the Scripted stub below
+
+        class _Complete:
+            async def complete(self, *a, **kw):
+                return "# Candidate\n## Description\nx\n## Procedure\n1. y"
+
+        synthesizer.provider = _Complete()
+        await synthesizer.synthesize(Trajectory(task_id="t", prompt="my candidate", steps=[], final_result="ok", success=True))
+
+        await send(app, pilot, "/skill list")
+        await pilot.pause(0.1)
+        # REPO_DIR/skills may hold real, unrelated skills from actual prior usage of this install -
+        # only assert what this test controls: the new candidate is not listed as active.
+        assert not any(t.strip().startswith("my_candidate") for t in system_lines(app))
+        assert any("1 candidate(s) awaiting review" in t for t in system_lines(app))
+
+        await send(app, pilot, "/skill candidates")
+        await pilot.pause(0.1)
+        assert any("my_candidate" in t and "candidate" in t and "unverified" in t for t in system_lines(app))
+
+
+async def test_skill_promote_makes_it_active_and_listed(tmp_path, monkeypatch):
+    from core.learning import Trajectory
+
+    async with tui_app(tmp_path, monkeypatch, [text("x")]) as (app, pilot):
+        synthesizer = app.state.agent.synthesizer
+        synthesizer.skills_dir = str(tmp_path / "skills")
+
+        class _Complete:
+            async def complete(self, *a, **kw):
+                return "# Promote Me\n## Description\nx\n## Procedure\n1. y"
+
+        synthesizer.provider = _Complete()
+        await synthesizer.synthesize(Trajectory(task_id="t", prompt="promote me", steps=[], final_result="ok", success=True))
+
+        await send(app, pilot, "/skill promote promote_me")
+        await pilot.pause(0.1)
+        assert any("Promoted promote_me" in t for t in system_lines(app))
+
+        await send(app, pilot, "/skill list")
+        await pilot.pause(0.1)
+        assert any(t.strip().startswith("promote_me") for t in system_lines(app))
+
+
+async def test_skill_reject_and_rollback_report_when_there_is_nothing_to_act_on(tmp_path, monkeypatch):
+    async with tui_app(tmp_path, monkeypatch, [text("x")]) as (app, pilot):
+        await send(app, pilot, "/skill promote does_not_exist")
+        await pilot.pause(0.1)
+        assert any("Skill not found: does_not_exist" in t for t in system_lines(app))
+
+        await send(app, pilot, "/skill rollback")
+        await pilot.pause(0.1)
+        assert any("Provide a skill name" in t for t in system_lines(app))

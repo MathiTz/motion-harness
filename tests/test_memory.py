@@ -101,7 +101,10 @@ async def test_skill_synthesizer_never_stores_zero_embedding():
         trajectory = Trajectory(
             task_id="t1", prompt="test skill", steps=[], final_result="done", success=True,
         )
-        await synthesizer.synthesize(trajectory)
+        skill_path = await synthesizer.synthesize(trajectory)
+        # synthesize() only writes a CANDIDATE (issue #16) - promote() is the step that indexes it
+        # into the MemoryDB at all, which is what this regression test is actually about.
+        await synthesizer.promote(skill_path)
 
         row = db.conn.execute("SELECT embedding FROM memories ORDER BY id DESC LIMIT 1").fetchone()
         assert row is not None

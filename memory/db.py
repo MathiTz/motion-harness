@@ -115,6 +115,7 @@ class MemoryDB:
                 (mem_id, self._serialize_embedding(chunk.embedding)),
             )
         self.conn.commit()
+        return mem_id
 
     def keyword_search(self, query: str, limit: int = 5) -> List[Tuple[float, str]]:
         match = fts_query(query)

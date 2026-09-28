@@ -200,7 +200,7 @@ Everything the harness writes into your project goes under one self-ignoring fol
 | `Enter` (chat input) | Send message |
 | `Shift+Enter` (chat input) | New line |
 | `↑` / `↓` (chat input) | Prompt history |
-| `/skill list` · `show <name>` · `save <name>` · `delete <name>` | Manage reusable skills |
+| `/skill list` · `show <name>` · `save <name>` · `delete <name>` · `candidates` · `promote <name>` · `reject <name>` · `rollback <name>` | Manage reusable skills; a synthesized skill starts as a candidate and needs `promote` before it's recalled — see [Skills Engine](docs/skills.md) |
 | `/compact` | Summarize the conversation to free context |
 | `/undo` | Revert the file changes of the last turn |
 | `/diff [on\|off]` | Show the last turn's edits / toggle inline diffs |

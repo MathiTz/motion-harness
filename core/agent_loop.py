@@ -1279,18 +1279,25 @@ class TurnRunner:
         if self.depth == 0 and getattr(agent, "auto_remember", False) and raw_response and (self.used_tool or len(raw_response) > 200):
             agent.schedule_remember(self.prompt, raw_response, self.tool_operations)
 
-        # Skill crystallization (manual-first: disabled by default)
+        # Skill crystallization (manual-first: disabled by default). `success` used to be
+        # hardcoded True regardless of what happened; it's now a real (if still narrow) signal -
+        # the turn actually used a tool and produced a real answer, the same bar auto_remember
+        # already uses above. This is not outcome verification (did the task actually succeed) -
+        # that needs the eval-baseline's task-success signal (issue #13), which is why every
+        # synthesized skill is written as an unverified CANDIDATE (core/learning.py's
+        # write_candidate) rather than made live immediately (issue #16).
         if self.depth == 0 and agent.auto_skill_synthesis:
             from core.learning import Trajectory
 
+            crystallization_worthy = bool(raw_response) and (self.used_tool or len(raw_response) > 200)
             try:
                 await self.trace("skill_synthesis_start", "Running skill synthesizer")
                 trajectory = Trajectory(
                     task_id="single",
                     prompt=self.prompt,
-                    steps=[{"tool": "model", "input": self.prompt, "output": raw_response}],
+                    steps=[{"tool": "trajectory", "input": self.prompt, "output": "; ".join(self.tool_operations) or raw_response}],
                     final_result=raw_response,
-                    success=True,
+                    success=crystallization_worthy,
                 )
                 skill_path = await agent.synthesizer.synthesize(trajectory)
                 if skill_path:
