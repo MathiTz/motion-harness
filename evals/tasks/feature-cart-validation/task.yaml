@@ -1,0 +1,9 @@
+id: feature-cart-validation
+category: feature_mod
+description: Add input validation to an existing shopping-cart method.
+prompt: >
+  In cart.py, Cart.add_item(name, price, qty) doesn't validate its inputs.
+  Modify it to raise ValueError if price is negative or qty is not a
+  positive integer, without changing its behavior for valid input.
+held_out: false
+check: tests/test_cart.py

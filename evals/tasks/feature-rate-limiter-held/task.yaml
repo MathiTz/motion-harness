@@ -1,0 +1,12 @@
+id: feature-rate-limiter-held
+category: feature_mod
+description: >
+  Held-out feature modification. Do not use while iterating on feature-mod
+  behavior - see docs/evals.md.
+prompt: >
+  limiter.py's RateLimiter class has an allow() method that always returns
+  True. Implement it as a fixed-size sliding window: allow(now) should return
+  True at most `self.max_calls` times within any `self.window_seconds` window
+  ending at `now`, and False otherwise. now is a float (seconds).
+held_out: true
+check: tests/test_limiter.py

@@ -52,5 +52,8 @@ test_doc.md
 # Logs
 motion.log
 
-# Task artifacts
-tasks/
+# Task-manager state: current path is a workspace's .motion/tasks/; /tasks/ (anchored to the repo
+# root) covers leftover state from before that consolidation. Neither should match evals/tasks/.
+/tasks/
+.motion/tasks/
+evals/results/*.json

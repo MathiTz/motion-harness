@@ -1,0 +1,18 @@
+id: resume-shape-areas
+category: resume
+description: >
+  Simulates resuming interrupted work: phase 1 runs with a tight step budget
+  so the multi-part task cannot finish; phase 2 runs fresh (no conversation
+  history, matching headless mode's real limits - see docs/evals.md) and must
+  notice what is already done and finish the rest without breaking it.
+prompt: >
+  In shapes.py there are three classes: Circle, Square, Triangle. None of them
+  has an area() method yet. Add a correct area() method to all three classes.
+resume_prompt: >
+  Continue the previous task: shapes.py's Circle, Square and Triangle classes
+  each need a correct area() method. Some may already be done - check the
+  current contents of shapes.py first, and only add what's missing. Do not
+  remove or break any area() method that is already correct.
+phase1_max_steps: 1
+held_out: false
+check: tests/test_shapes.py

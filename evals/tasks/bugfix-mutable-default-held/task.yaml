@@ -1,0 +1,10 @@
+id: bugfix-mutable-default-held
+category: bug_fix
+description: >
+  Held-out bug fix (mutable default argument). Do not use while iterating on
+  bug-fix behavior - see docs/evals.md.
+prompt: >
+  register.py's Roster.add(name, tags=[]) sometimes shows tags on a person
+  that were actually added for someone else. Find and fix the bug.
+held_out: true
+check: tests/test_register.py
