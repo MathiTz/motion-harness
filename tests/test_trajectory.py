@@ -346,3 +346,67 @@ async def test_headless_effort_flag_reaches_the_request(tmp_path):
     out = io.StringIO()
     await run_headless("hi", out=out, err=io.StringIO(), agent_factory=make, workspace=str(tmp_path), effort="low")
     assert seen["options"]["reasoning_effort"] == "low"
+
+
+# ── harness version + redaction (issue #19) ─────────────────────────────────
+
+def test_to_json_records_the_harness_version_alongside_the_provider():
+    doc = traj.to_json([rec(1, 100)], turn=1, provider="p/m")
+    assert doc["harness_version"] and doc["harness_version"] != "unknown"
+    with open(Path(__file__).resolve().parents[1] / "VERSION") as f:
+        assert doc["harness_version"] == f.read().strip()
+
+
+def test_to_json_redacts_a_secret_shaped_value_by_default_but_not_when_opted_out():
+    system_prompt = "You have access to ANTHROPIC_API_KEY=sk-ant-realsecretvalue1234567890."
+    messages = [{"role": "tool", "content": "file contents:\nANTHROPIC_API_KEY=sk-ant-realsecretvalue1234567890\n"}]
+
+    redacted = traj.to_json([rec(1, 100)], turn=1, provider="p/m", system_prompt=system_prompt, messages=messages)
+    blob = json.dumps(redacted)
+    assert "sk-ant-realsecretvalue1234567890" not in blob and "[REDACTED]" in blob
+    assert redacted["redacted"] is True
+
+    raw = traj.to_json([rec(1, 100)], turn=1, provider="p/m", system_prompt=system_prompt, messages=messages, redact=False)
+    assert "sk-ant-realsecretvalue1234567890" in json.dumps(raw)
+    assert raw["redacted"] is False
+
+
+def test_to_json_without_messages_has_no_redacted_field_at_all():
+    doc = traj.to_json([rec(1, 100)], turn=1, provider="p/m")
+    assert "redacted" not in doc and "messages" not in doc
+
+
+async def test_trajectory_save_full_redacts_a_real_secret_in_a_tool_result_by_default(tmp_path, monkeypatch):
+    """The end-to-end acceptance criterion: a fake secret placed in a tool result during a real
+    scripted turn must not appear in the saved JSON by default, and must appear with 'noredact'."""
+    (tmp_path / "config.env").write_text("ANTHROPIC_API_KEY=sk-ant-realsecretvalue1234567890\n")
+    steps = [call("1", "read_file", path="config.env") + usage(500, 20), text("done") + usage(600, 5)]
+    async with tui_app(tmp_path, monkeypatch, steps) as (app, pilot):
+        await send(app, pilot, "look at config.env")
+        await wait_idle(app, pilot)
+
+        await send(app, pilot, "/trajectory save full")
+        await pilot.pause(0.1)
+        saved = sorted((tmp_path / ".motion" / "trajectories").glob("*.json"), key=lambda p: p.stat().st_mtime_ns)
+        default_doc = json.loads(saved[-1].read_text())
+        assert "sk-ant-realsecretvalue1234567890" not in json.dumps(default_doc)
+        assert any("Saved" in t and "noredact" not in t for t in system_lines(app))
+
+        await send(app, pilot, "/trajectory save full noredact")
+        await pilot.pause(0.1)
+        saved = sorted((tmp_path / ".motion" / "trajectories").glob("*.json"), key=lambda p: p.stat().st_mtime_ns)
+        raw_doc = json.loads(saved[-1].read_text())
+        assert "sk-ant-realsecretvalue1234567890" in json.dumps(raw_doc)
+        assert any("UNREDACTED" in t for t in system_lines(app))
+
+
+async def test_noredact_is_refused_without_full_since_theres_nothing_to_redact(tmp_path, monkeypatch):
+    async with tui_app(tmp_path, monkeypatch, [text("hi")]) as (app, pilot):
+        await send(app, pilot, "hello")
+        await wait_idle(app, pilot)
+        before = len(list((tmp_path / ".motion" / "trajectories").glob("*.json")))
+        await send(app, pilot, "/trajectory save noredact")
+        await pilot.pause(0.1)
+        after = len(list((tmp_path / ".motion" / "trajectories").glob("*.json")))
+        assert after == before  # refused, nothing written
+        assert any("only applies to 'save full'" in t for t in system_lines(app))

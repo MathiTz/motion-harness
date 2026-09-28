@@ -13,10 +13,29 @@ Records are plain dicts so they serialize straight to JSON:
 
 from __future__ import annotations
 
+import os
 from typing import Any, Dict, List, Optional
+
+from core.redact import redact_value
 
 ARG_PREVIEW_CHARS = 100
 LONG_VALUE = 48
+
+_REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_version_cache: Optional[str] = None
+
+
+def harness_version() -> str:
+    """The harness's own VERSION file, so a saved trajectory can be tied to which commit/release
+    produced it - previously only the provider/model was recorded, not which harness version was
+    running it (issue #19)."""
+    global _version_cache
+    if _version_cache is None:
+        try:
+            _version_cache = (open(os.path.join(_REPO_DIR, "VERSION")).read() or "").strip() or "unknown"
+        except OSError:
+            _version_cache = "unknown"
+    return _version_cache
 
 
 def preview_args(args: Dict[str, Any], limit: int = ARG_PREVIEW_CHARS) -> str:
@@ -147,13 +166,27 @@ def render(recs: List[Dict[str, Any]], title: str = "") -> str:
 
 
 def to_json(records: List[Dict[str, Any]], *, turn: Optional[int] = None, provider: str = "",
-            system_prompt: Optional[str] = None, messages: Optional[list] = None) -> Dict[str, Any]:
+            system_prompt: Optional[str] = None, messages: Optional[list] = None,
+            redact: bool = True) -> Dict[str, Any]:
+    """``redact`` (default True) applies core.redact's best-effort secret-shaped-value stripping to
+    ``system_prompt``/``messages`` before they're embedded - see that module's docstring for what
+    it does and does not catch. Only meaningful when ``messages`` is given (that's the only case
+    that includes raw content at all); has no effect on ``steps``, which already only ever holds
+    truncated argument previews (preview_args, capped at ARG_PREVIEW_CHARS), never full tool
+    output."""
     recs = turn_records(records, turn) if turn is not None or records else []
     doc: Dict[str, Any] = {
-        "version": 1, "provider": provider, "turn": (recs[0].get("turn") if recs else None),
+        "version": 1, "harness_version": harness_version(), "provider": provider,
+        "turn": (recs[0].get("turn") if recs else None),
         "summary": totals(recs), "insights": insights(recs), "steps": recs,
     }
     if messages is not None:
+        if redact:
+            doc["redacted"] = True
+            system_prompt = redact_value(system_prompt)
+            messages = redact_value(messages)
+        else:
+            doc["redacted"] = False
         doc["system_prompt"] = system_prompt
         doc["messages"] = messages
     return doc
