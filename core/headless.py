@@ -34,8 +34,10 @@ class HeadlessUsageError(Exception):
     """Bad arguments or configuration (exit code 2)."""
 
 
-def build_agent(provider_id: Optional[str]):
-    """Create a MotionAgent from config.yml the same way the TUI does."""
+def build_agent(provider_id: Optional[str], workspace: Optional[str] = None):
+    """Create a MotionAgent from config.yml the same way the TUI does. Memory defaults to
+    ``workspace``'s own DB (issue #17); config.yml's `memory_path`, if set, opts back into a
+    single shared DB across projects."""
     from core.config import ConfigManager
     from core.providers import ModelConfig
     from main import MotionAgent
@@ -59,7 +61,7 @@ def build_agent(provider_id: Optional[str]):
         from core.mcp import MCPManager
 
         mcp = MCPManager(servers)
-    agent = MotionAgent(model_config, mcp_manager=mcp)
+    agent = MotionAgent(model_config, mcp_manager=mcp, workspace=workspace, memory_path=cm.get("memory_path") or None)
     agent.permissions_config = cm.data
     from core.agent_config import configure_agent
 
@@ -99,7 +101,7 @@ async def run_headless(
     if not os.path.isdir(workspace):
         raise HeadlessUsageError(f"workspace is not a directory: {workspace}")
 
-    agent = agent_factory() if agent_factory else build_agent(provider_id)
+    agent = agent_factory() if agent_factory else build_agent(provider_id, workspace)
     if effort:
         agent.provider.config.options["reasoning_effort"] = effort
     if limits:  # command-line limits override config.yml

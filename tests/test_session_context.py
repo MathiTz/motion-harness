@@ -98,7 +98,7 @@ class _MockRetriever:
 
 
 async def test_agent_uses_context_query_for_recall():
-    agent = MotionAgent(ModelConfig(name="t", endpoint="http://localhost", provider_type="local"))
+    agent = MotionAgent(ModelConfig(name="t", endpoint="http://localhost", provider_type="local"), memory_path=":memory:")
     agent.provider = _MockProvider()
     retriever = _MockRetriever()
     agent.retriever = retriever
@@ -111,7 +111,7 @@ async def test_agent_uses_context_query_for_recall():
 
 
 async def test_agent_dedupes_recalled_chunks():
-    agent = MotionAgent(ModelConfig(name="t", endpoint="http://localhost", provider_type="local"))
+    agent = MotionAgent(ModelConfig(name="t", endpoint="http://localhost", provider_type="local"), memory_path=":memory:")
     agent.provider = _MockProvider()
 
     class _DupRetriever:
@@ -138,7 +138,7 @@ async def test_agent_dedupes_recalled_chunks():
 
 
 async def test_agent_without_context_query_uses_only_prompt():
-    agent = MotionAgent(ModelConfig(name="t", endpoint="http://localhost", provider_type="local"))
+    agent = MotionAgent(ModelConfig(name="t", endpoint="http://localhost", provider_type="local"), memory_path=":memory:")
     agent.provider = _MockProvider()
     retriever = _MockRetriever()
     agent.retriever = retriever
