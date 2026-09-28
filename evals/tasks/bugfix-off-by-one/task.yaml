@@ -1,0 +1,8 @@
+id: bugfix-off-by-one
+category: bug_fix
+description: Fix an off-by-one slicing bug in a small utility function.
+prompt: >
+  There's a bug in utils.py: get_last_n(items, n) is supposed to return the
+  last n items of a list, but it returns one too many. Find and fix it.
+held_out: false
+check: tests/test_utils.py

@@ -1,0 +1,13 @@
+id: investigate-shared-state
+category: investigate
+description: >
+  Open-ended: diagnose why a test fails depending on call order, without
+  fixing it. Success is judged by a human against rubric.md (see Non-goals
+  in issue #13 — automating judgment of open-ended diagnosis is out of scope).
+prompt: >
+  test_counter.py in this directory fails when the whole test file is run,
+  but each test passes if you run it alone. Investigate why and write your
+  diagnosis (root cause, not a fix) to FINDINGS.md. Do not modify counter.py
+  or test_counter.py.
+held_out: false
+rubric: rubric.md
