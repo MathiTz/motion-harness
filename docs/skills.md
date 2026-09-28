@@ -25,8 +25,26 @@ The extracted procedure is formatted into a structured Markdown skill, including
 - **Procedure**: Step-by-step execution logic.
 - **Verification**: How to know the skill was applied successfully.
 
-### 4. Integration
-The skill is saved to the local skill library. The next time the agent encounters a similar problem, the **Hybrid Recall** system pulls this skill into the prompt, allowing the agent to "remember" the correct procedure.
+### 4. Integration — with a review gate (issue #16)
+The skill is written to disk, but **not** integrated immediately: it starts as an unevaluated **candidate**, invisible to every live turn (the system prompt's skill index, `use_skill`, and Hybrid Recall all only ever see **active** skills). See "Lifecycle: candidate → active" below for what promotes it from there. This replaced an earlier version of this feature that made a synthesized skill live the moment it was written, with no check that the turn it came from had actually succeeded at anything — `auto_skill_synthesis` also stays off by default (`/synthesize on` to opt in) regardless of this lifecycle.
+
+## Lifecycle: candidate → active
+
+Every synthesized skill gets a metadata sidecar (`<name>.meta.json`, next to `<name>.md`) tracking its status, version history and provenance (which trajectory produced it, when, against which model). A hand-saved skill (`/skill save`) has no sidecar and is treated as active immediately — this lifecycle is about synthesizer output specifically, not skills you wrote yourself.
+
+- **`/skill candidates`** — list skills awaiting review, with their provenance.
+- **`/skill promote <name>`** — make a candidate active: from this point it's indexed for recall and shown in listings.
+- **`/skill reject <name>`** — remove it from recall (de-indexing an already-promoted one too) without deleting the file; it stays on disk, in its own history, for audit.
+- **`/skill rollback <name>`** — restore the previous version of a skill (content + metadata), de-indexing whatever was currently promoted. Regenerating a skill with the same name never silently loses the prior version: it's pushed onto that skill's own history first.
+
+**Promotion criterion.** A skill's provenance carries a `verified` flag - `false` until something has actually checked that using the skill doesn't hurt task outcomes. `/synthesize`'s own success signal is a real one (the turn used a tool and produced an answer — not the unconditional `True` this feature used to hardcode), but that is not the same as verifying the skill *helps*. The honest way to check that is `scripts/skill_ab_test.py`:
+
+```bash
+python scripts/skill_ab_test.py --skill skills/my_candidate.md
+python scripts/skill_ab_test.py --skill skills/my_candidate.md --tasks bugfix-off-by-one,feature-cart-validation --repeat 3
+```
+
+It runs the [eval-baseline task set](evals.md) twice per task — once with the candidate installed, once without — on the same provider, and reports whether enabling it regresses any outcome. Promotion is still a human decision (`/skill promote`) made by reading that report; nothing here auto-promotes. This needs the eval-baseline's task set to exist (it does, as of issue #13) and makes real, billed provider calls, so it's a maintainer/local check, not something run in CI.
 
 ## 🛠️ Manual Skill Creation
 
