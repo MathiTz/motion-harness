@@ -99,12 +99,7 @@ class ConfigManager:
             raise ValueError(f"Unknown provider: {base_id}")
 
         # Resolve api_key: auth store → env var → config.yml
-        env_key = f"{base_id.replace('-', '_').upper()}_API_KEY"
-        env_val = os.environ.get(env_key)
-        if not env_val:
-            prefix = base_id.split('-')[0].upper()
-            generic_key = f"{prefix}_API_KEY"
-            env_val = os.environ.get(generic_key)
+        env_val = self._env_key_value(base_id, config.get("endpoint", ""))
         stored = auth.get_key(base_id)
         if stored:
             config = {**config, "api_key": stored}
@@ -186,6 +181,33 @@ class ConfigManager:
             or self.data.get("providers", {}).get("default", "ollama-cloud")
         )
 
+    @staticmethod
+    def _env_var_names(base_id: str, endpoint: str) -> list:
+        """Every env var name that could plausibly hold this provider's key, most specific first:
+        the vendor's own documented name for its endpoint host (e.g. ANTHROPIC_API_KEY for
+        api.anthropic.com - see core/providers.py's _HOST_KEY_ENV, the single source of truth for
+        this mapping, reused here rather than duplicated) is checked before names merely guessed
+        from the provider id (CLAUDE_API_KEY) - "claude" and "anthropic.com" don't share a name,
+        so guessing from the id alone missed the documented, working env var entirely."""
+        names = []
+        if endpoint:
+            from core.providers import _env_var_for
+
+            host_var = _env_var_for(endpoint)
+            if host_var != "MOTION_API_KEY":
+                names.append(host_var)
+        names.append(f"{base_id.replace('-', '_').upper()}_API_KEY")
+        names.append(f"{base_id.split('-')[0].upper()}_API_KEY")
+        return names
+
+    @classmethod
+    def _env_key_value(cls, base_id: str, endpoint: str) -> str:
+        for name in cls._env_var_names(base_id, endpoint):
+            value = os.environ.get(name)
+            if value:
+                return value
+        return ""
+
     def has_api_key(self, provider_id: str) -> bool:
         """Check whether a provider has a usable API key (env var or config)."""
         if '/' in provider_id:
@@ -205,13 +227,8 @@ class ConfigManager:
         if config_key:
             return True
 
-        # Check environment variables
-        env_key = f"{base_id.replace('-', '_').upper()}_API_KEY"
-        if os.environ.get(env_key):
-            return True
-        prefix = base_id.split('-')[0].upper()
-        generic_key = f"{prefix}_API_KEY"
-        if os.environ.get(generic_key):
+        # Check environment variables (including the vendor's own name for this endpoint's host)
+        if self._env_key_value(base_id, cfg.get("endpoint", "")):
             return True
 
         # Local providers don't need a key
@@ -242,7 +259,7 @@ class ConfigManager:
             delegate = next(iter(models.values()), {}).get("delegate", "") if models else ""
             binary = {"claude-cli": "claude", "codex-cli": "codex"}.get(delegate, delegate)
             return f"'{binary}' isn't on PATH - install it and run `{binary} login`"
-        env_key = f"{base_id.replace('-', '_').upper()}_API_KEY"
+        env_key = self._env_var_names(base_id, cfg.get("endpoint", ""))[0]
         reason = f"no API key - `motion auth login {base_id}`, set {env_key}, or add it in Ctrl+A"
         if base_id in ("claude", "openai") and self.has_api_key("claude-cli" if base_id == "claude" else "codex-cli"):
             cli = "claude-cli" if base_id == "claude" else "codex-cli"

@@ -11,6 +11,7 @@
   <a href="docs/setup.md">Setup Guide</a> · 
   <a href="docs/architecture.md">Architecture</a> · 
   <a href="docs/skills.md">Skills Engine</a> · 
+  <a href="docs/compatibility.md">Compatibility</a> · 
   <a href="docs/roadmap.md">Roadmap</a>
 </p>
 

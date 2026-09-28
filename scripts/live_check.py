@@ -79,11 +79,79 @@ async def check_tool_round_trip(p: Any) -> str:
     return f"called echo({call.arguments}) then answered"
 
 
+async def check_cancellation(p: Any) -> str:
+    """Stopping mid-stream must not hang or raise - this is what TurnRunner relies on when the
+    user presses Esc (ui/tui.py's action_request_cancel) or a turn is cancelled for any other
+    reason (core/agent_loop.py's cancellation path)."""
+    gen = p.chat_stream([{"role": "user", "content": "Count slowly from one to fifty, one number per line."}])
+    seen = 0
+    try:
+        async for _ev in gen:
+            seen += 1
+            if seen >= 2:
+                break
+    finally:
+        await asyncio.wait_for(gen.aclose(), 15)
+    assert seen >= 2, f"stream ended before 2 events ({seen}); can't tell if closing early works"
+    return f"closed cleanly after {seen} events, no hang"
+
+
+async def check_failover_classification(p: Any) -> str:
+    """core/agent_loop.py's TurnRunner._failover_worthy(exc) decides whether an error triggers a
+    switch to a fallback provider. Mock-transport tests (tests/test_failover.py) only exercise
+    error shapes WE fabricated; this sends one real request with a deliberately invalid key to the
+    real endpoint and checks the REAL error the vendor sends back is classified as failover-worthy
+    (a credentials problem another provider could plausibly avoid), matching what TurnRunner does."""
+    from core.agent_loop import TurnRunner
+    from core.providers import ModelConfig, ProviderFactory
+
+    bad_config = ModelConfig(
+        name=p.config.name, endpoint=p.config.endpoint, api_key="sk-invalid-deliberately-wrong-key",
+        provider_type=p.config.provider_type, options=p.config.options,
+    )
+    bad_provider = ProviderFactory.get_provider(bad_config)
+    try:
+        async for _ev in bad_provider.chat_stream([{"role": "user", "content": "hi"}]):
+            pass
+        return "no error raised with an invalid key - cannot verify classification (unusual; check manually)"
+    except Exception as exc:
+        worthy = TurnRunner._failover_worthy(exc)
+        status = getattr(exc, "status_code", None)
+        assert worthy, f"a real invalid-key error ({type(exc).__name__}, status={status}) was NOT classified as failover-worthy"
+        return f"real {type(exc).__name__} (status={status}) correctly classified as failover-worthy"
+    finally:
+        close = getattr(bad_provider, "close", None)
+        if close:
+            try:
+                await close()
+            except Exception:
+                pass
+
+
+async def check_usage_plausibility(p: Any) -> str:
+    """Sanity-checks reported prompt_tokens against a known input of controlled length, rather than
+    only checking usage is present (check_usage) - catches a provider silently reporting 0, or a
+    wildly wrong count, that a bare "is it present" check would miss."""
+    known_text = ("The quick brown fox jumps over the lazy dog. " * 40).strip()  # ~2000 chars, no prompt yet
+    r = await collect(p, [{"role": "user", "content": f"Reply with exactly the word DONE. Ignore this text: {known_text}"}])
+    u = r["usage"]
+    assert u and u.get("prompt_tokens", 0) > 0, f"no usable prompt token count: {u}"
+    chars = len(known_text)
+    lo, hi = chars / 8, chars / 2  # generous bounds: real tokenizers run roughly 3-6 chars/token
+    assert lo <= u["prompt_tokens"] <= hi * 2, (  # *2 headroom for the instruction text + system prompt overhead
+        f"prompt_tokens={u['prompt_tokens']} implausible for ~{chars} known chars (expected roughly {lo:.0f}-{hi:.0f})"
+    )
+    return f"prompt_tokens={u['prompt_tokens']} plausible for {chars} known chars"
+
+
 CHECKS: List[Tuple[str, Callable[[Any], Awaitable[str]]]] = [
     ("streams text", check_streaming),
     ("reports token usage", check_usage),
     ("honours the system prompt", check_system_prompt),
     ("tool call round trip", check_tool_round_trip),
+    ("cancellation mid-stream", check_cancellation),
+    ("usage reporting accuracy", check_usage_plausibility),
+    ("failover error classification", check_failover_classification),
 ]
 
 

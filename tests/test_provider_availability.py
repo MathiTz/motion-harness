@@ -84,8 +84,10 @@ def test_cli_delegate_reason_names_the_actual_binary_and_the_login_command():
 
 
 def test_api_key_reason_names_the_env_var_and_auth_command():
+    # ANTHROPIC_API_KEY, not CLAUDE_API_KEY: the vendor's own name for api.anthropic.com, which is
+    # what README.md/.env.example actually document - the provider id "claude" doesn't match it.
     reason = ConfigManager().unavailable_reason("claude")
-    assert "motion auth login claude" in reason and "CLAUDE_API_KEY" in reason and "Ctrl+A" in reason
+    assert "motion auth login claude" in reason and "ANTHROPIC_API_KEY" in reason and "Ctrl+A" in reason
 
 
 def test_api_key_reason_offers_the_cli_delegate_only_when_it_is_actually_available(fake_bin):
@@ -159,3 +161,25 @@ def _row_label(item) -> str:
         if text is not None:
             return str(text)
     return ""
+
+
+# ── documented env var name must actually be recognized (issue #15) ────────
+
+def test_has_api_key_recognizes_the_vendors_documented_env_var_name(monkeypatch):
+    """README.md, .env.example and docs/setup.md all document ANTHROPIC_API_KEY /
+    OPENAI_API_KEY for these providers. The request-time key lookup (core/providers.py's
+    _env_key_for, host-based) always honoured that; has_api_key (which gates the model picker's
+    lock icon and whether make_provider_builder even constructs the provider - used by fallback
+    and by scripts/live_check.py) used to derive CLAUDE_API_KEY from the provider id "claude"
+    instead, which nothing documents or sets - a provider configured exactly as documented showed
+    as unavailable."""
+    monkeypatch.delenv("CLAUDE_API_KEY", raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-test-key")
+    assert ConfigManager().has_api_key("claude") is True
+
+
+def test_has_api_key_still_checks_the_id_derived_name_for_providers_without_a_host_mapping(monkeypatch):
+    monkeypatch.setenv("SOME_CUSTOM_API_KEY", "fake-test-key")
+    cm = ConfigManager()
+    cm.data.setdefault("providers", {})["some-custom"] = {"endpoint": "https://example.internal"}
+    assert cm.has_api_key("some-custom") is True
