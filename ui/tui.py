@@ -3100,7 +3100,7 @@ class ChatPane(Vertical):
             return
         self._copy_text(traj.render(recs, self._trajectory_title(everything)), "trajectory")
 
-    def save_trajectory(self, full: bool = False, everything: bool = False) -> Optional[Path]:
+    def save_trajectory(self, full: bool = False, everything: bool = False, redact: bool = True) -> Optional[Path]:
         import json
 
         recs = self._trajectory_records(everything)
@@ -3114,6 +3114,7 @@ class ChatPane(Vertical):
             provider=self.state.current_provider_id,
             system_prompt=last.get("system_prompt") if full else None,
             messages=last.get("messages") if full else None,
+            redact=redact,
         )
         if everything:
             doc["steps"], doc["summary"], doc["insights"] = recs, traj.totals(recs), traj.insights(recs)
@@ -3129,11 +3130,19 @@ class ChatPane(Vertical):
         if "copy" in words:
             self.copy_trajectory(everything)
         elif "save" in words:
-            path = self.save_trajectory(full="full" in words, everything=everything)
+            full = "full" in words
+            no_redact = "noredact" in words
+            if no_redact and not full:
+                log.mount(SystemMessage("⚠️ 'noredact' only applies to 'save full' (there's nothing to redact otherwise)."))
+                return
+            path = self.save_trajectory(full=full, everything=everything, redact=not no_redact)
             if path:
-                log.mount(SystemMessage(f"💾 Saved {path}" + ("" if "full" in words else "  (add 'full' to include every message sent to the model)")))
+                note = "" if full else "  (add 'full' to include every message sent to the model)"
+                if no_redact:
+                    note = "  ⚠️ UNREDACTED: secret-shaped values were NOT stripped - do not share this file"
+                log.mount(SystemMessage(f"💾 Saved {path}{note}"))
         elif words and not everything:
-            log.mount(SystemMessage("Usage: /trajectory [all] | copy [all] | save [full] [all]"))
+            log.mount(SystemMessage("Usage: /trajectory [all] | copy [all] | save [full [noredact]] [all]"))
         else:
             self.show_trajectory(everything)
 
