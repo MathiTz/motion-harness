@@ -171,7 +171,9 @@ A high-performance terminal interface built with `Textual`, designed for daily-d
 
 #### 🗂️ Where state lives
 
-Everything the harness writes into your project goes under one self-ignoring folder, `<workspace>/.motion/` (`tasks/`, `sessions/`, `skills/`); the harness's own log, memory DB and config stay in the install directory. Session transcripts (for `/resume`) are only written if you opted into interaction tracking.
+Everything the harness writes into your project goes under one self-ignoring folder, `<workspace>/.motion/` (`tasks/`, `sessions/`, `skills/`, `memory.db`); the harness's own log and config stay in the install directory. Session transcripts (for `/resume`) are only written if you opted into interaction tracking.
+
+**Memory is per-project.** Each workspace gets its own `.motion/memory.db`, so a fact remembered while working on one project (a file layout, a naming convention, a decision you made) is never recalled while working on an unrelated one. Before this, every workspace shared one DB at the harness's own install directory — if you used an early version, that file (`motion_memory.db` next to `main.py`) still exists with whatever it accumulated, untouched: nothing was migrated or deleted, since there's no way to know which project each old entry belonged to. Set `memory_path: /path/to/some.db` in `config.yml` to opt back into a single shared DB across every project (including pointing it at that old file) — this is deliberately not the default.
 
 **Model persistence**: switching models via `Ctrl+O` (or the startup provider picker) saves your choice as `last_provider` in `config.yml`, so the next `motion` launch reconnects to the same provider/model instead of resetting to the catalog default. An explicit `motion --provider ...` flag always overrides this for that one run and is not persisted.
 

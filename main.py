@@ -24,10 +24,32 @@ logger = logging.getLogger(__name__)
 # pattern applied to config and skill-synthesis paths.
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
 
+
+def _default_memory_path(workspace: Optional[str]) -> str:
+    """Memory is scoped to the workspace it was recorded in (issue #17): a fact remembered while
+    working on project A must not be recalled while working on unrelated project B. Each workspace
+    gets its own DB under its ``.motion/`` state directory, the same pattern already used for
+    sessions/skills/trajectories - see core/session.py's ``state_dir``.
+
+    When no workspace is known at all (a library caller that never resolved one, or the
+    `motion --test` self-check), this falls back to the harness's own pre-#17 shared DB at
+    REPO_DIR/motion_memory.db - unchanged from before this fix, since there is no workspace to
+    scope to. An explicit ``memory_path`` (a constructor arg, or config.yml's `memory_path`) always
+    overrides this and is the documented way to opt back into a single shared DB across projects -
+    see README.md's "Where state lives" section.
+    """
+    if not workspace:
+        return os.path.join(REPO_DIR, "motion_memory.db")
+    from core.session import state_dir
+
+    return str(state_dir(workspace) / "memory.db")
+
+
 class MotionAgent:
-    def __init__(self, model_config: ModelConfig, memory_path: Optional[str] = None, auto_skill_synthesis: bool = False, mcp_manager: Optional[Any] = None):
+    def __init__(self, model_config: ModelConfig, memory_path: Optional[str] = None, auto_skill_synthesis: bool = False,
+                 mcp_manager: Optional[Any] = None, workspace: Optional[str] = None):
         self.provider = ProviderFactory.get_provider(model_config)
-        self.memory = MemoryDB(memory_path or os.path.join(REPO_DIR, "motion_memory.db"))
+        self.memory = MemoryDB(memory_path or _default_memory_path(workspace))
         self.retriever = HybridRetriever(self.memory, self)
         self.caveman = CavemanProtocol(enabled=True)
         self.synthesizer = SkillSynthesizer(model_config, self.memory, embedding_provider=self)

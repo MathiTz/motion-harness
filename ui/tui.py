@@ -224,8 +224,12 @@ class AppState:
 
     def make_agent(self, model_config: ModelConfig) -> MotionAgent:
         """Build an agent wired to this session's config (permissions, memory,
-        MCP)."""
-        agent = MotionAgent(model_config, mcp_manager=self.mcp_manager)
+        MCP). Memory defaults to this workspace's own DB (issue #17); config.yml's
+        `memory_path`, if set, opts back into a single shared DB across projects."""
+        agent = MotionAgent(
+            model_config, mcp_manager=self.mcp_manager, workspace=WORKSPACE,
+            memory_path=self.config_manager.get("memory_path") or None,
+        )
         agent.auto_skill_synthesis = self.auto_synthesis_enabled
         agent.permissions_config = self.config_manager.data
         from core.agent_config import configure_agent
