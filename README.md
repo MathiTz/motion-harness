@@ -349,4 +349,16 @@ PY
 
 Checks cover: MainScreen compose, the `Ctrl+K` command palette, trace disclosure toggle (`F8`), and the shortcuts overlay (`?`/`Escape`).
 
+### 📋 User-reported problems
+
+A shipped PR that claims to fix something a real person hit is evidence of effort, not evidence the product got better for that person — only a **retest**, done by the reporter or the maintainer, is that evidence. This applies equally to a human contributor and an AI assistant working in this repo: completing the code change and its tests passing is not the same as the report being resolved, and neither should ever mark the retest step as done on the reporter's behalf.
+
+The workflow:
+
+1. File the report with [`.github/ISSUE_TEMPLATE/user-report.md`](.github/ISSUE_TEMPLATE/user-report.md) — the task the person was attempting, their friction in their own words where possible, and who reported it.
+2. A PR that fixes it links the report (the PR template has a section for this) and fills in "What changed."
+3. The issue's **Retest** section stays unchecked and blank until the reporter (or the maintainer, confirming with them) actually retries the same task and records the result. Nothing else closes that loop.
+
+[`docs/user-reports.md`](docs/user-reports.md) is a plain table of reports and whether each is still awaiting retest.
+
 For more details on our versioning and changelog, see [RELEASES.md](RELEASES.md).
