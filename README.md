@@ -98,7 +98,7 @@ motion auth list                          # List stored API keys
 ## 🛠️ Deep Capabilities
 
 ### 🧠 Hybrid Cognitive Memory
-Combines the nuance of vector embeddings with the precision of SQLite FTS5. Whether you need a "concept" or a "specific variable name," Motion finds it instantly.
+Combines the nuance of vector embeddings with the precision of SQLite FTS5, scoped to the current project (per-workspace, not shared across projects — see "Where state lives" below). Ranking is relevance-only today — two memories that say opposite things about the same topic (an old decision and the one that superseded it) aren't ranked by recency, so the more recent one isn't guaranteed to come back first; see [Memory & compaction quality](docs/memory-quality.md) for the real, measured result and what it did and didn't affect in practice.
 
 ### 🦴 Caveman Protocol
 An optional output filter that strips a fixed set of stock filler phrases ("Certainly!", "I hope this helps.", …) when a response is handed to another agent rather than to you. It is reversible (`CavemanCompressor.expand`) and is **not** applied to the model's input or to replies shown to you, so it does not meaningfully change token cost — treat it as a small utility, not a compression layer. (`motion --test` demonstrates it.)
