@@ -122,3 +122,41 @@ async def test_agent_embedding_failure_degrades_to_keyword_only():
     agent.provider.embed = boom
     await agent.get_embedding("q")
     assert not agent.semantic_available
+
+
+# ── confidence and recency surfaced, not silently smoothed over ────────────
+
+def test_keyword_and_semantic_search_return_the_stored_timestamp():
+    db = MemoryDB(":memory:")
+    vec = [1.0] + [0.0] * (EMBEDDING_DIM - 1)
+    add(db, "a memory about deployment", vec)
+    mid = db.conn.execute("SELECT id FROM memories").fetchone()[0]
+    db.conn.execute("UPDATE memories SET timestamp = ?", ("2020-06-15 00:00:00",))
+    kw = db.keyword_search("deployment")
+    sem = db.semantic_search(vec)
+    assert kw and kw[0][2] == "2020-06-15 00:00:00"
+    assert sem and sem[0][2] == "2020-06-15 00:00:00"
+    assert mid  # sanity: the row exists
+
+
+async def test_retrieve_reports_age_and_raw_semantic_score_per_result():
+    from datetime import datetime, timedelta, timezone
+
+    db = MemoryDB(":memory:")
+    vec = [1.0] + [0.0] * (EMBEDDING_DIM - 1)
+    add(db, "tokens plus vector memory", vec)
+    mid = db.conn.execute("SELECT id FROM memories").fetchone()[0]
+    old = (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=400)).isoformat()
+    db.conn.execute("UPDATE memories SET timestamp = ? WHERE id = ?", (old, mid))
+    r = HybridRetriever(db, FakeEmbedder(vec))
+    out = await r.retrieve("tokens")
+    assert out[0]["age"] == "1y ago"
+    assert out[0]["raw_score"] is not None and out[0]["raw_score"] > 0.9
+
+
+async def test_a_keyword_only_hit_has_no_raw_score_but_still_has_an_age():
+    db = MemoryDB(":memory:")
+    add(db, "alpha keyword only memory about tokens", [0.0, 1.0] + [0.0] * (EMBEDDING_DIM - 2))
+    r = HybridRetriever(db, FakeEmbedder([0.0] * EMBEDDING_DIM, semantic=False))
+    out = await r.retrieve("tokens")
+    assert out and out[0]["raw_score"] is None and out[0]["age"] is not None

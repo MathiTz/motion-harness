@@ -45,13 +45,13 @@ async def test_aseed_memory_db_can_set_an_explicit_timestamp(tmp_path: Path):
 
 # ── the real, verified finding: conflicting memories have no recency signal ─
 
-async def test_conflicting_memories_are_not_ranked_by_recency_today(tmp_path: Path):
-    """Regression/documentation test for the real finding in docs/memory-quality.md: retrieve()
-    never reads the timestamp column, so a stale memory can rank ABOVE the current one that
-    explicitly supersedes it. This does not assert that's *correct* - it's not - it documents
-    today's actual behavior per issue #18's "findings are recorded, even if nothing needs fixing
-    yet" instruction (here, something does need fixing - a natural follow-up, not this issue's
-    scope, per its own non-goals)."""
+async def test_near_tied_conflicting_memories_are_broken_by_recency(tmp_path: Path):
+    """Regression test for the real finding in docs/memory-quality.md: retrieve() used to never
+    read the timestamp column, so a stale memory could rank ABOVE the current one that explicitly
+    superseded it - measured live (0.0164 vs 0.0161, ~2% apart, stale one on top). Fixed by
+    HybridRetriever._break_ties_by_recency: fused scores this close (RECENCY_TIE_MARGIN) are
+    reordered newest-first rather than left to incidental fusion arithmetic. Both memories still
+    come back either way - only the order changed."""
     agent = FakeAgent()
     await aseed_memory_db(tmp_path, [
         {"content": "Team decision: this project uses TAB characters for indentation.", "timestamp": "2020-01-01T00:00:00"},
@@ -62,9 +62,36 @@ async def test_conflicting_memories_are_not_ranked_by_recency_today(tmp_path: Pa
     results = await retriever.retrieve("what indentation style should I use in this project?")
     db.close()
     assert len(results) == 2
-    # Both come back (context isn't lost); it's the RANKING that has no recency awareness - the
-    # two scores are close enough that either can lead, which is itself the finding.
-    assert abs(results[0]["score"] - results[1]["score"]) < 0.01
+    max_score = max(results[0]["score"], results[1]["score"])
+    assert abs(results[0]["score"] - results[1]["score"]) <= max_score * HybridRetriever.RECENCY_TIE_MARGIN  # still a near-tie
+    assert "now uses SPACES" in results[0]["content"]  # the CURRENT one now wins the tie
+    assert results[0]["age"] == "today" and results[1]["age"] == "6y ago"
+
+
+def test_a_clear_non_tied_winner_is_never_displaced_by_recency():
+    """The tie-break must only reorder genuine near-ties - a memory that's a clear, non-competing
+    match must not be pushed down by an older, weakly-related one just because it's newer."""
+    from memory.retriever import HybridRetriever
+
+    ranked = [
+        {"score": 0.05, "content": "clear winner", "timestamp": "2020-01-01T00:00:00"},
+        {"score": 0.01, "content": "old, weakly related", "timestamp": "2030-01-01T00:00:00"},
+    ]
+    retriever = HybridRetriever.__new__(HybridRetriever)
+    out = retriever._break_ties_by_recency(ranked)
+    assert out[0]["content"] == "clear winner"
+
+
+def test_missing_or_unparseable_timestamps_never_sort_as_if_recent():
+    from memory.retriever import HybridRetriever
+
+    ranked = [
+        {"score": 0.05, "content": "no timestamp at all", "timestamp": None},
+        {"score": 0.049, "content": "has a real, recent timestamp", "timestamp": "2030-01-01T00:00:00"},
+    ]
+    retriever = HybridRetriever.__new__(HybridRetriever)
+    out = retriever._break_ties_by_recency(ranked)
+    assert out[0]["content"] == "has a real, recent timestamp"
 
 
 async def test_a_stale_memory_is_surfaced_with_no_awareness_that_it_is_stale(tmp_path: Path):

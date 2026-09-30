@@ -117,11 +117,17 @@ class MemoryDB:
         self.conn.commit()
         return mem_id
 
-    def keyword_search(self, query: str, limit: int = 5) -> List[Tuple[float, str]]:
+    def keyword_search(self, query: str, limit: int = 5) -> List[Tuple[float, str, str]]:
+        """Returns ``(rank, content, timestamp)`` - the timestamp lets a caller (HybridRetriever)
+        show how old a memory is, not just how well it matched (issue #18's follow-up: a match with
+        no age/confidence signal is indistinguishable from a stronger, more current one)."""
         match = fts_query(query)
         if not match:
             return []
-        sql = "SELECT rank, content FROM memories_fts WHERE memories_fts MATCH ? ORDER BY rank LIMIT ?"
+        sql = (
+            "SELECT f.rank, f.content, m.timestamp FROM memories_fts f "
+            "JOIN memories m ON m.id = f.rowid WHERE f.content MATCH ? ORDER BY f.rank LIMIT ?"
+        )
         try:
             return self.conn.execute(sql, (match, limit)).fetchall()
         except sqlite3.OperationalError:
@@ -162,11 +168,16 @@ class MemoryDB:
         prefix = f"[note:{key}] "
         return row[0][len(prefix):] if row[0].startswith(prefix) else row[0]
 
-    def semantic_search(self, query_embedding: List[float], limit: int = 5) -> List[Tuple[float, str]]:
+    def semantic_search(self, query_embedding: List[float], limit: int = 5) -> List[Tuple[float, str, str]]:
+        """Returns ``(cosine_similarity, content, timestamp)``. The raw similarity is a real
+        0-1-ish confidence number (unlike HybridRetriever's fused rank score, which has no
+        absolute meaning) - callers use it to tell a strong match from a borderline one, and the
+        timestamp to tell a current memory from a stale one, instead of presenting every recalled
+        chunk with equal, unstated confidence (issue #18's follow-up)."""
         query_blob = self._serialize_embedding(query_embedding)
         if self._vec_available:
             rows = self.conn.execute(
-                """SELECT m.content, v.distance
+                """SELECT m.content, v.distance, m.timestamp
                    FROM memories_vec v
                    JOIN memories m ON m.id = v.rowid
                    WHERE v.embedding MATCH ? AND k = ?
@@ -185,16 +196,16 @@ class MemoryDB:
             # (e.g. a stored placeholder embedding). Skip those rather than
             # crashing on `1.0 - None` - they simply can't participate in
             # semantic search, but remain findable via keyword search.
-            return [(1.0 - row[1], row[0]) for row in rows if row[1] is not None]
+            return [(1.0 - row[1], row[0], row[2]) for row in rows if row[1] is not None]
 
         # Fallback: brute-force cosine similarity using numpy
-        cursor = self.conn.execute("SELECT content, embedding FROM memories")
+        cursor = self.conn.execute("SELECT content, embedding, timestamp FROM memories")
         results = []
         query_arr = np.array(query_embedding, dtype=np.float32)
         query_norm = np.linalg.norm(query_arr)
         if query_norm == 0:
             return []
-        for content, emb_blob in cursor:
+        for content, emb_blob, timestamp in cursor:
             emb = np.frombuffer(emb_blob, dtype="<f")
             if len(emb) != len(query_arr):
                 continue
@@ -205,7 +216,7 @@ class MemoryDB:
                 # dividing by zero and injecting a NaN-scored "match".
                 continue
             score = float(np.dot(query_arr, emb) / (query_norm * emb_norm))
-            results.append((score, content))
+            results.append((score, content, timestamp))
         results.sort(key=lambda x: x[0], reverse=True)
         return results[:limit]
 

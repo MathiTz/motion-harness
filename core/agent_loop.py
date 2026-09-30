@@ -43,6 +43,7 @@ from core.permissions import CommandPolicy
 from core.providers import SYSTEM_CACHE_SPLIT, BaseProvider, NativeToolsUnsupported, StreamCutError, StreamEvent, ToolCall
 from core.sandbox import Sandbox, default_protected_paths
 from core.skills import SkillLibrary
+from memory.retriever import HybridRetriever
 from core.tool_specs import ALL_TOOL_NAMES, MUTATING_TOOLS
 from core.toolstate import ToolSession
 from core.workspace_tools import (
@@ -205,6 +206,23 @@ async def _empty() -> str:
     return ""
 
 
+def _format_recalled_chunk(chunk: Dict[str, Any]) -> str:
+    """A recalled memory shown with its age and, when it came from semantic search, its raw
+    confidence - so a weak 0.4-similarity guess doesn't read exactly like a solid keyword match or
+    a well-scoring one. Without this, every recalled chunk looked equally authoritative regardless
+    of how sure the retriever actually was, or how old the fact is (memory/retriever.py's
+    HybridRetriever computes both; this is the one place they're rendered into the prompt)."""
+    tags = []
+    if chunk.get("age"):
+        tags.append(f"recorded {chunk['age']}")
+    raw_score = chunk.get("raw_score")
+    if raw_score is not None:
+        weak = " - weak, verify before relying on this" if raw_score < HybridRetriever.WEAK_SEMANTIC_SCORE else ""
+        tags.append(f"semantic match {raw_score:.2f}{weak}")
+    prefix = f"[{', '.join(tags)}] " if tags else ""
+    return f"{prefix}{chunk['content']}"
+
+
 class TurnRunner:
     def __init__(
         self,
@@ -341,7 +359,7 @@ class TurnRunner:
                 deduped.append(c)
         deduped = deduped[:5]
         await self.trace("memory_recall_done", "Memory recall complete", chunks=len(deduped))
-        return "\n".join(c["content"] for c in deduped)
+        return "\n".join(_format_recalled_chunk(c) for c in deduped)
 
     def _build_tools(self) -> WorkspaceTools:
         agent = self.agent

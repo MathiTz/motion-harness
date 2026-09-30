@@ -29,6 +29,12 @@ async def tui_app(tmp_path: Path, monkeypatch, steps, *, mode="build", track=Fal
     monkeypatch.setattr(ConfigManager, "CONFIG_PATHS", [str(cfg)])
     monkeypatch.setattr(tui, "WORKSPACE", str(tmp_path))
     monkeypatch.setattr(tui, "_suppress_logging", lambda: None)
+    # core.skills.SkillLibrary.for_workspace always falls back to REPO_DIR/skills (where real
+    # auto-synthesized skills accumulate on an actual install - by design, see core/skills.py's own
+    # docstring). Left unpatched, any test that touches /skill list|show|candidates or the system
+    # prompt's skill listing is exposed to whatever real skills happen to exist on the machine
+    # running the suite - this bit a real test during issue #16's work. tmp_path is always empty.
+    monkeypatch.setattr("core.skills.REPO_DIR", tmp_path / "_isolated_repo_dir_unused")
     app = tui.MotionTUI(
         model_config=ModelConfig(name="x", endpoint="http://x", provider_type="local", options={"model": "m"}),
         provider_id="x/m",
@@ -877,9 +883,7 @@ async def test_skill_candidates_lists_pending_synthesized_skills_not_active_ones
 
         await send(app, pilot, "/skill list")
         await pilot.pause(0.1)
-        # REPO_DIR/skills may hold real, unrelated skills from actual prior usage of this install -
-        # only assert what this test controls: the new candidate is not listed as active.
-        assert not any(t.strip().startswith("my_candidate") for t in system_lines(app))
+        assert any("No skills saved yet" in t for t in system_lines(app))  # the candidate is not active
         assert any("1 candidate(s) awaiting review" in t for t in system_lines(app))
 
         await send(app, pilot, "/skill candidates")
