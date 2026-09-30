@@ -458,6 +458,36 @@ async def test_failing_retriever_does_not_fail_the_turn(tmp_path: Path):
     assert resp == "still works"
 
 
+async def test_recalled_memory_reaches_the_prompt_with_age_and_confidence_shown(tmp_path: Path):
+    """core/agent_loop.py's _format_recalled_chunk: a recalled memory is not pasted into the system
+    prompt as bare, unqualified content - its age and (for a semantic match) confidence are shown,
+    a weak one explicitly hedged, so the model can tell a strong recent fact from a shaky old guess
+    instead of every recalled chunk reading with equal, unstated authority."""
+    class Annotated:
+        async def retrieve(self, query, top_k=5):
+            return [
+                {"content": "STRONG_RECENT_FACT", "age": "today", "raw_score": 0.95},
+                {"content": "WEAK_OLD_GUESS", "age": "3y ago", "raw_score": 0.41},
+                {"content": "KEYWORD_ONLY_HIT", "age": "2d ago", "raw_score": None},
+            ]
+
+    agent = make_agent(Scripted([text("ok")]))
+    agent.retriever = Annotated()
+    await run(agent, workspace=str(tmp_path))
+    system = agent.provider.requests[0]["system"]
+    assert "[recorded today, semantic match 0.95] STRONG_RECENT_FACT" in system
+    assert "[recorded 3y ago, semantic match 0.41 - weak, verify before relying on this] WEAK_OLD_GUESS" in system
+    assert "[recorded 2d ago] KEYWORD_ONLY_HIT" in system  # no confidence tag for a keyword-only hit
+
+
+async def test_a_retriever_that_omits_the_new_fields_still_works_plainly():
+    """Backward compatibility: a retriever/mock that only returns {"content": ...} (no age/
+    raw_score) must not crash formatting - it just gets no annotation, the pre-existing behavior."""
+    from core.agent_loop import _format_recalled_chunk
+
+    assert _format_recalled_chunk({"content": "plain memory, no metadata"}) == "plain memory, no metadata"
+
+
 async def test_project_instructions_and_environment_reach_the_system_prompt(tmp_path: Path):
     (tmp_path / "AGENTS.md").write_text("Always use tabs.")
     p = Scripted([text("ok")])

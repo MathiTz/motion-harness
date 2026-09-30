@@ -17,14 +17,13 @@ retrieval/compaction algorithms, it doesn't replace them.
 
 from __future__ import annotations
 
-import io
-import json
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from core.session import state_dir
+from evals.lib import _run_headless_capturing
 
 
 async def aseed_memory_db(workspace: Path, entries: List[Dict[str, Any]], *, agent=None) -> None:
@@ -63,14 +62,6 @@ class ScenarioResult:
     detail: Dict[str, Any] = field(default_factory=dict)
 
 
-async def _run_headless(prompt: str, workspace: Path, provider_id: Optional[str]) -> Dict[str, Any]:
-    from core.headless import run_headless
-
-    buf = io.StringIO()
-    await run_headless(prompt, provider_id=provider_id, workspace=str(workspace), output_format="json", out=buf, err=io.StringIO())
-    return json.loads(buf.getvalue().splitlines()[-1])
-
-
 def _build_agent(provider_id: Optional[str], workspace: Path):
     """Always pass workspace: without it, build_agent falls back to the harness's own shared,
     real, historically-accumulated motion_memory.db (main.py's _default_memory_path with no
@@ -101,10 +92,10 @@ async def scenario_conflicting_memories(workdir: Path, provider_id: Optional[str
         f"top result: {top[:90]!r}" if results else "no results returned"
     ) + f" ({len(results)} total, scores: {[round(r['score'], 4) for r in results]})"
 
-    summary = await _run_headless(
+    summary = await _run_headless_capturing(
         "Write a new file add.py containing exactly one function, add(a, b), that returns a + b, "
         "following this project's established indentation convention.",
-        workdir, provider_id,
+        provider_id=provider_id, workspace=str(workdir),
     )
     written = (workdir / "add.py")
     downstream_ok = None
@@ -139,8 +130,9 @@ async def scenario_stale_memory(workdir: Path, provider_id: Optional[str]) -> Sc
         f"stale memory surfaced: {results[0]['content'][:80]!r}" if results else "nothing surfaced"
     )
 
-    summary = await _run_headless(
-        "Add a 10% discount to the function in utils.py that computes the order total.", workdir, provider_id,
+    summary = await _run_headless_capturing(
+        "Add a 10% discount to the function in utils.py that computes the order total.",
+        provider_id=provider_id, workspace=str(workdir),
     )
     content = (workdir / "utils.py").read_text()
     downstream_ok = "calculate_total" in content and ("0.9" in content or "10%" in content or "discount" in content.lower())
