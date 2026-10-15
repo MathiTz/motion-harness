@@ -86,6 +86,11 @@ motion --list                             # List available providers/models
 motion --test                             # Run Caveman compression test
 motion -p "review main.py"                # Headless one-shot: print the answer and exit
 motion -p "..." --output-format json      # ...or a JSON result / stream-json events for scripts
+motion -p "..." --resume <session-id>     # ...continuing a saved session
+motion skill candidates                   # Review learned skills (promote / reject / rollback / ab-test)
+motion eval run --json                    # Run the eval baseline; JSON report on stdout
+motion memory search "deploy script"      # What would be recalled, with age and confidence
+motion sessions list                      # Saved sessions (see also: trajectory, tracking, check)
 motion auth login <provider>              # Store an API key
 motion auth logout <provider>             # Remove a stored API key
 motion auth list                          # List stored API keys
@@ -157,7 +162,7 @@ A high-performance terminal interface built with `Textual`, designed for daily-d
 
 #### 🤖 Headless mode
 
-`motion -p "prompt"` runs one turn with no UI, for scripts and CI. `--output-format text` (default) prints the answer; `json` prints one result object (answer, usage, cost, steps, timing and a per-step `trajectory`); `stream-json` prints events as they happen and ends with that result. `--plan` is read-only, `--workspace DIR` picks the directory, `--verbose` prints tool activity to stderr, `-p -` reads the prompt from stdin and `--stdin` appends piped input as context (`git diff | motion -p "review this" --stdin`). Nothing can be approved interactively, so risky commands are refused unless pre-approved in `permissions.commands.allow`. Exit codes: 0 ok, 1 the turn failed, 2 usage error, 130 interrupted.
+`motion -p "prompt"` runs one turn with no UI, for scripts and CI. `--output-format text` (default) prints the answer; `json` prints one result object (answer, usage, cost, steps, timing and a per-step `trajectory`); `stream-json` prints events as they happen and ends with that result. `--plan` is read-only, `--workspace DIR` picks the directory, `--verbose` prints tool activity to stderr, `-p -` reads the prompt from stdin and `--stdin` appends piped input as context (`git diff | motion -p "review this" --stdin`). Nothing can be approved interactively, so risky commands are refused unless pre-approved in `permissions.commands.allow`. Exit codes: 0 ok, 1 the turn failed, 2 usage error, 130 interrupted. `--resume ID` continues a saved session. The review, eval and inspection features are subcommands too, each with `--json`: `motion skill|eval|trajectory|sessions|memory|tracking|check` (see [docs/cli.md](docs/cli.md#headless-subcommands)).
 
 #### 🔐 Safety & permissions
 

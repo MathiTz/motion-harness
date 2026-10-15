@@ -5,7 +5,18 @@ This file tracks the evolution of Motion Harness. We follow Semantic Versioning 
 ## 🧪 Beta Releases (Pre-release)
 Current Phase: **Stability & Bug Squashing**
 
-### v0.15.2-beta.0 (Current)
+### Unreleased: headless subcommands — [#39](https://github.com/MathiTz/motion-harness/pull/39)
+
+The features added over the last cycle were reachable only from the TUI (`/skill`, `/resume`, `/tracking`, `/trajectory`) or as loose scripts under `scripts/`, which made them unusable from CI or another program. They are now `motion` subcommands with machine-readable output; the version number is assigned by the release action when this merges.
+
+- `motion skill list|show|candidates|promote|reject|rollback|ab-test` — the full candidate → active review loop from a shell. `ab-test` returns a verdict and never promotes; promotion stays a separate, explicit call.
+- `motion eval list|run|memory` — the task baseline and memory-quality scenarios, with the report on stdout under `--json`.
+- `motion trajectory list|compare`, `motion sessions list|show`, `motion memory search|stats`, `motion tracking on|off|status`, `motion check` — inspection, consent and provider checks.
+- `motion -p ... --resume ID` — continue a saved session headlessly. The turn is recorded only if interaction tracking is on, so it never writes a transcript you opted out of.
+- Contract: `--json` puts exactly one JSON document on stdout (progress goes to stderr); exit codes are 0 ok, 1 the operation did not succeed, 2 usage error. `motion memory search` never creates a database as a side effect of searching.
+- Not changed: the billed commands (`eval run`, `eval memory`, `skill ab-test`, `check`) make real provider calls exactly as the scripts they wrap always did; nothing here runs them automatically, and CI does not run them.
+
+### v0.15.2-beta.0
 
 This entry covers PRs [#21](https://github.com/MathiTz/motion-harness/pull/21)–[#37](https://github.com/MathiTz/motion-harness/pull/37), a single work cycle driven by a review of the codebase's own real gaps plus direct user reports, each one verified against the actual code before being acted on (not assumed). The versions between v0.1.0-beta.1 and this one were never written up here — this file had gone stale; it starts tracking accurately from here rather than reconstructing history it doesn't have firsthand knowledge of.
 

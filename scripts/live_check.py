@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import sys
 import time
 from pathlib import Path
@@ -155,28 +156,36 @@ CHECKS: List[Tuple[str, Callable[[Any], Awaitable[str]]]] = [
 ]
 
 
-async def run_provider(provider_id: str, cm: Any) -> bool:
+async def run_provider(provider_id: str, cm: Any, rows: "List[Dict[str, Any]] | None" = None, log: Any = None) -> bool:
+    """`rows`, when given, collects one dict per check (for `motion check --json`); `log` is where
+    the human-readable lines go (stdout by default, stderr in JSON mode)."""
     from core.agent_config import make_provider_builder
 
+    log = log or sys.stdout
+    rows = rows if rows is not None else []
     provider = make_provider_builder(cm)(provider_id)
     if provider is None:
-        print(f"\n{provider_id}: SKIPPED (unknown id, or no API key: `motion auth login` / set its env var)")
+        print(f"\n{provider_id}: SKIPPED (unknown id, or no API key: `motion auth login` / set its env var)", file=log)
+        rows.append({"provider": provider_id, "check": None, "status": "skipped", "detail": "unknown id or no API key"})
         return True
     opts = provider.config.options
-    print(f"\n{provider_id}  ({provider.config.provider_type}, model {opts.get('model')}, {provider.config.endpoint})")
+    print(f"\n{provider_id}  ({provider.config.provider_type}, model {opts.get('model')}, {provider.config.endpoint})", file=log)
     ok = True
     try:
         for name, fn in CHECKS:
             t0 = time.monotonic()
             try:
                 detail = await asyncio.wait_for(fn(provider), 90)
-                print(f"  PASS  {name:<28} {detail}  ({time.monotonic() - t0:.1f}s)")
+                print(f"  PASS  {name:<28} {detail}  ({time.monotonic() - t0:.1f}s)", file=log)
+                rows.append({"provider": provider_id, "check": name, "status": "pass", "detail": str(detail), "seconds": round(time.monotonic() - t0, 2)})
             except AssertionError as exc:
                 ok = False
-                print(f"  FAIL  {name:<28} {exc}")
+                print(f"  FAIL  {name:<28} {exc}", file=log)
+                rows.append({"provider": provider_id, "check": name, "status": "fail", "detail": str(exc)})
             except Exception as exc:  # network / HTTP errors: show the (key-free) message
                 ok = False
-                print(f"  FAIL  {name:<28} {type(exc).__name__}: {str(exc)[:200]}")
+                print(f"  FAIL  {name:<28} {type(exc).__name__}: {str(exc)[:200]}", file=log)
+                rows.append({"provider": provider_id, "check": name, "status": "fail", "detail": f"{type(exc).__name__}: {str(exc)[:200]}"})
     finally:
         close = getattr(provider, "close", None)
         if close:
@@ -193,15 +202,21 @@ async def main_async(args: argparse.Namespace) -> int:
 
     _load_dotenv(REPO)
     cm = ConfigManager()
+    as_json = getattr(args, "json_output", False)  # `motion check --json`: human lines -> stderr
+    log = sys.stderr if as_json else sys.stdout
     if args.all:
         ids = [pid for pid in cm.list_providers() if pid != "default" and cm.has_api_key(pid)]
     else:
         ids = [args.provider or cm.get_default_provider()]
     if not ids:
-        print("No providers with an API key found. Run `motion auth login`.")
+        print("No providers with an API key found. Run `motion auth login`.", file=sys.stderr)
         return 2
-    results = [await run_provider(pid, cm) for pid in ids]
-    print("\nAll checks passed." if all(results) else "\nSome checks FAILED: the adapter and the live service disagree.")
+    rows: List[Dict[str, Any]] = []
+    results = [await run_provider(pid, cm, rows, log) for pid in ids]
+    if as_json:
+        print(json.dumps({"ok": all(results), "checks": rows}, indent=2))
+    else:
+        print("\nAll checks passed." if all(results) else "\nSome checks FAILED: the adapter and the live service disagree.")
     return 0 if all(results) else 1
 
 

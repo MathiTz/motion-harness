@@ -25,21 +25,26 @@ from evals.memory_quality import SCENARIOS, build_report  # noqa: E402
 
 
 async def main_async(args: argparse.Namespace) -> int:
+    as_json = getattr(args, "json_output", False)  # `motion eval memory --json`: progress -> stderr
+    log = sys.stderr if as_json else sys.stdout
     names = [args.scenario] if args.scenario else list(SCENARIOS)
     results = []
     for name in names:
         fn = SCENARIOS[name]
         workdir = Path(tempfile.mkdtemp(prefix=f"memquality-{name}-"))
-        print(f"-> {name}...")
+        print(f"-> {name}...", file=log)
         try:
             result = await fn(workdir, args.provider)
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
         results.append(result)
-        print(f"   relevance:  {'n/a' if result.relevance_ok is None else ('OK' if result.relevance_ok else 'BAD')}  {result.relevance_finding}")
-        print(f"   downstream: {'n/a' if result.downstream_ok is None else ('OK' if result.downstream_ok else 'BAD')}  {result.downstream_finding}")
+        print(f"   relevance:  {'n/a' if result.relevance_ok is None else ('OK' if result.relevance_ok else 'BAD')}  {result.relevance_finding}", file=log)
+        print(f"   downstream: {'n/a' if result.downstream_ok is None else ('OK' if result.downstream_ok else 'BAD')}  {result.downstream_finding}", file=log)
 
     report = build_report(results)
+    if as_json:
+        print(json.dumps(report, indent=2, default=str))
+        return 0
     out_path = Path(args.out) if args.out else Path(tempfile.gettempdir()) / f"memory-quality-{report['timestamp'].replace(':', '')}.json"
     out_path.write_text(json.dumps(report, indent=2, default=str))
     print(f"\nTotal cost: ${report['total_cost_usd']:.4f}")

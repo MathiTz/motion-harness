@@ -411,7 +411,13 @@ def build_parser():
     headless.add_argument("--effort", choices=("low", "medium", "high"), default=None,
                           help="Headless: reasoning effort for models that support it (lower = faster and cheaper)")
     headless.add_argument("--verbose", action="store_true", help="Headless: print tool activity to stderr")
+    headless.add_argument("--resume", default=None, metavar="SESSION_ID",
+                          help="Headless: continue a saved session (see `motion sessions list`); the new turn is "
+                               "appended to it when interaction tracking is on")
     sub = parser.add_subparsers(dest="command")
+    from core.cli_commands import add_subcommands
+
+    add_subcommands(sub)
     auth_parser = sub.add_parser("auth", help="Manage provider API keys")
     auth_sub = auth_parser.add_subparsers(dest="auth_action", required=True)
     auth_sub.add_parser("list", help="List stored API keys")
@@ -437,6 +443,10 @@ def main(argv=None) -> int:
         from core.headless import main_headless
 
         return main_headless(args)
+    from core.cli_commands import COMMANDS, run as run_subcommand
+
+    if args.command in COMMANDS:
+        return run_subcommand(args)
     if args.command == "auth":
         cmd_auth(args)
     elif args.list:

@@ -90,7 +90,13 @@ async def run_headless(
     out: Optional[TextIO] = None,
     err: Optional[TextIO] = None,
     agent_factory: Optional[Callable[[], Any]] = None,
+    history: Optional[list] = None,
+    session_store: Any = None,
 ) -> int:
+    """`history` is prior [{"role", "content"}] messages (from `--resume`); `session_store`, when
+    given, records this turn the way the TUI does (turn_start before any tool runs, turn_end after)
+    so the next `--resume`/`/resume` sees it - and an uncatchable kill still leaves the
+    "interrupted" trace (core/session.py)."""
     out = out or sys.stdout
     err = err or sys.stderr
     if output_format not in FORMATS:
@@ -159,6 +165,12 @@ async def run_headless(
 
     session = ToolSession()
     ok, result = True, ""
+    turn_id = None
+    if session_store is not None:
+        try:
+            turn_id = session_store.start_turn(prompt)
+        except Exception:
+            session_store = None
     try:
         if agent.mcp_manager is not None:
             try:
@@ -174,6 +186,7 @@ async def run_headless(
             workspace=workspace,
             agent_mode="plan" if plan else "build",
             session=session,
+            history=history or None,
         )
         if stats["error"]:
             ok = False
@@ -182,6 +195,14 @@ async def run_headless(
     except Exception as exc:
         ok, stats["error"] = False, f"{type(exc).__name__}: {exc}"
     finally:
+        if session_store is not None and turn_id:
+            try:
+                session_store.append({
+                    "type": "turn_end", "turn_id": turn_id, "provider": getattr(agent, "provider_id", ""),
+                    "prompt": prompt, "response": result if ok else (stats["error"] or result or ""),
+                })
+            except Exception:
+                pass
         try:  # background jobs must not outlive the run
             await asyncio.wait_for(session.jobs.stop_all(), timeout=5)
         except Exception:
@@ -238,6 +259,32 @@ async def run_headless(
     return EXIT_OK if ok else EXIT_FAILED
 
 
+def _resume_context(args: Any):
+    """(history messages, SessionStore) for `--resume ID`, or (None, None). The store is only
+    returned when interaction tracking is on - the same gate the TUI applies, so `--resume` never
+    writes a transcript the user opted out of."""
+    session_id = getattr(args, "resume", None)
+    if not session_id:
+        return None, None
+    from core.config import ConfigManager
+    from core.session import SessionStore
+
+    workspace = os.path.abspath(args.workspace or os.getenv("MOTION_WORKSPACE") or os.getcwd())
+    turns = SessionStore.load(workspace, session_id)
+    if not turns:
+        raise HeadlessUsageError(f"no session named {session_id!r} in {workspace} (see `motion sessions list`)")
+    history = []
+    for rec in turns[-8:]:  # same window the TUI sends
+        history.append({"role": "user", "content": rec.get("prompt", "")})
+        response = rec.get("response", "")
+        if response and not rec.get("interrupted"):
+            history.append({"role": "assistant", "content": response})
+    store = None
+    if ConfigManager().get("track_interactions"):
+        store = SessionStore(workspace, os.path.splitext(os.path.basename(session_id))[0])
+    return history, store
+
+
 def main_headless(args: Any, stdin: Optional[TextIO] = None) -> int:
     """Entry point used by main.py; turns exceptions into exit codes."""
     stdin = stdin or sys.stdin
@@ -249,8 +296,11 @@ def main_headless(args: Any, stdin: Optional[TextIO] = None) -> int:
             extra = stdin.read()
             if extra.strip():
                 prompt = f"{prompt}\n\n<stdin>\n{extra}\n</stdin>"
+        history, store = _resume_context(args)
         return asyncio.run(run_headless(
             prompt or "",
+            history=history,
+            session_store=store,
             provider_id=args.provider,
             workspace=args.workspace,
             plan=args.plan,
