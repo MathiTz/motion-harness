@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import shutil
 import sys
 import tempfile
@@ -64,18 +65,29 @@ async def main_async(args: argparse.Namespace) -> int:
         print("no scriptable tasks to compare (rubric-scored tasks can't feed a pass/fail A/B)", file=sys.stderr)
         return 2
 
-    print(f"A/B testing {skill_path.name} against {len(tasks)} task(s), {args.repeat} repeat(s) each, provider={args.provider or '(config default)'}\n")
+    as_json = getattr(args, "json_output", False)  # `motion skill ab-test --json`: progress -> stderr
+    log = sys.stderr if as_json else sys.stdout
+    print(f"A/B testing {skill_path.name} against {len(tasks)} task(s), {args.repeat} repeat(s) each, provider={args.provider or '(config default)'}\n", file=log)
     regressions = []
+    rows = []
     for task in tasks:
         without = [await run_variant(task, args.provider, None) for _ in range(args.repeat)]
         with_skill = [await run_variant(task, args.provider, skill_path) for _ in range(args.repeat)]
         w_rate = sum(without) / len(without)
         s_rate = sum(with_skill) / len(with_skill)
         verdict = "REGRESSION" if s_rate < w_rate else ("improved" if s_rate > w_rate else "no change")
-        print(f"  {task.id:32s} without={without}  with_skill={with_skill}  {verdict}")
+        print(f"  {task.id:32s} without={without}  with_skill={with_skill}  {verdict}", file=log)
+        rows.append({"task": task.id, "without": without, "with_skill": with_skill, "verdict": verdict})
         if s_rate < w_rate:
             regressions.append(task.id)
 
+    if as_json:
+        print(json.dumps({
+            "skill": skill_path.stem, "repeat": args.repeat, "tasks": rows, "regressions": regressions,
+            "verdict": "do_not_promote" if regressions else "no_regression",
+            "note": "this never promotes automatically; run `motion skill promote <name>` yourself",
+        }, indent=2))
+        return 1 if regressions else 0
     print()
     if regressions:
         print(f"DO NOT PROMOTE: regressed on {len(regressions)}/{len(tasks)} task(s): {', '.join(regressions)}")

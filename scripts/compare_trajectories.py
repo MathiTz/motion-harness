@@ -109,6 +109,27 @@ def compare(before: Dict[str, Any], after: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def compare_data(before: Dict[str, Any], after: Dict[str, Any]) -> Dict[str, Any]:
+    """The same comparison as `compare`, as plain data (for `motion trajectory compare --json`)."""
+    bs, as_ = before.get("summary", {}), after.get("summary", {})
+    metrics = ("steps", "tool_calls", "prompt_tokens", "completion_tokens", "model_seconds", "tool_seconds")
+    deltas = {m: {"before": bs.get(m, 0), "after": as_.get(m, 0), "delta": as_.get(m, 0) - bs.get(m, 0)} for m in metrics}
+    bc, ac = estimated_cost(before), estimated_cost(after)
+    before_calls, after_calls = call_set(before), call_set(after)
+    bv, av = before.get("harness_version", "unknown"), after.get("harness_version", "unknown")
+    bp, ap = before.get("provider", "?"), after.get("provider", "?")
+    return {
+        "before": {"harness_version": bv, "provider": bp},
+        "after": {"harness_version": av, "provider": ap},
+        "same_harness_and_provider": bv == av and bp == ap,
+        "metrics": deltas,
+        "estimated_cost_usd": None if bc is None or ac is None else {"before": bc, "after": ac, "delta": ac - bc},
+        "only_in_before": [{"name": n, "args": a} for n, a in sorted(before_calls - after_calls)],
+        "only_in_after": [{"name": n, "args": a} for n, a in sorted(after_calls - before_calls)],
+        "task_result": {"before": before.get("task_result"), "after": after.get("task_result")},
+    }
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("before", help="the earlier trajectory JSON")

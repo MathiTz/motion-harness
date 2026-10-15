@@ -42,33 +42,50 @@ def print_task_list(tasks: list[Task]) -> None:
         print(f"  {t.id:32s} {t.category:12s} {kind:7s}{flag}  {t.description.strip().splitlines()[0]}")
 
 
+def task_list_data(tasks: list[Task]) -> list[dict]:
+    return [
+        {"id": t.id, "category": t.category, "scoring": "script" if t.scriptable else "rubric",
+         "held_out": t.held_out, "description": t.description.strip().splitlines()[0]}
+        for t in tasks
+    ]
+
+
 async def main_async(args: argparse.Namespace) -> int:
+    as_json = getattr(args, "json_output", False)  # set by `motion eval ... --json`; progress goes to stderr
+    log = sys.stderr if as_json else sys.stdout
     tasks = load_tasks(include_held_out=args.include_held_out, only=args.tasks)
     if not tasks:
         print("no matching tasks", file=sys.stderr)
         return 2
     if args.list:
-        print_task_list(tasks)
+        if as_json:
+            print(json.dumps(task_list_data(tasks), indent=2))
+        else:
+            print_task_list(tasks)
         return 0
 
     results = []
     for task in tasks:
         runner = run_resume_task if task.category == "resume" else run_task
         workdir = Path(tempfile.mkdtemp(prefix=f"eval-{task.id}-"))
-        print(f"-> {task.id} ({task.category})...", end=" ", flush=True)
+        print(f"-> {task.id} ({task.category})...", end=" ", flush=True, file=log)
         result = await runner(task, provider_id=args.provider, workdir=workdir, keep_workdir=args.keep_workdirs)
         if not args.keep_workdirs:
             shutil.rmtree(workdir, ignore_errors=True)
         results.append(result)
         if result.passed is None:
-            print(f"needs human review (rubric: {result.rubric})")
+            print(f"needs human review (rubric: {result.rubric})", file=log)
         else:
-            print("PASS" if result.success else "FAIL")
+            print("PASS" if result.success else "FAIL", file=log)
 
     report = build_report(results)
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     out_path = Path(args.out) if args.out else RESULTS_DIR / f"{report['timestamp'].replace(':', '')}.json"
     out_path.write_text(json.dumps(report, indent=2, default=str))
+    report["report_path"] = str(out_path)
+    if as_json:
+        print(json.dumps(report, indent=2, default=str))
+        return 0
 
     s = report["summary"]
     print()
