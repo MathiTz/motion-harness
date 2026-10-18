@@ -76,7 +76,8 @@ from core.skills import SkillLibrary, slugify
 from core.toolstate import ToolSession
 from core import auth
 from main import MotionAgent, REPO_DIR
-from ui.chrome import HintBar, StatusBar
+from ui.chrome import HintBar, StatusBar, role_colors
+from ui.turncard import Chip, TurnLog, TurnSummary, headline_parts, render_card
 from ui.themes import ThemeRegistry
 
 WORKSPACE = os.getenv("MOTION_WORKSPACE", os.getcwd())
@@ -682,11 +683,11 @@ class StepsMessage(Static):
     """
     DEFAULT_CSS = """
     StepsMessage {
-        background: transparent;
+        background: $surface;
         color: $text;
-        text-opacity: 45%;
+        border-left: solid $border;
         padding: 0 2;
-        margin: 0 0 0 1;
+        margin: 0 1 0 1;
         height: auto;
         text-wrap: nowrap;
         text-overflow: ellipsis;
@@ -2865,6 +2866,8 @@ class ChatPane(Vertical):
         self._trace_count = 0
         # Live view of the running turn, read by the status-line timer.
         self._turn: dict = {}
+        # "Done" strips whose action chips are still live (they act on "the last turn").
+        self._summaries: list[TurnSummary] = []
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="chat_body"):
@@ -3702,6 +3705,8 @@ class ChatPane(Vertical):
     ) -> bool:
         """Run a single agent turn. Returns True if it was cancelled."""
         header_ts = datetime.now().strftime("%H:%M:%S")
+        self._retire_summaries()  # undo/diff/copy now mean this new turn, not the one above
+        tlog = TurnLog()
         st = self._turn = {
             "started": time.monotonic(), "phase": "thinking", "step": 0, "tool": "",
             "out": "", "ttft": None, "tokens": 0,
@@ -3813,8 +3818,21 @@ class ChatPane(Vertical):
             except asyncio.CancelledError:
                 pass
 
+        def refresh_card() -> None:
+            """Draw the live turn card: finished operations, then what is running right now."""
+            nonlocal steps_widget
+            if not tlog.has_activity():
+                return
+            stick = near_bottom()
+            if steps_widget is None:
+                steps_widget = StepsMessage("")
+                log.mount(steps_widget, before=live_response)
+            steps_widget.update(render_card(tlog, role_colors(self.app), width=max(40, log.size.width - 10)))
+            if stick:
+                log.scroll_end(animate=False)
+
         def on_stream_chunk(chunk: str) -> None:
-            nonlocal step_buf, think_buf, dirty, think_t0, think_last, steps_widget
+            nonlocal step_buf, think_buf, dirty, think_t0, think_last
             if not chunk:
                 return
             if chunk.startswith("_delta_ "):
@@ -3859,14 +3877,8 @@ class ChatPane(Vertical):
                 st["out"] = ""
                 if tool_text:
                     step_lines.append(_one_line(tool_text))
-                    stick = near_bottom()
-                    if steps_widget is None:
-                        steps_widget = StepsMessage("")
-                        log.mount(steps_widget, before=live_response)
-                    preview = "\n".join(f"• {s}" for s in step_lines[-3:])
-                    steps_widget.update(Text(preview, style="dim", no_wrap=True, overflow="ellipsis"))
-                    if stick:
-                        log.scroll_end(animate=False)
+                    tlog.add_line(_one_line(tool_text))
+                    refresh_card()
                     try:
                         main_screen = self.screen
                         if isinstance(main_screen, MainScreen):
@@ -3945,9 +3957,14 @@ class ChatPane(Vertical):
                 if event_type == "tool_start":
                     st["phase"] = _tool_label(tool)
                     detail = _tool_detail("about to run", tool, path)
+                    tlog.start(tool, path)
+                    refresh_card()
                 elif event_type == "tool_done":
                     st["phase"] = "thinking"
                     detail = _tool_detail("finished", tool, path)
+                    tlog.finish(tool, path, blocked="blocked" in str(payload.get("message", "")),
+                                created=bool(payload.get("created")))
+                    refresh_card()
                     diff = payload.get("diff") or ""
                     if diff and not payload.get("created"):
                         added, removed = int(payload.get("added") or 0), int(payload.get("removed") or 0)
@@ -3962,6 +3979,8 @@ class ChatPane(Vertical):
                 else:
                     st["phase"] = "thinking"
                     detail = _tool_detail("failed", tool, path, error)
+                    tlog.finish(tool, path, ok=False)
+                    refresh_card()
             elif event_type == "tool_progress":
                 detail = payload.get("message", "")
             else:
@@ -4069,7 +4088,7 @@ class ChatPane(Vertical):
             # also covers turns that finished before the first render tick.
             all_reasoning = "\n\n".join(x for x in (think_buf, reasoning) if x).strip()
             narration = "\n\n".join(thinking_steps).strip()  # the model's text between tool calls
-            if all_reasoning or narration or step_lines or reasoning_widget is not None:
+            if all_reasoning or narration or step_lines or tlog.calls or reasoning_widget is not None:
                 if reasoning_widget is None:
                     reasoning_widget = ReasoningMessage("")
                     log.mount(reasoning_widget, before=live_response)
@@ -4077,8 +4096,9 @@ class ChatPane(Vertical):
                 parts = []
                 if all_reasoning or (reasoning_widget is not None and not step_lines and not narration):
                     parts.append(f"thought for {max(secs, 0.1):.1f}s")
-                if step_lines:
-                    parts.append(f"{len(step_lines)} step{'s' if len(step_lines) != 1 else ''}")
+                parts.extend(tlog.summary_parts() or (
+                    [f"{len(step_lines)} step{'s' if len(step_lines) != 1 else ''}"] if step_lines else []
+                ))
                 sections = []
                 if all_reasoning:
                     sections.append(all_reasoning[-6000:])
@@ -4132,6 +4152,8 @@ class ChatPane(Vertical):
             self.state.conversation_turns.append((recorded, self.state.last_agent_response))
             self.state.update_session_context(recorded, self.state.last_agent_response)
             self.state.log_interaction(recorded, self.state.last_agent_response, turn_id)
+            if tlog.calls:
+                self._mount_turn_summary(tlog, log, live_response, elapsed, est_cost_usd)
             if stick_final:
                 log.scroll_end(animate=False)
             self._refresh_status()
@@ -4185,6 +4207,45 @@ class ChatPane(Vertical):
                     steps_widget.remove()
                 except Exception:
                     pass
+
+    def _retire_summaries(self) -> None:
+        """Drop the action chips from earlier "Done" strips: undo, diff and copy act on the last
+        turn, so once a new turn starts an old strip's chips would point at the wrong one."""
+        for strip in self._summaries:
+            try:
+                strip.retire()
+            except Exception:
+                pass
+        self._summaries.clear()
+
+    def _run_session_cmd(self, cmd: str) -> None:
+        """Run a slash command exactly as if it had been typed (a chip is a click on one)."""
+        log = self.query_one("#chat_log", VerticalScroll)
+        self.run_worker(self._handle_session_command(cmd, log), exclusive=False)
+
+    def _mount_turn_summary(self, tlog: TurnLog, log: VerticalScroll, after: Any, elapsed: float, cost: Any) -> None:
+        """The "Done" strip under the answer: what changed, and what you can do about it."""
+        cps = self.state.tool_session.checkpoints
+        changed = {str(e.path) for e in cps.entries if e.turn == cps.turn}  # this turn only, not an older one
+        diffs = self.state.turn_diffs
+        chips: list[Chip] = []
+        if diffs:
+            chips.append(Chip("View diff", "/diff", lambda: self._run_session_cmd("/diff")))
+        if changed:
+            def undo() -> None:
+                self._run_session_cmd("/undo")
+                summary.retire()  # one undo per strip: a second click would reach for an older turn
+
+            chips.append(Chip("Undo edits" if len(changed) > 1 else "Undo edit", "/undo", undo))
+        chips.append(Chip("Trace", "F8", self.action_toggle_trace_panel))
+        chips.append(Chip("Copy answer", "F9", self.action_copy_last_response))
+        priced = format_cost(cost) if isinstance(cost, (int, float)) and cost > 0 else None
+        summary = TurnSummary(
+            headline_parts(tlog, len(changed), sum(d[2] for d in diffs), sum(d[3] for d in diffs), elapsed, priced),
+            chips, role_colors(self.app),
+        )
+        log.mount(summary, after=after)
+        self._summaries.append(summary)
 
     async def _handle_tools_command(self) -> None:
         """Show the available tools and commands (opencode-style /tools | /help)."""

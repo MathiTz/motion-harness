@@ -5,9 +5,9 @@ This file tracks the evolution of Motion Harness. We follow Semantic Versioning 
 ## 🧪 Beta Releases (Pre-release)
 Current Phase: **Stability & Bug Squashing**
 
-### Unreleased: Cobalt theme and a calmer window
+### Unreleased: Cobalt theme, a calmer window, and a turn card
 
-First two steps of a UI redesign (design: one page per state, in the redesign canvas shared with the maintainer). Nothing here changes behaviour, keybindings or headless output.
+First three steps of a UI redesign (design: one page per state, in the redesign canvas shared with the maintainer). Nothing here changes behaviour, keybindings or headless output.
 
 - **Cobalt**, a new blue-ground theme and the new default for anyone who hasn't picked one. Each colour has one meaning: gold is you and Build mode (can change files), blue is the agent and Plan mode (read-only), cyan is reserved for learned things (memory, skills), orange only ever means "needs a look". A saved `default_theme` is respected, so existing choices don't change.
 - Contrast was checked, not assumed: Cobalt2's own line colour is 1.07:1 against its ground and would vanish in a terminal, and its blue is 3.6:1 as text, so Cobalt uses a lighter hairline and a text tint. Those numbers are pinned by tests.
@@ -16,7 +16,11 @@ First two steps of a UI redesign (design: one page per state, in the redesign ca
 - **Mode colours flipped**: Build is the primary colour and Plan the secondary (it was Build blue, Plan orange, which made Plan look like a warning). This applies to every theme.
 - Muted system text no longer has an extra `dim` on top of the muted colour, and the context panel is separated by a hairline instead of a blank gutter.
 - Themes gained `$blue-text` and `$error-text` variables (defaulting to their own secondary/error colours), through Textual's `Theme(variables=...)`.
-- Not in this step: the session rail, launchpad, turn card and guided dialogs from the design are separate steps.
+- **Turn card:** while a turn runs, a card lists finished operations (✓, ✗ if one failed) and what is running right now (●), instead of three dim lines. When the turn ends the process collapses to a line that says what was done ("read 3 files · edited cart.py · ran 1 command") rather than "4 steps"; it still expands on click.
+- **Done strip** under the answer: what changed ("✓ Done · 1 file changed (+3 −4) · 4.9s · $0.005", or "⚠ Done with 1 failed tool call") with View diff, Undo edit, Trace and Copy answer chips. Each chip prints the key or command that does the same thing. The chips act on "the last turn", so they are removed when the next turn starts: an old strip can never undo a newer turn's edits. One undo per strip.
+- A write refused in Plan mode used to leave no trace in the chat; it now shows up as "1 blocked" and is never counted as an edit.
+- Deliberate deviation from the design board: the board had "↑ focuses the actions", but ↑ already recalls prompt history in the composer, so the chips are clickable and teach the existing keys (`/diff`, `/undo`, F8, F9) instead.
+- Not in these steps: the session rail, launchpad and guided dialogs from the design are separate steps.
 
 ### v0.16.0-beta.0: headless subcommands — [#39](https://github.com/MathiTz/motion-harness/pull/39)
 

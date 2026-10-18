@@ -118,6 +118,7 @@ A high-performance terminal interface built with `Textual`, designed for daily-d
 
 **Workspace regions**:
 - **Conversation canvas** — markdown-first message cards with author/time headers and compact metadata; response code blocks carry theme-aware syntax highlighting.
+- **Turn card and Done strip** — while a turn runs, a card lists what the agent has done (✓) and what is running now (●). When it finishes, the process collapses to one line ("read 3 files · edited cart.py · ran 1 command", click to expand) and a strip under the answer says what changed ("✓ Done · 1 file changed (+3 −4) · 4.9s") with **View diff / Undo edit / Trace / Copy answer** chips; each chip shows the key or command that does the same thing. Chips act on the last turn, so they disappear when the next turn starts. A write refused in Plan mode is reported as "blocked", never as an edit.
 - **Right Context panel** — the rolling session context and most recent turns, so you always see what the model is grounded against (`Ctrl+B` to toggle).
 - **Composer** — a compact, opencode-style prompt: auto-growing (soft-wraps instead of scrolling), a thick left accent border colored by agent mode, prompt history (↑/↓), and an inline `agent · model · provider` meta row. Enter sends, Shift+Enter adds a newline.
 
