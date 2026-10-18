@@ -54,8 +54,6 @@ from textual.containers import Container, Horizontal, Vertical, VerticalScroll
 from textual.message import Message
 from textual.screen import Screen
 from textual.widgets import (
-    Footer,
-    Header,
     Input,
     Label,
     ListItem,
@@ -78,6 +76,7 @@ from core.skills import SkillLibrary, slugify
 from core.toolstate import ToolSession
 from core import auth
 from main import MotionAgent, REPO_DIR
+from ui.chrome import HintBar, StatusBar
 from ui.themes import ThemeRegistry
 
 WORKSPACE = os.getenv("MOTION_WORKSPACE", os.getcwd())
@@ -110,7 +109,7 @@ class AppState:
         self.config_manager: ConfigManager = ConfigManager()
         self.mcp_manager = self._build_mcp_manager()
         self.current_provider_id: str = ""
-        self.current_theme: str = "opencode"
+        self.current_theme: str = "cobalt"
         self.caveman_enabled: bool = True
         self.auto_synthesis_enabled: bool = False
         self.ui_mode: str = "conservative"
@@ -738,7 +737,6 @@ class SystemMessage(_FadeIn, Static):
     DEFAULT_CSS = """
     SystemMessage {
         color: $text-muted;
-        text-style: dim;
         padding: 0 2;
         margin: 0 0 0 0;
     }
@@ -1252,8 +1250,8 @@ class ContextPanel(Vertical):
         width: 38;
         min-width: 30;
         max-width: 44;
-        border-left: blank;
-        margin-left: 2;
+        border-left: solid $border;
+        margin-left: 1;
         padding: 1 1;
         background: $panel;
     }
@@ -2712,11 +2710,11 @@ class MainScreen(Screen):
         self.state = state
 
     def compose(self) -> ComposeResult:
-        yield Header(show_clock=True)
+        yield StatusBar(self.state, WORKSPACE, id="status_bar")
         with Horizontal(id="main_shell"):
             yield ChatPane(self.state)
             yield ContextPanel(self.state, id="context_panel")
-        yield Footer()
+        yield HintBar(id="hint_bar")
 
     def on_mount(self) -> None:
         if not self.state.show_activity_rail:
@@ -3207,6 +3205,7 @@ class ChatPane(Vertical):
     def _theme_code_style(theme_name: str) -> str:
         """Map a TUI theme to a Pygments code style for Rich Markdown."""
         mapping = {
+            "cobalt": "material",
             "opencode": "github-dark",
             "dracula": "dracula",
             "nord": "nord",
@@ -3237,9 +3236,11 @@ class ChatPane(Vertical):
     def _agent_color(self) -> str:
         """Return the agent-mode accent color as a CSS variable string.
 
-        opencode uses blue for the build agent and orange for the plan agent.
+        Build (can change files) is the primary colour - gold in Cobalt; Plan (read-only) is the
+        secondary colour - blue. Orange stays reserved for "needs a look" (warnings), which Plan
+        used to share. This flipped the opencode-style Build=blue / Plan=orange pairing.
         """
-        return "$secondary" if self.state.agent_mode == "build" else "$warning"
+        return "$primary" if self.state.agent_mode == "build" else "$secondary"
 
     def _refresh_meta(self) -> None:
         """Update the composer meta row: agent · model · provider.
@@ -3276,6 +3277,7 @@ class ChatPane(Vertical):
         composer.set_meta(meta_markup)
         # Tint the left border of the composer with the agent color.
         self._refresh_agent_color_accent()
+        self._refresh_chrome(status_bar=True)
         self._refresh_status()
 
     @staticmethod
@@ -3299,6 +3301,16 @@ class ChatPane(Vertical):
     def _fmt_tokens(n: int) -> str:
         return f"{n / 1000:.1f}k" if n >= 1000 else str(n)
 
+    def _refresh_chrome(self, status_bar: bool = False) -> None:
+        """Keep the window chrome in step: the hint bar follows idle/running (cheap, called on every
+        status tick); the top status bar is repainted only when asked, i.e. when the mode changed."""
+        try:
+            if status_bar:
+                self.screen.query_one(StatusBar).refresh_bar()
+            self.screen.query_one(HintBar).set_busy(bool(self.state.busy))
+        except Exception:
+            pass
+
     def _refresh_status(self) -> None:
         """Update the status row below the composer.
 
@@ -3306,6 +3318,7 @@ class ChatPane(Vertical):
         time-to-first-token, the latest command output line - so waiting on the
         model is never silent. Idle, it shows the last turn's timing and totals.
         """
+        self._refresh_chrome()
         try:
             status_text = self.query_one("#chat_status_text", Label)
             spinner = self.query_one("#chat_status_spinner", LoadingIndicator)
@@ -4759,20 +4772,6 @@ class MotionTUI(App):
 
     CSS = """
     Screen { background: $background; color: $foreground; }
-    Header {
-        background: $background;
-        border-bottom: blank;
-        color: $text-muted;
-        text-style: bold;
-        padding: 0 1;
-    }
-    Header.-header-tall { height: 3; }
-    Footer {
-        background: $background;
-        border-top: blank;
-        color: $text-muted;
-        padding: 0 1;
-    }
     """
 
     BINDINGS = [

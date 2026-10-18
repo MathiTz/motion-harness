@@ -114,20 +114,20 @@ When a complex task is solved, the harness doesn't just forget. It analyzes the 
 ### 🎨 Pro-Grade TUI
 A high-performance terminal interface built with `Textual`, designed for daily-driver clarity rather than an engineering dashboard.
 
-**Focused single-chat view (opencode-style)**: no top tab bar. The screen is a top bar, the conversation canvas, a compact bottom composer, and a right-hand **Context panel**. Skills, settings, and model switching are all reachable via the command palette.
+**Focused single-chat view (opencode-style)**: no top tab bar. The screen is a status bar (workspace, git branch, and the agent mode with what it allows), the conversation canvas, a compact composer, a right-hand **Context panel**, and a hint bar that lists only the keys that matter right now (idle vs. a turn running). Skills, settings, and model switching are all reachable via the command palette.
 
 **Workspace regions**:
 - **Conversation canvas** — markdown-first message cards with author/time headers and compact metadata; response code blocks carry theme-aware syntax highlighting.
 - **Right Context panel** — the rolling session context and most recent turns, so you always see what the model is grounded against (`Ctrl+B` to toggle).
 - **Composer** — a compact, opencode-style prompt: auto-growing (soft-wraps instead of scrolling), a thick left accent border colored by agent mode, prompt history (↑/↓), and an inline `agent · model · provider` meta row. Enter sends, Shift+Enter adds a newline.
 
-**Agent modes**: `build` (blue) has write access and creates/edits files; `plan` (orange, opencode-style) is read-only and produces a concrete written plan before you approve implementation. Toggle with `Tab` or via the command palette. Plan mode blocks `write_file`/`replace_in_file` with a soft guidance nudge so the model answers with a plan rather than asking you to repeat yourself.
+**Agent modes**: `build` (the theme's primary colour, gold in Cobalt) has write access and creates/edits files; `plan` (the secondary colour, blue in Cobalt) is read-only and produces a concrete written plan before you approve implementation. Toggle with `Tab` or via the command palette. Plan mode blocks `write_file`/`replace_in_file` with a soft guidance nudge so the model answers with a plan rather than asking you to repeat yourself.
 
 **Grounded responses**: on every turn the harness passes the prior conversation (user + assistant) as history and the rolling session context as a memory-recall query, so the model references what was actually said instead of hallucinating. Long sessions are capped at the most recent 8 turns to keep the latest user message prominent.
 
-**Theme token model**: semantic tokens (`$background`, `$surface`, `$panel`, `$border`, `$primary`, `$secondary`, `$accent`, `$text`, `$text-muted`, `$success`, `$warning`, `$error`) cascade through every widget via Textual's theme system.
+**Theme token model**: semantic tokens (`$background`, `$surface`, `$panel`, `$border`, `$primary`, `$secondary`, `$accent`, `$text`, `$text-muted`, `$success`, `$warning`, `$error`) cascade through every widget via Textual's theme system. Every theme also defines `$blue-text` and `$error-text` (readable tints for words in the secondary and error hues; they default to the theme's own secondary/error) through `Theme(variables=...)`.
 
-**10 Native Themes**: OpenCode (default), One Dark, Solarized Light, Nord, Dracula, Omni Dark, and the full [Catppuccin](https://catppuccin.com/) family (Mocha, Macchiato, Frappé, Latte) — press `Ctrl+T` to open the theme menu (arrow keys preview live, `Enter` confirms, `Esc` reverts). Your choice is saved to `config.yml` (`default_theme`) and restored on the next launch.
+**11 Native Themes**: **Cobalt** (default: a blue ground where gold means you/Build, blue means the agent/Plan, cyan means learned, and orange only ever means "needs a look"), OpenCode, One Dark, Solarized Light, Nord, Dracula, Omni Dark, and the full [Catppuccin](https://catppuccin.com/) family (Mocha, Macchiato, Frappé, Latte) — press `Ctrl+T` to open the theme menu (arrow keys preview live, `Enter` confirms, `Esc` reverts). Your choice is saved to `config.yml` (`default_theme`) and restored on the next launch, so anyone who already picked a theme keeps it; only an unset theme now starts as Cobalt.
 
 **Interaction trace panel** (`F8`): a right-hand panel that shows the live tool loop as human-readable sentences, e.g. "about to run read_file on `main.py`", "write_file finished on `README.md`", or "read_file failed on `missing.txt`: file does not exist". Trace events include the affected path where applicable, plus diagnostics such as `step_cap_hit` (the tool loop hit its safety cap) and `loop_warning` (the same tool+path/command repeated 3x in a row). Unexpected turn failures are also logged with a full traceback to `motion.log` for debugging.
 
@@ -240,7 +240,7 @@ Everything the harness writes into your project goes under one self-ignoring fol
 
 ### ⚠️ Known Limitations (v2 TUI)
 - Trace persistence is per-session (not yet written to disk).
-- Theme contrast validation is manual; the bundled themes are tuned for readability but very-low-contrast combinations are not auto-corrected.
+- Theme contrast validation is manual except for Cobalt, whose text and border contrast is pinned by tests (`tests/test_chrome.py`); the other bundled themes are tuned for readability but very-low-contrast combinations are not auto-corrected.
 - Clipboard copy falls back to inserting the response into the input box when the terminal lacks clipboard support.
 - Conversation history sent to the model is capped at the most recent 8 turns; older context is condensed by `/compact` (or automatically near the context window).
 - Attached PDFs/DOCX/XLSX are extracted to text (no native PDF modality yet); images are sent as real image parts to vision-capable models. See [Roadmap](docs/roadmap.md).
@@ -255,7 +255,7 @@ Everything the harness writes into your project goes under one self-ignoring fol
 flowchart LR
     subgraph P1[Phase 1 — Core Chat UX]
         direction TB
-        A[opencode-style prompt panel] --> B[Agent mode colors: build=blue, plan=orange]
+        A[opencode-style prompt panel] --> B[Agent mode colors: build=primary, plan=secondary]
         B --> C[Ctrl+K palette · Ctrl+O model]
         C --> D[Right-hand Context panel]
         D --> E[Drop top tabs]

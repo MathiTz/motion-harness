@@ -2,7 +2,7 @@
 
 # General Settings
 workspace_path: "/Users/user/Documents/projects/motion-harness"
-default_theme: "one_dark"
+default_theme: "cobalt"
 max_parallel_tasks: null  # Set to integer to override CPU-based auto-scaling
 
 # Provider Configuration
