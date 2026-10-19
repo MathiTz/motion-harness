@@ -45,6 +45,7 @@ from rich.console import Group
 from rich.markdown import Markdown as RichMarkdown
 from rich.syntax import Syntax
 from rich.style import Style
+from rich.table import Table
 from rich.text import Text
 
 from textual import events, work
@@ -77,9 +78,11 @@ from core.toolstate import ToolSession
 from core import auth
 from main import MotionAgent, REPO_DIR
 from ui.chrome import HintBar, StatusBar, role_colors
+from ui.commands import catalog
+from ui.explain import Explanation, explain_code, explain_command, explain_network
 from ui.launchpad import LaunchCard, Launchpad
 from ui.rail import RAIL_MIN_WIDTH, RailData, SessionRail
-from ui.turncard import EDIT_TOOLS, Chip, TurnLog, TurnSummary, headline_parts, render_card
+from ui.turncard import EDIT_TOOLS, Chip, TurnLog, TurnSummary, headline_parts, next_steps, render_card
 from ui.themes import ThemeRegistry
 
 WORKSPACE = os.getenv("MOTION_WORKSPACE", os.getcwd())
@@ -1402,6 +1405,8 @@ class CommandPalette(Screen):
         super().__init__(**kwargs)
         self._main = main_screen
         self._commands: list[tuple[str, str]] = []
+        self._entries: list = []
+        self._row_labels: list[Label] = []
         self._selection_index: Optional[int] = None
 
     def compose(self) -> ComposeResult:
@@ -1412,41 +1417,55 @@ class CommandPalette(Screen):
 
     def on_mount(self) -> None:
         self.query_one("#palette_box", VerticalScroll).border_title = " Commands "
-        self._commands = [
-            ("Switch model…", "model"),
-            ("Toggle agent (build/plan)", "agent"),
-            ("Theme menu", "theme"),
-            ("Show shortcuts", "shortcuts"),
-            ("Toggle trace panel", "trace"),
-            ("Toggle agent thinking", "thinking"),
-            ("Copy last response", "copy"),
-            ("Copy last code block", "copy_code"),
-            ("Copy trace log", "copy_trace"),
-            ("Show turn trajectory (/trajectory)", "trajectory"),
-            ("Copy turn trajectory", "copy_trajectory"),
-            ("Toggle interaction tracking", "tracking"),
-            ("Toggle context panel", "context"),
-            ("Manage API keys (/auth)", "auth"),
-            ("Close menu (Esc)", "close"),
-        ]
+        try:
+            waiting = len(SkillLibrary.for_workspace(WORKSPACE).pending())
+        except Exception:
+            waiting = 0
+        entries = catalog(waiting, bool(self._main.state.config_manager.get("track_interactions")))
+        self._entries = entries
+        self._commands = [(e.label, e.action) for e in entries]  # (label, action), as before
         lv = self.query_one("#palette_list", ListView)
-        for label, _ in self._commands:
-            lv.append(ListItem(Label(label)))
+        self._row_labels: list[Label] = []
+        for _ in entries:
+            row = Label("")
+            self._row_labels.append(row)
+            lv.append(ListItem(row))
+        self._render_rows(set(range(len(entries))))
         if lv.children:
             lv.index = 0
             self._selection_index = 0
         self.query_one("#palette_input", Input).focus()
 
+    def _render_rows(self, visible: set) -> None:
+        """Draw each row (label, live note, the key that does the same thing) and put a group
+        heading on the first visible row of each group, so a filter never leaves an orphan heading."""
+        seen: set = set()
+        for idx, entry in enumerate(self._entries):
+            row = Text()
+            if idx in visible and entry.group not in seen:
+                seen.add(entry.group)
+                row.append(entry.group + "\n", style="dim bold")
+            row.append(entry.label)
+            if entry.note:
+                row.append(f"  {entry.note}", style="dim italic")
+            if entry.hint:
+                row.append(f"   {entry.hint}", style="dim")
+            self._row_labels[idx].update(row)
+
     def on_input_changed(self, event: Input.Changed) -> None:
         query = event.value.strip().lower()
         lv = self.query_one("#palette_list", ListView)
         first_visible: Optional[int] = None
-        for idx, (label, _) in enumerate(self._commands):
-            visible = query in label.lower()
+        shown: set = set()
+        for idx, entry in enumerate(self._entries):
+            visible = query in entry.label.lower() or query in entry.hint.lower() or query in entry.group.lower()
             item = lv.children[idx]
             item.display = visible
+            if visible:
+                shown.add(idx)
             if visible and first_visible is None:
                 first_visible = idx
+        self._render_rows(shown)
         # Re-clamp the highlight: with display-toggling, Textual keeps the
         # stale index, so point it at the first *visible* row. If nothing
         # matches, clear the highlight so Enter has no target.
@@ -1529,7 +1548,12 @@ class CommandPalette(Screen):
         self.app.pop_screen()
         if action == "close":
             return
-        if action == "agent":
+        if action.startswith("slash:"):
+            try:
+                self._main.query_one(ChatPane)._run_session_cmd(action[len("slash:"):])
+            except Exception:
+                pass
+        elif action == "agent":
             try:
                 self._main.query_one(ChatPane)._toggle_agent_mode()
             except Exception:
@@ -2078,9 +2102,12 @@ class AddModelScreen(Screen):
 class PermissionOption(ListItem):
     """A choice row in the out-of-workspace permission prompt."""
 
-    def __init__(self, label: str, choice: str, **kwargs) -> None:
+    def __init__(self, label: str, choice: str, key: str = "", **kwargs) -> None:
         self.choice = choice
-        super().__init__(Label(label), **kwargs)
+        text = Text(label)  # a Text, not markup: "[y]" would be eaten as a style tag
+        if key:
+            text.append(f"   {key}", style="dim")
+        super().__init__(Label(text), **kwargs)
 
 
 class PermissionScreen(Screen):
@@ -2097,6 +2124,7 @@ class PermissionScreen(Screen):
     }
     #permission_box {
         width: 76;
+        height: auto;
         border: round $warning;
         background: $surface;
         padding: 1 2;
@@ -2115,6 +2143,11 @@ class PermissionScreen(Screen):
         border: blank;
         padding: 0 1;
     }
+    #permission_explain {
+        height: auto;
+        margin-bottom: 1;
+        padding: 0 1;
+    }
     #permission_hint {
         color: $text-muted;
         text-align: center;
@@ -2124,13 +2157,38 @@ class PermissionScreen(Screen):
 
     BINDINGS = [
         Binding("escape", "deny", "Deny", priority=True),
+        Binding("y", "choose('once')", "Allow once", show=False),
+        Binding("s", "choose('session')", "Allow for the session", show=False),
+        Binding("n", "choose('deny')", "Deny", show=False),
     ]
 
-    def __init__(self, path: str, title: str = "⚠ Out-of-workspace access requested", detail: str = "", **kwargs) -> None:
+    # Letter shortcuts are ignored for this long after the dialog appears. Without it, a prompt
+    # that pops up while you are typing a chat message ("yes please...") would be answered by the
+    # first letter you were already in the middle of typing.
+    LETTER_GRACE_S = 0.7
+
+    def __init__(self, path: str, title: str = "⚠ Out-of-workspace access requested", detail: str = "",
+                 explanation: Optional[Explanation] = None, **kwargs) -> None:
         super().__init__(**kwargs)
         self.path = path
         self.title_text = title
         self.detail = detail
+        self.explanation = explanation
+        self._armed_at = time.monotonic() + self.LETTER_GRACE_S
+
+    def action_choose(self, choice: str) -> None:
+        if time.monotonic() >= self._armed_at:
+            self.dismiss(choice)
+
+    def _explanation_text(self) -> Table:
+        colors = role_colors(self.app)
+        styles = {"plain": "", "ok": colors["ok"], "warn": colors["warn"], "fail": colors["fail"], "dim": "dim"}
+        grid = Table.grid(padding=(0, 1))
+        grid.add_column(width=12, style="dim")
+        grid.add_column(ratio=1)  # the body wraps inside its own column, under itself, not under the label
+        for label, body, role in self.explanation.rows:
+            grid.add_row(label, Text(body, style=styles.get(role, "")))
+        return grid
 
     def compose(self) -> ComposeResult:
         with Container(id="permission_box"):
@@ -2140,14 +2198,16 @@ class PermissionScreen(Screen):
             if self.detail:
                 body += f"\n[dim italic]{self.detail.replace('[', chr(92) + '[')}[/]"
             yield Static(body, id="permission_path")
+            if self.explanation is not None:
+                yield Static(self._explanation_text(), id="permission_explain")
             yield ListView(id="permission_list")
-            yield Label("Enter to choose · Esc to deny", id="permission_hint")
+            yield Label("y once · s session · n deny · Esc denies", id="permission_hint")
 
     def on_mount(self) -> None:
         lv = self.query_one("#permission_list", ListView)
-        lv.append(PermissionOption("Allow once", "once"))
-        lv.append(PermissionOption("Allow for this session", "session"))
-        lv.append(PermissionOption("Deny", "deny"))
+        lv.append(PermissionOption("Allow once", "once", "y"))
+        lv.append(PermissionOption("Allow for this session", "session", "s"))
+        lv.append(PermissionOption("Deny", "deny", "n"))
         lv.index = 0
         lv.focus()
 
@@ -2802,12 +2862,16 @@ class ChatPane(Vertical):
         if card.kind == "resume":
             self._run_session_cmd(f"/resume {card.session_id}")
             return
-        if card.mode and self.state.agent_mode != card.mode:
-            self.state.agent_mode = card.mode
+        self._seed_composer(card.prompt, card.mode)
+
+    def _seed_composer(self, prompt: str, mode: Optional[str] = None) -> None:
+        """Switch mode if asked and put `prompt` in the composer to edit. Never sends."""
+        if mode and self.state.agent_mode != mode:
+            self.state.agent_mode = mode
             self._refresh_meta()
         box = self.query_one("#chat_input", ChatComposer)
-        box.value = card.prompt
-        box.cursor_position = len(card.prompt)
+        box.value = prompt
+        box.cursor_position = len(prompt)
         box.refresh()
         box.focus()
 
@@ -3942,8 +4006,14 @@ class ChatPane(Vertical):
                 "network": "⚠ The agent wants to reach a private network address",
             }.get(kind, "⚠ Approval needed")
             st["phase"] = "waiting for you"
+            if kind == "network":
+                explanation = explain_network(subject, reason)
+            elif subject.startswith(("run_python:", "run_script:")):
+                explanation = explain_code(subject, reason)
+            else:
+                explanation = explain_command(subject, reason, WORKSPACE)
             try:
-                choice = await self.app.push_screen_wait(PermissionScreen(subject, title=title, detail=reason))
+                choice = await self.app.push_screen_wait(PermissionScreen(subject, title=title, explanation=explanation))
             except Exception:
                 choice = "deny"
             st["phase"] = "thinking"
@@ -4161,7 +4231,8 @@ class ChatPane(Vertical):
     def _run_session_cmd(self, cmd: str) -> None:
         """Run a slash command exactly as if it had been typed (a chip is a click on one)."""
         log = self.query_one("#chat_log", VerticalScroll)
-        self.run_worker(self._handle_session_command(cmd, log), exclusive=False)
+        handler = self._handle_skill_command if cmd.startswith("/skill") else self._handle_session_command
+        self.run_worker(handler(cmd, log), exclusive=False)
 
     def _mount_turn_summary(self, tlog: TurnLog, log: VerticalScroll, after: Any, elapsed: float, cost: Any) -> None:
         """The "Done" strip under the answer: what changed, and what you can do about it."""
@@ -4180,9 +4251,13 @@ class ChatPane(Vertical):
         chips.append(Chip("Trace", "F8", self.action_toggle_trace_panel))
         chips.append(Chip("Copy answer", "F9", self.action_copy_last_response))
         priced = format_cost(cost) if isinstance(cost, (int, float)) and cost > 0 else None
+        follow_ups = [
+            Chip(step.label, "", lambda step=step: self._seed_composer(step.prompt, step.mode))
+            for step in next_steps(bool(changed), tlog.failed(), self.state.agent_mode)
+        ]
         summary = TurnSummary(
             headline_parts(tlog, len(changed), sum(d[2] for d in diffs), sum(d[3] for d in diffs), elapsed, priced),
-            chips, role_colors(self.app),
+            chips, role_colors(self.app), follow_ups,
         )
         log.mount(summary, after=after)
         self._summaries.append(summary)

@@ -5,9 +5,9 @@ This file tracks the evolution of Motion Harness. We follow Semantic Versioning 
 ## 🧪 Beta Releases (Pre-release)
 Current Phase: **Stability & Bug Squashing**
 
-### Unreleased: Cobalt theme, a calmer window, a turn card, a session rail, and a launchpad
+### Unreleased: Cobalt theme, a calmer window, a turn card, a session rail, a launchpad, and guided dialogs
 
-First five steps of a UI redesign (design: one page per state, in the redesign canvas shared with the maintainer). Nothing here changes behaviour, keybindings or headless output.
+First six steps of a UI redesign (design: one page per state, in the redesign canvas shared with the maintainer). Nothing here changes behaviour, keybindings or headless output.
 
 - **Cobalt**, a new blue-ground theme and the new default for anyone who hasn't picked one. Each colour has one meaning: gold is you and Build mode (can change files), blue is the agent and Plan mode (read-only), cyan is reserved for learned things (memory, skills), orange only ever means "needs a look". A saved `default_theme` is respected, so existing choices don't change.
 - Contrast was checked, not assumed: Cobalt2's own line colour is 1.07:1 against its ground and would vanish in a terminal, and its blue is 3.6:1 as text, so Cobalt uses a lighter hairline and a text tint. Those numbers are pinned by tests.
@@ -26,7 +26,12 @@ First five steps of a UI redesign (design: one page per state, in the redesign c
 - Removed with the old panel: the "Recent turns" list and the "Current turn" checklist (the turn card now shows the latter in the chat).
 - **Launchpad:** an empty session opens on four starting moves (Explore this repo, Fix something, Review my changes, Pick up where I left off) and a row of live facts (memory notes in this project, skills awaiting review, history on/off, budget set or not), replacing the one-line tip. Each card says whether it is read-only or can edit files. A card sets the mode and fills the composer for you to edit; it never sends anything. Cards that can't work say why: "not a git repository", "No uncommitted changes to review", "No saved sessions yet", "History is off · /tracking on turns it on". Gone at the first message; back on `/new`.
 - Deliberate deviation from the design board: the board had "1–4 start", but digits are not shortcuts. A first message such as "3 tests are failing" must reach the model as typed (covered by a test), so cards are clicked.
-- Not in these steps: the guided dialogs (approval explainer, grouped palette, next-step chips) are a separate step.
+- **Approval dialog explains itself:** the command, what it does in plain words, where it acts (inside or outside the project), the rule that triggered it, and that `/undo` can't restore a command. Templates cover the risky patterns the policy already knows (`rm`, `git push/reset/clean/...`, `sudo`, pipe-to-shell, `chmod -R`, `kill`, `docker rm`, package publish, credentials, ...); anything else shows the policy's own reason instead of a guess. Paths are judged lexically (`~`, `$HOME`, `..` resolved without touching the disk), so a sibling like `/work/proj-other` is never mistaken for inside `/work/proj`.
+- **`y` / `s` / `n` answer the approval** (once / this session / deny), ignored for the first 0.7 s so a prompt that appears while you are typing a message can't be answered by your own keystroke. Enter and Esc behave as before. (Enter has no such grace period; see the PR notes.)
+- **Grouped command palette:** Work, Review, Memory and skills, Session, Setup, with live notes and the key or slash command each row stands for; it filters by those too. New rows for actions that were slash-only (`/new`, `/undo`, `/diff`, `/compact`, `/resume`, `/skill candidates`, `/budget`, ...) run exactly as if typed and don't touch the draft in the composer.
+- **Next-step chips** under the Done strip, keyed to what happened (after an edit: add a test, run the suite, review my changes; after a failure: diagnose it; after a Plan-mode answer: switch to Build and do it). Fixed templates, so no tokens and no invented work; each one only fills the message box.
+- Bug fixes found while building it: option labels like `[y]` were swallowed as Rich markup, and the approval box stretched to the full screen height.
+- Not changed: the "/" completion menu keeps its own list.
 
 ### v0.16.0-beta.0: headless subcommands — [#39](https://github.com/MathiTz/motion-harness/pull/39)
 

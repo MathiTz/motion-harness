@@ -26,7 +26,7 @@ EXPLORE_PROMPT = (
     "Explore this repo and summarize how it's organized: the main modules, the entry points, "
     "and how to run the tests."
 )
-REVIEW_PROMPT = "Review my uncommitted changes (git diff): flag bugs, risky edits and missing tests."
+from ui.turncard import REVIEW_PROMPT  # noqa: E402  (one wording for both "review my changes" entry points)
 
 
 @dataclass
