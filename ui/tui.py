@@ -77,7 +77,8 @@ from core.toolstate import ToolSession
 from core import auth
 from main import MotionAgent, REPO_DIR
 from ui.chrome import HintBar, StatusBar, role_colors
-from ui.turncard import Chip, TurnLog, TurnSummary, headline_parts, render_card
+from ui.rail import RAIL_MIN_WIDTH, RailData, SessionRail
+from ui.turncard import EDIT_TOOLS, Chip, TurnLog, TurnSummary, headline_parts, render_card
 from ui.themes import ThemeRegistry
 
 WORKSPACE = os.getenv("MOTION_WORKSPACE", os.getcwd())
@@ -161,6 +162,9 @@ class AppState:
         # Edits made during the most recent turn, for the /diff command, and
         # whether to show them inline as they happen (config: show_diffs).
         self.turn_diffs: list[tuple[str, str, int, int]] = []
+        # What the session rail shows that nothing else keeps (files touched, recall, sandbox, budget use).
+        self.rail = RailData()
+        self.rail_forced = False  # the user asked for the rail on a terminal too narrow to show it by default
         # One record per model step of every turn this session (see core/trajectory.py),
         # plus the last turn's full message transcript for `/trajectory save full`.
         self.trajectory: list[dict] = []
@@ -276,6 +280,7 @@ class AppState:
         self.session_context = ""
         self.attachments.clear()
         self.todos = []
+        self.rail.new_session()
         self.trajectory = []
         self.trajectory_turn = 0
         self.last_transcript = None
@@ -1238,147 +1243,8 @@ class ProviderSelectScreen(Screen):
 
 # ─── Global activity rail + main hub ─────────────────────────────────────────
 
-class ContextPanel(Vertical):
-    """Right-side context panel showing session context and recent turns.
+ContextPanel = SessionRail  # the old name, for callers and tests that still use it
 
-    Mirrors opencode's context/side panel: it reflects the rolling session
-    summary and the most recent user/assistant turns so the operator can see
-    what the model is working against.
-    """
-
-    DEFAULT_CSS = """
-    ContextPanel {
-        width: 38;
-        min-width: 30;
-        max-width: 44;
-        border-left: solid $border;
-        margin-left: 1;
-        padding: 1 1;
-        background: $panel;
-    }
-    #context_header {
-        color: $text-muted;
-        text-style: bold;
-        margin-bottom: 1;
-        padding: 0 1;
-        background: transparent;
-        border: blank;
-    }
-    #context_body {
-        height: 1fr;
-        scrollbar-size: 1 1;
-    }
-    .context_section {
-        color: $text-muted;
-        text-style: bold;
-        margin-top: 1;
-        margin-bottom: 0;
-        padding: 0 1;
-    }
-    .context_turn {
-        padding: 0 1;
-        margin: 0 0 1 0;
-        color: $text;
-        background: transparent;
-        border: blank;
-    }
-    .context_turn:first-child {
-        border-top: blank;
-    }
-    """
-
-    def __init__(self, state: AppState, **kwargs) -> None:
-        super().__init__(**kwargs)
-        self.state = state
-
-    def compose(self) -> ComposeResult:
-        yield Label("Context", id="context_header")
-        yield VerticalScroll(id="context_body")
-
-    def update_current_steps(self, lines: list[str]) -> None:
-        """Live-update a "Current turn" checklist fed by the same tool-op
-        lines shown inline in chat, so the user has an at-a-glance view of
-        what step the agent is on without needing to open the trace panel
-        (#9 in the issue report: no checklist to follow along with).
-        """
-        try:
-            container = self.query_one("#context_body", VerticalScroll)
-        except Exception:
-            return
-        try:
-            existing = self.query_one("#current_steps_block", Static)
-        except Exception:
-            existing = None
-        if not lines:
-            if existing is not None:
-                existing.remove()
-            return
-        from rich.markup import escape
-
-        text = "[bold]Current turn[/]\n" + "\n".join(f"• {escape(_one_line(s, 48))}" for s in lines[-6:])
-        if existing is not None:
-            existing.update(text)
-        else:
-            container.mount(Static(text, id="current_steps_block", classes="context_turn"), before=0)
-
-    def update_todos(self, todos: list) -> None:
-        """Show the model's todo_write checklist (kept at the top of the panel)."""
-        try:
-            container = self.query_one("#context_body", VerticalScroll)
-        except Exception:
-            return
-        try:
-            existing = self.query_one("#todos_block", Static)
-        except Exception:
-            existing = None
-        if not todos:
-            if existing is not None:
-                existing.remove()
-            return
-        marks = {"completed": "[green]✓[/]", "in_progress": "[yellow]▶[/]", "pending": "[dim]○[/]"}
-        lines = [
-            f"{marks.get(t.get('status'), '○')} {str(t.get('content', '')).replace('[', chr(92) + '[')[:60]}"
-            for t in todos[:12]
-        ]
-        text = "[bold]Todo[/]\n" + "\n".join(lines)
-        if existing is not None:
-            existing.update(text)
-        else:
-            container.mount(Static(text, id="todos_block", classes="context_turn"), before=0)
-
-    def refresh_context(self) -> None:
-        container = self.query_one("#context_body", VerticalScroll)
-        for child in list(container.children):
-            child.remove()
-        if getattr(self.state, "todos", None):
-            self.update_todos(self.state.todos)
-
-        if getattr(self.state, "_context_turns", None):
-            container.mount(Static(f"[dim]session · {self.state.context_summary()}[/]", classes="context_turn"))
-
-        # Resolve the theme primary to a hex for Rich markup.
-        try:
-            theme = self.app.get_theme(self.app.theme)
-            primary = theme.primary or "#fab283"
-        except Exception:
-            primary = "#fab283"
-
-        turns = getattr(self.state, "conversation_turns", None) or []
-        if turns:
-            container.mount(Label("Recent turns", classes="context_section"))
-            for prompt, response in turns[-6:]:
-                p = prompt.replace("[", "\\[").replace("]", "\\]")
-                p = p[:44] + "…" if len(p) > 44 else p
-                r = (response or "").replace("[", "\\[").replace("]", "\\]")
-                r = r[:44] + "…" if len(r) > 44 else r
-                container.mount(
-                    Static(f"[{primary} bold]Q[/] {p}\n[dim]A[/] {r or '…'}", classes="context_turn")
-                )
-        else:
-            container.mount(Static("[dim]No turns yet — start a conversation.[/]", classes="context_turn"))
-
-
-# ─── Shortcuts overlay ────────────────────────────────────────────────────────
 
 class ShortcutsOverlay(Screen):
     """Unified shortcuts help overlay generated from real bindings."""
@@ -2714,13 +2580,26 @@ class MainScreen(Screen):
         yield StatusBar(self.state, WORKSPACE, id="status_bar")
         with Horizontal(id="main_shell"):
             yield ChatPane(self.state)
-            yield ContextPanel(self.state, id="context_panel")
+            yield SessionRail(self.state, id="context_panel")
         yield HintBar(id="hint_bar")
 
     def on_mount(self) -> None:
-        if not self.state.show_activity_rail:
-            self.query_one("#context_panel", ContextPanel).styles.display = "none"
+        self._apply_rail_visibility()
         self.refresh_context_panel()
+
+    def on_resize(self, event: events.Resize) -> None:
+        self._apply_rail_visibility()
+
+    def _rail_shown(self) -> bool:
+        """The rail is on by default, but hides itself when the terminal is too narrow for it."""
+        wide = self.size.width >= RAIL_MIN_WIDTH
+        return self.state.show_activity_rail and (wide or self.state.rail_forced)
+
+    def _apply_rail_visibility(self) -> None:
+        try:
+            self.query_one("#context_panel", SessionRail).styles.display = "block" if self._rail_shown() else "none"
+        except Exception:
+            pass
 
     def refresh_context_panel(self) -> None:
         try:
@@ -2751,9 +2630,11 @@ class MainScreen(Screen):
             pass
 
     def action_toggle_context_panel(self) -> None:
-        panel = self.query_one("#context_panel", ContextPanel)
-        self.state.show_activity_rail = not self.state.show_activity_rail
-        panel.styles.display = "block" if self.state.show_activity_rail else "none"
+        if self._rail_shown():
+            self.state.show_activity_rail, self.state.rail_forced = False, False
+        else:  # asking for it on a narrow terminal is an explicit choice, so it overrides the auto-hide
+            self.state.show_activity_rail, self.state.rail_forced = True, True
+        self._apply_rail_visibility()
 
     def action_show_shortcuts(self) -> None:
         self.app.push_screen(ShortcutsOverlay(self))
@@ -3322,6 +3203,13 @@ class ChatPane(Vertical):
         model is never silent. Idle, it shows the last turn's timing and totals.
         """
         self._refresh_chrome()
+        if self.state.busy and self._turn:
+            t = self._turn
+            self.state.rail.use = {
+                "steps": t.get("step") or 0, "tokens": t.get("tokens") or 0, "cost": t.get("cost"),
+                "seconds": time.monotonic() - t.get("started", time.monotonic()),
+            }
+            self._refresh_rail(budget_only=True)
         try:
             status_text = self.query_one("#chat_status_text", Label)
             spinner = self.query_one("#chat_status_spinner", LoadingIndicator)
@@ -3706,6 +3594,8 @@ class ChatPane(Vertical):
         """Run a single agent turn. Returns True if it was cancelled."""
         header_ts = datetime.now().strftime("%H:%M:%S")
         self._retire_summaries()  # undo/diff/copy now mean this new turn, not the one above
+        self.state.rail.recalled, self.state.rail.use = None, {}  # recall and budget use belong to a turn
+        self._refresh_rail()
         tlog = TurnLog()
         st = self._turn = {
             "started": time.monotonic(), "phase": "thinking", "step": 0, "tool": "",
@@ -3879,12 +3769,6 @@ class ChatPane(Vertical):
                     step_lines.append(_one_line(tool_text))
                     tlog.add_line(_one_line(tool_text))
                     refresh_card()
-                    try:
-                        main_screen = self.screen
-                        if isinstance(main_screen, MainScreen):
-                            main_screen.query_one("#context_panel", ContextPanel).update_current_steps(step_lines)
-                    except Exception:
-                        pass
                 return
             committed.append(chunk)
             dirty = True
@@ -3913,6 +3797,12 @@ class ChatPane(Vertical):
             if event_type == "failover" and payload.get("provider"):
                 self.state.current_provider_id = str(payload["provider"])  # the status line follows the switch
                 self.notify(f"Switched to {payload['provider']} (the previous provider failed)", severity="warning", timeout=8)
+            if event_type == "memory_recall_done":
+                self.state.rail.recalled = list(payload.get("items") or [])
+                self._refresh_rail()
+            elif event_type == "sandbox":
+                self.state.rail.sandbox = {"active": bool(payload.get("active")), "detail": payload.get("message", "")}
+                self._refresh_rail()
             if event_type == "step_record":
                 record = dict(payload.get("record") or {})
                 if record:
@@ -3927,6 +3817,11 @@ class ChatPane(Vertical):
                 turn_usage["cached_tokens"] += int(payload.get("cached_tokens") or 0)
                 st["tokens"] = turn_usage["total_tokens"]
                 st["out_tokens"] = turn_usage["completion_tokens"]
+                agent_cfg = getattr(getattr(self.state.agent, "provider", None), "config", None)
+                st["cost"] = turn_cost(
+                    getattr(agent_cfg, "provider_type", ""), getattr(agent_cfg, "options", {}) or {},
+                    turn_usage["prompt_tokens"], turn_usage["completion_tokens"],
+                )
                 if "sub-agent" not in str(payload.get("message", "")):
                     st["ctx"] = int(payload.get("prompt_tokens") or 0)  # what the model sees right now
                 cached_note = f" ({payload['cached_tokens']} cached)" if payload.get("cached_tokens") else ""
@@ -3962,9 +3857,12 @@ class ChatPane(Vertical):
                 elif event_type == "tool_done":
                     st["phase"] = "thinking"
                     detail = _tool_detail("finished", tool, path)
-                    tlog.finish(tool, path, blocked="blocked" in str(payload.get("message", "")),
-                                created=bool(payload.get("created")))
+                    finished = tlog.finish(tool, path, blocked="blocked" in str(payload.get("message", "")),
+                                           created=bool(payload.get("created")))
                     refresh_card()
+                    if tool in EDIT_TOOLS and path and finished is not None and finished.ok:
+                        self.state.rail.note_edit(path, payload.get("added"), payload.get("removed"), payload.get("created"))
+                        self._refresh_rail()
                     diff = payload.get("diff") or ""
                     if diff and not payload.get("created"):
                         added, removed = int(payload.get("added") or 0), int(payload.get("removed") or 0)
@@ -4152,6 +4050,10 @@ class ChatPane(Vertical):
             self.state.conversation_turns.append((recorded, self.state.last_agent_response))
             self.state.update_session_context(recorded, self.state.last_agent_response)
             self.state.log_interaction(recorded, self.state.last_agent_response, turn_id)
+            self.state.rail.use = {  # the final numbers, so the rail's budget block reflects the whole turn
+                "steps": st.get("step") or 0, "tokens": turn_usage["total_tokens"] if has_real_usage else 0,
+                "cost": est_cost_usd if isinstance(est_cost_usd, (int, float)) else None, "seconds": elapsed,
+            }
             if tlog.calls:
                 self._mount_turn_summary(tlog, log, live_response, elapsed, est_cost_usd)
             if stick_final:
@@ -4207,6 +4109,15 @@ class ChatPane(Vertical):
                     steps_widget.remove()
                 except Exception:
                     pass
+
+    def _refresh_rail(self, budget_only: bool = False) -> None:
+        """Repaint the session rail (just the budget block on the live tick: it is the only part
+        that changes every few hundred milliseconds)."""
+        try:
+            rail = self.screen.query_one("#context_panel", SessionRail)
+        except Exception:
+            return
+        rail.refresh_budget() if budget_only else rail.refresh_all()
 
     def _retire_summaries(self) -> None:
         """Drop the action chips from earlier "Done" strips: undo, diff and copy act on the last

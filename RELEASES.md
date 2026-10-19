@@ -5,9 +5,9 @@ This file tracks the evolution of Motion Harness. We follow Semantic Versioning 
 ## 🧪 Beta Releases (Pre-release)
 Current Phase: **Stability & Bug Squashing**
 
-### Unreleased: Cobalt theme, a calmer window, and a turn card
+### Unreleased: Cobalt theme, a calmer window, a turn card, and a session rail
 
-First three steps of a UI redesign (design: one page per state, in the redesign canvas shared with the maintainer). Nothing here changes behaviour, keybindings or headless output.
+First four steps of a UI redesign (design: one page per state, in the redesign canvas shared with the maintainer). Nothing here changes behaviour, keybindings or headless output.
 
 - **Cobalt**, a new blue-ground theme and the new default for anyone who hasn't picked one. Each colour has one meaning: gold is you and Build mode (can change files), blue is the agent and Plan mode (read-only), cyan is reserved for learned things (memory, skills), orange only ever means "needs a look". A saved `default_theme` is respected, so existing choices don't change.
 - Contrast was checked, not assumed: Cobalt2's own line colour is 1.07:1 against its ground and would vanish in a terminal, and its blue is 3.6:1 as text, so Cobalt uses a lighter hairline and a text tint. Those numbers are pinned by tests.
@@ -20,7 +20,11 @@ First three steps of a UI redesign (design: one page per state, in the redesign 
 - **Done strip** under the answer: what changed ("✓ Done · 1 file changed (+3 −4) · 4.9s · $0.005", or "⚠ Done with 1 failed tool call") with View diff, Undo edit, Trace and Copy answer chips. Each chip prints the key or command that does the same thing. The chips act on "the last turn", so they are removed when the next turn starts: an old strip can never undo a newer turn's edits. One undo per strip.
 - A write refused in Plan mode used to leave no trace in the chat; it now shows up as "1 blocked" and is never counted as an edit.
 - Deliberate deviation from the design board: the board had "↑ focuses the actions", but ↑ already recalls prompt history in the composer, so the chips are clickable and teach the existing keys (`/diff`, `/undo`, F8, F9) instead.
-- Not in these steps: the session rail, launchpad and guided dialogs from the design are separate steps.
+- **Session rail** replaces the Context panel, which mostly repeated the chat. It shows what the chat doesn't: the **plan**, **files touched** this session (+/−, newest first), **recalled** memory for the current turn with its age and raw similarity (a weak match is flagged, so a 0.41 guess no longer looks like a 0.82 match), the per-turn **budget** as bars against each limit that is set (or "no limit set · /budget" when none is), and **safety**: whether the command sandbox is confining anything. Memory recall and the sandbox state reach the UI through two small additions to existing trace events (`items` on `memory_recall_done`, `active` on `sandbox`); nothing else about them changed.
+- The rail hides itself below 110 columns so it never squeezes the chat; `Ctrl+B` still shows it, and an explicit hide is not overridden when the terminal widens.
+- Recall and budget use belong to a turn, so they are cleared when the next turn starts rather than showing the previous turn's as the current one. `/new` clears files touched.
+- Removed with the old panel: the "Recent turns" list and the "Current turn" checklist (the turn card now shows the latter in the chat).
+- Not in these steps: the launchpad and guided dialogs from the design are separate steps.
 
 ### v0.16.0-beta.0: headless subcommands — [#39](https://github.com/MathiTz/motion-harness/pull/39)
 

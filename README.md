@@ -114,12 +114,12 @@ When a complex task is solved, the harness doesn't just forget. It analyzes the 
 ### 🎨 Pro-Grade TUI
 A high-performance terminal interface built with `Textual`, designed for daily-driver clarity rather than an engineering dashboard.
 
-**Focused single-chat view (opencode-style)**: no top tab bar. The screen is a status bar (workspace, git branch, and the agent mode with what it allows), the conversation canvas, a compact composer, a right-hand **Context panel**, and a hint bar that lists only the keys that matter right now (idle vs. a turn running). Skills, settings, and model switching are all reachable via the command palette.
+**Focused single-chat view (opencode-style)**: no top tab bar. The screen is a status bar (workspace, git branch, and the agent mode with what it allows), the conversation canvas, a compact composer, a right-hand **session rail**, and a hint bar that lists only the keys that matter right now (idle vs. a turn running). Skills, settings, and model switching are all reachable via the command palette.
 
 **Workspace regions**:
 - **Conversation canvas** — markdown-first message cards with author/time headers and compact metadata; response code blocks carry theme-aware syntax highlighting.
 - **Turn card and Done strip** — while a turn runs, a card lists what the agent has done (✓) and what is running now (●). When it finishes, the process collapses to one line ("read 3 files · edited cart.py · ran 1 command", click to expand) and a strip under the answer says what changed ("✓ Done · 1 file changed (+3 −4) · 4.9s") with **View diff / Undo edit / Trace / Copy answer** chips; each chip shows the key or command that does the same thing. Chips act on the last turn, so they disappear when the next turn starts. A write refused in Plan mode is reported as "blocked", never as an edit.
-- **Right Context panel** — the rolling session context and most recent turns, so you always see what the model is grounded against (`Ctrl+B` to toggle).
+- **Session rail** (right) — the harness's own state, not a copy of the chat: the **plan** (the agent's todo list), **files touched** this session with +/−, **recalled** memory for the current turn (with age and raw similarity, a weak match flagged in orange), the per-turn **budget** against its limits (or how to set one), and whether the command **sandbox** is confining anything. It hides itself below 110 columns; `Ctrl+B` shows or hides it.
 - **Composer** — a compact, opencode-style prompt: auto-growing (soft-wraps instead of scrolling), a thick left accent border colored by agent mode, prompt history (↑/↓), and an inline `agent · model · provider` meta row. Enter sends, Shift+Enter adds a newline.
 
 **Agent modes**: `build` (the theme's primary colour, gold in Cobalt) has write access and creates/edits files; `plan` (the secondary colour, blue in Cobalt) is read-only and produces a concrete written plan before you approve implementation. Toggle with `Tab` or via the command palette. Plan mode blocks `write_file`/`replace_in_file` with a soft guidance nudge so the model answers with a plan rather than asking you to repeat yourself.
@@ -191,7 +191,7 @@ Everything the harness writes into your project goes under one self-ignoring fol
 | :-- | :-- |
 | `Ctrl+T` | Open theme menu |
 | `Ctrl+A` | Open auth management |
-| `Ctrl+B` | Toggle context panel |
+| `Ctrl+B` | Toggle the session rail |
 | `Ctrl+O` | Switch model (browse/search all models) |
 | `Ctrl+R` (in model dialog) | Refresh the model list (scrapes latest Ollama Cloud models) |
 | `Ctrl+N` (in model dialog) | Add a custom model |
@@ -258,7 +258,7 @@ flowchart LR
         direction TB
         A[opencode-style prompt panel] --> B[Agent mode colors: build=primary, plan=secondary]
         B --> C[Ctrl+K palette · Ctrl+O model]
-        C --> D[Right-hand Context panel]
+        C --> D[Right-hand session rail]
         D --> E[Drop top tabs]
         E --> F[Grounded responses via history + context_query]
     end
