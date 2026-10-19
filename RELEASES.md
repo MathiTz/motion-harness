@@ -5,9 +5,9 @@ This file tracks the evolution of Motion Harness. We follow Semantic Versioning 
 ## 🧪 Beta Releases (Pre-release)
 Current Phase: **Stability & Bug Squashing**
 
-### Unreleased: Cobalt theme, a calmer window, a turn card, and a session rail
+### Unreleased: Cobalt theme, a calmer window, a turn card, a session rail, and a launchpad
 
-First four steps of a UI redesign (design: one page per state, in the redesign canvas shared with the maintainer). Nothing here changes behaviour, keybindings or headless output.
+First five steps of a UI redesign (design: one page per state, in the redesign canvas shared with the maintainer). Nothing here changes behaviour, keybindings or headless output.
 
 - **Cobalt**, a new blue-ground theme and the new default for anyone who hasn't picked one. Each colour has one meaning: gold is you and Build mode (can change files), blue is the agent and Plan mode (read-only), cyan is reserved for learned things (memory, skills), orange only ever means "needs a look". A saved `default_theme` is respected, so existing choices don't change.
 - Contrast was checked, not assumed: Cobalt2's own line colour is 1.07:1 against its ground and would vanish in a terminal, and its blue is 3.6:1 as text, so Cobalt uses a lighter hairline and a text tint. Those numbers are pinned by tests.
@@ -24,7 +24,9 @@ First four steps of a UI redesign (design: one page per state, in the redesign c
 - The rail hides itself below 110 columns so it never squeezes the chat; `Ctrl+B` still shows it, and an explicit hide is not overridden when the terminal widens.
 - Recall and budget use belong to a turn, so they are cleared when the next turn starts rather than showing the previous turn's as the current one. `/new` clears files touched.
 - Removed with the old panel: the "Recent turns" list and the "Current turn" checklist (the turn card now shows the latter in the chat).
-- Not in these steps: the launchpad and guided dialogs from the design are separate steps.
+- **Launchpad:** an empty session opens on four starting moves (Explore this repo, Fix something, Review my changes, Pick up where I left off) and a row of live facts (memory notes in this project, skills awaiting review, history on/off, budget set or not), replacing the one-line tip. Each card says whether it is read-only or can edit files. A card sets the mode and fills the composer for you to edit; it never sends anything. Cards that can't work say why: "not a git repository", "No uncommitted changes to review", "No saved sessions yet", "History is off · /tracking on turns it on". Gone at the first message; back on `/new`.
+- Deliberate deviation from the design board: the board had "1–4 start", but digits are not shortcuts. A first message such as "3 tests are failing" must reach the model as typed (covered by a test), so cards are clicked.
+- Not in these steps: the guided dialogs (approval explainer, grouped palette, next-step chips) are a separate step.
 
 ### v0.16.0-beta.0: headless subcommands — [#39](https://github.com/MathiTz/motion-harness/pull/39)
 
