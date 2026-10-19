@@ -194,11 +194,13 @@ class Launchpad(Vertical):
     DEFAULT_CSS = """
     Launchpad {
         height: auto;
-        max-width: 100;
-        margin: 1 2 0 2;
+        width: 100%;
+        margin: 2 0 0 0;
+        align-horizontal: center;
     }
-    Launchpad #lp_title { text-style: bold; margin-bottom: 0; }
-    Launchpad #lp_sub { color: $text-muted; margin-bottom: 1; }
+    Launchpad > * { width: 96; max-width: 100%; }
+    Launchpad #lp_title { text-style: bold; text-align: center; margin-bottom: 0; }
+    Launchpad #lp_sub { color: $text-muted; text-align: center; margin-bottom: 1; }
     Launchpad #lp_cards { layout: grid; grid-size: 2; grid-gutter: 0 1; height: auto; }
     Launchpad #lp_chips { color: $text-muted; margin-top: 1; height: auto; }
     """

@@ -2646,6 +2646,7 @@ class MainScreen(Screen):
 
     def on_mount(self) -> None:
         self._apply_rail_visibility()
+        self.call_after_refresh(self._apply_rail_visibility)  # again once the real terminal size is known
         self.refresh_context_panel()
 
     def on_resize(self, event: events.Resize) -> None:
@@ -2653,7 +2654,7 @@ class MainScreen(Screen):
 
     def _rail_shown(self) -> bool:
         """The rail is on by default, but hides itself when the terminal is too narrow for it."""
-        wide = self.size.width >= RAIL_MIN_WIDTH
+        wide = max(self.size.width, self.app.size.width) >= RAIL_MIN_WIDTH
         return self.state.show_activity_rail and (wide or self.state.rail_forced)
 
     def _apply_rail_visibility(self) -> None:
@@ -4876,10 +4877,15 @@ class MotionTUI(App):
         # Restore the last-saved theme (config.yml's default_theme), falling
         # back to AppState's built-in default when unset/unknown.
         saved_theme = self.state.config_manager.get("default_theme")
+        theme_notice = self._migrate_theme(saved_theme)
+        if theme_notice is not None:
+            saved_theme = "cobalt"
         if saved_theme and saved_theme in ThemeRegistry.theme_ids():
             self.state.current_theme = saved_theme
         self.theme = self.state.current_theme
         self.set_class(self.state.ui_mode == "experimental", "experimental-ui")
+        if theme_notice:
+            self.call_after_refresh(lambda: self.notify(theme_notice, timeout=12))
 
         if self._model_config:
             self.state.agent = self.state.make_agent(self._model_config)
@@ -4900,6 +4906,32 @@ class MotionTUI(App):
         # the user gets a clear choice, but never nag again afterwards.
         if self.state.config_manager.get("track_interactions") is None:
             self.call_after_refresh(self._ask_tracking_consent)
+
+    def _migrate_theme(self, saved: Optional[str]) -> Optional[str]:
+        """Switch to Cobalt exactly once, then never again.
+
+        The redesign is Cobalt's colours and layout together. A theme saved in config.yml is
+        normally respected, but here it meant that anyone who had ever opened the theme menu (or
+        copied config.example.yml, which used to say one_dark) got the new layout in their old
+        colours and could not see the redesign at all. So the first launch after the redesign moves
+        everyone to Cobalt once, says so, and records `ui_theme_migrated`; Ctrl+T picks any theme
+        and that choice is respected from then on.
+
+        Returns None when nothing was migrated, else the message to show ("" for a silent
+        migration of an unset theme)."""
+        cm = self.state.config_manager
+        if cm.get("ui_theme_migrated"):
+            return None
+        try:
+            cm.set("ui_theme_migrated", True)
+            if saved and saved != "cobalt":
+                cm.set("default_theme", "cobalt")
+        except Exception:
+            return None  # a read-only config: leave their theme alone rather than fail to start
+        if saved and saved != "cobalt":
+            name = ThemeRegistry.get_theme(saved).name if saved in ThemeRegistry.theme_ids() else saved
+            return f"New default theme: Cobalt (you had {name}). Ctrl+T switches back; your choice is kept."
+        return ""
 
     async def _init_mcp(self) -> None:
         """Connect MCP servers in the background so startup isn't delayed."""

@@ -9,7 +9,7 @@ Current Phase: **Stability & Bug Squashing**
 
 First six steps of a UI redesign (design: one page per state, in the redesign canvas shared with the maintainer). Nothing here changes behaviour, keybindings or headless output.
 
-- **Cobalt**, a new blue-ground theme and the new default for anyone who hasn't picked one. Each colour has one meaning: gold is you and Build mode (can change files), blue is the agent and Plan mode (read-only), cyan is reserved for learned things (memory, skills), orange only ever means "needs a look". A saved `default_theme` is respected, so existing choices don't change.
+- **Cobalt**, a new blue-ground theme and the new default. The first launch after the redesign moves everyone to it **once** (with a notice, recorded as `ui_theme_migrated` in `config.yml`): a saved theme used to win, which left anyone who had ever opened the theme menu with the new layout in their old colours and the redesign invisible. After that your `Ctrl+T` choice is respected. Each colour has one meaning: gold is you and Build mode (can change files), blue is the agent and Plan mode (read-only), cyan is reserved for learned things (memory, skills), orange only ever means "needs a look".
 - Contrast was checked, not assumed: Cobalt2's own line colour is 1.07:1 against its ground and would vanish in a terminal, and its blue is 3.6:1 as text, so Cobalt uses a lighter hairline and a text tint. Those numbers are pinned by tests.
 - **Status bar** instead of a clock: workspace, git branch, and the current mode with what it allows ("Build · can edit files" / "Plan · read-only").
 - **Hint bar** instead of the stock footer: only the keys that matter now (idle vs. a turn running).
