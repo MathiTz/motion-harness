@@ -18,6 +18,39 @@ from textual.theme import Theme as TextualTheme
 #   2. A lightweight dataclass-style Theme (backward compat for ThemeRegistry)
 
 _RAW_THEMES: List[dict] = [
+    # Cobalt (the default): a blue-ground theme in the spirit of the VS Code "Cobalt2" palette, with
+    # one meaning per colour - primary gold = you / Build mode (can change files), secondary blue =
+    # the agent / Plan mode (read-only), accent cyan = learned (memory, skills), then the usual
+    # success / warning / error. Hex values were adjusted for terminal contrast, not copied:
+    #   - Cobalt2's own line colour (#0D3A58) is 1.07:1 against its ground and vanishes in a
+    #     terminal, so `border` is the lighter #2A5A7A (1.7:1).
+    #   - #0088FF as *text* is 3.6:1 (below 4.5), so it stays for bars and icons and words use the
+    #     tint `blue-text`; likewise `error-text` for pink words.
+    #   - `text-muted` is set explicitly so muted text keeps >= 4.8:1 on both background and surface.
+    # `variables` become CSS variables ($blue-text, ...) next to Textual's generated ones.
+    dict(
+        id="cobalt",
+        name="Cobalt",
+        background="#193549",
+        surface="#1F4662",
+        panel="#15232D",
+        foreground="#E8F0F6",
+        primary="#FFC600",
+        secondary="#0088FF",
+        accent="#9EFFFF",
+        border="#2A5A7A",
+        highlight="#0D3A58",
+        error="#FF628C",
+        success="#3AD900",
+        warning="#FF9D00",
+        dark=True,
+        variables={
+            "text-muted": "#9FB8C9",
+            "border": "#2A5A7A",
+            "blue-text": "#5CB8FF",
+            "error-text": "#FF8AA8",
+        },
+    ),
     dict(
         id="omni_dark",
         name="Omni Dark",
@@ -227,6 +260,9 @@ for d in _RAW_THEMES:
         dark=d["dark"],
         panel=d.get("panel", d["border"]),
         boost=d["highlight"],
+        # Every theme defines the custom variables our CSS may use (an undefined $variable is a CSS
+        # error), defaulting them to the theme's own secondary/error so other themes look as before.
+        variables={"blue-text": d["secondary"], "error-text": d["error"], **d.get("variables", {})},
     )
 
     # Lightweight theme

@@ -5,9 +5,22 @@ This file tracks the evolution of Motion Harness. We follow Semantic Versioning 
 ## 🧪 Beta Releases (Pre-release)
 Current Phase: **Stability & Bug Squashing**
 
-### Unreleased: headless subcommands — [#39](https://github.com/MathiTz/motion-harness/pull/39)
+### Unreleased: Cobalt theme and a calmer window
 
-The features added over the last cycle were reachable only from the TUI (`/skill`, `/resume`, `/tracking`, `/trajectory`) or as loose scripts under `scripts/`, which made them unusable from CI or another program. They are now `motion` subcommands with machine-readable output; the version number is assigned by the release action when this merges.
+First two steps of a UI redesign (design: one page per state, in the redesign canvas shared with the maintainer). Nothing here changes behaviour, keybindings or headless output.
+
+- **Cobalt**, a new blue-ground theme and the new default for anyone who hasn't picked one. Each colour has one meaning: gold is you and Build mode (can change files), blue is the agent and Plan mode (read-only), cyan is reserved for learned things (memory, skills), orange only ever means "needs a look". A saved `default_theme` is respected, so existing choices don't change.
+- Contrast was checked, not assumed: Cobalt2's own line colour is 1.07:1 against its ground and would vanish in a terminal, and its blue is 3.6:1 as text, so Cobalt uses a lighter hairline and a text tint. Those numbers are pinned by tests.
+- **Status bar** instead of a clock: workspace, git branch, and the current mode with what it allows ("Build · can edit files" / "Plan · read-only").
+- **Hint bar** instead of the stock footer: only the keys that matter now (idle vs. a turn running).
+- **Mode colours flipped**: Build is the primary colour and Plan the secondary (it was Build blue, Plan orange, which made Plan look like a warning). This applies to every theme.
+- Muted system text no longer has an extra `dim` on top of the muted colour, and the context panel is separated by a hairline instead of a blank gutter.
+- Themes gained `$blue-text` and `$error-text` variables (defaulting to their own secondary/error colours), through Textual's `Theme(variables=...)`.
+- Not in this step: the session rail, launchpad, turn card and guided dialogs from the design are separate steps.
+
+### v0.16.0-beta.0: headless subcommands — [#39](https://github.com/MathiTz/motion-harness/pull/39)
+
+The features added over the last cycle were reachable only from the TUI (`/skill`, `/resume`, `/tracking`, `/trajectory`) or as loose scripts under `scripts/`, which made them unusable from CI or another program. They are now `motion` subcommands with machine-readable output; released as v0.16.0-beta.0.
 
 - `motion skill list|show|candidates|promote|reject|rollback|ab-test` — the full candidate → active review loop from a shell. `ab-test` returns a verdict and never promotes; promotion stays a separate, explicit call.
 - `motion eval list|run|memory` — the task baseline and memory-quality scenarios, with the report on stdout under `--json`.
