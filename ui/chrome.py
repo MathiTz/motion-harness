@@ -69,10 +69,12 @@ def _hex(app: Any, which: str, fallback: str) -> str:
 
 def role_colors(app: Any) -> dict:
     """Theme colours by meaning, as hex strings for Rich: ok (success), fail (readable error tint),
-    warn, run (what is happening now: the primary colour)."""
+    warn, run (what is happening now: the primary colour), learned (accent: memory, skills) and info
+    (the readable blue tint)."""
     return {
         "ok": _hex(app, "success", "#7fd88f"), "fail": _hex(app, "error-text", "#e06c75"),
         "warn": _hex(app, "warning", "#f5a742"), "run": _hex(app, "primary", "#fab283"), "plain": "",
+        "learned": _hex(app, "accent", "#9d7cd8"), "info": _hex(app, "blue-text", "#5c9cf5"),
     }
 
 

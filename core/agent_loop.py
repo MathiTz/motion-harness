@@ -358,7 +358,13 @@ class TurnRunner:
                 seen.add(c["content"])
                 deduped.append(c)
         deduped = deduped[:5]
-        await self.trace("memory_recall_done", "Memory recall complete", chunks=len(deduped))
+        # `items` lets a UI show what was recalled with its age and confidence (kept short: it is
+        # only ever displayed, and the full text is already in the prompt).
+        items = [
+            {"content": str(c["content"])[:160], "raw_score": c.get("raw_score"), "age": c.get("age"), "type": c.get("type")}
+            for c in deduped
+        ]
+        await self.trace("memory_recall_done", "Memory recall complete", chunks=len(deduped), items=items)
         return "\n".join(_format_recalled_chunk(c) for c in deduped)
 
     def _build_tools(self) -> WorkspaceTools:
@@ -980,7 +986,10 @@ class TurnRunner:
 
         self.tools = self._build_tools()
         if self.tools.sandbox is not None and not self.tools.read_only:
-            await self.trace("sandbox", f"Command sandbox: {self.tools.sandbox.describe()}")
+            await self.trace(
+                "sandbox", f"Command sandbox: {self.tools.sandbox.describe()}",
+                active=bool(self.tools.sandbox.active),
+            )
         self.mode = self._pick_mode()
         self.system_prompt = self._compose_system_prompt(memory_text, context_blocks)
         self.messages = self.history + [self._user_message()]
