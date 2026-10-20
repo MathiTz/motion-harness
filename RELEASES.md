@@ -5,7 +5,7 @@ This file tracks the evolution of Motion Harness. We follow Semantic Versioning 
 ## 🧪 Beta Releases (Pre-release)
 Current Phase: **Stability & Bug Squashing**
 
-### Unreleased: Cobalt theme, a calmer window, a turn card, a session rail, a launchpad, and guided dialogs
+### v0.17.0-beta.0: Cobalt theme, a calmer window, a turn card, a session rail, a launchpad, and guided dialogs — PRs [#40](https://github.com/MathiTz/motion-harness/pull/40)–[#44](https://github.com/MathiTz/motion-harness/pull/44)
 
 First six steps of a UI redesign (design: one page per state, in the redesign canvas shared with the maintainer). Nothing here changes behaviour, keybindings or headless output.
 
