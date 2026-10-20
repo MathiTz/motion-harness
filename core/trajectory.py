@@ -81,6 +81,7 @@ def totals(recs: List[Dict[str, Any]]) -> Dict[str, Any]:
         "model_seconds": round(model_s, 2),
         "tool_seconds": round(tool_s, 2),
         "prompt_tokens": sum(prompts),
+        "cached_tokens": sum(r.get("cached_tokens") or 0 for r in recs),
         "completion_tokens": sum(r.get("completion_tokens") or 0 for r in recs),
         "usage_reported": bool(prompts),
         "result_chars": sum(t.get("result_chars", 0) for t in calls),
@@ -115,6 +116,19 @@ def insights(recs: List[Dict[str, Any]]) -> List[str]:
         reasoning = sum(r.get("reasoning_chars", 0) for r in recs)
         hint = " Reasoning models spend most of each step thinking; `/effort low` shortens that." if reasoning else ""
         out.append(f"{t['model_seconds'] / wall:.0%} of the time was the model generating, only {t['tool_seconds']:.1f}s was tools.{hint}")
+    if t["usage_reported"] and t["prompt_tokens"] and t["steps"] >= 3:
+        cached, total = t["cached_tokens"], t["prompt_tokens"]
+        if cached:
+            out.append(
+                f"{cached / total:.0%} of the {fmt_tok(total)} prompt tokens were served from the provider's cache "
+                f"(billed at a discount); {fmt_tok(total - cached)} were fresh. The total counts every request's "
+                "whole context, so it is much larger than what a single request holds."
+            )
+        elif t["steps"] >= 6:
+            out.append(
+                "no cached prompt tokens were reported: either this provider does not cache the prompt prefix or "
+                "does not report it, so every step is billed for its whole context"
+            )
     if t["steps"] >= 8:
         base = min((p for _, p in prompts), default=0)
         out.append(

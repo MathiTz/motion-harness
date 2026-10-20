@@ -3934,7 +3934,7 @@ class ChatPane(Vertical):
                 agent_cfg = getattr(getattr(self.state.agent, "provider", None), "config", None)
                 st["cost"] = turn_cost(
                     getattr(agent_cfg, "provider_type", ""), getattr(agent_cfg, "options", {}) or {},
-                    turn_usage["prompt_tokens"], turn_usage["completion_tokens"],
+                    turn_usage["prompt_tokens"], turn_usage["completion_tokens"], turn_usage["cached_tokens"],
                 )
                 if "sub-agent" not in str(payload.get("message", "")):
                     st["ctx"] = int(payload.get("prompt_tokens") or 0)  # what the model sees right now
@@ -4139,6 +4139,7 @@ class ChatPane(Vertical):
                 getattr(self.state.agent.provider.config, "options", {}) or {},
                 est_prompt_tokens,
                 est_output_tokens,
+                turn_usage["cached_tokens"] if has_real_usage else 0,
             )
             self.state.last_turn_metrics = {
                 "prompt_tokens_est": est_prompt_tokens,
