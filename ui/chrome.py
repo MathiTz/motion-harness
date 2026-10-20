@@ -60,11 +60,20 @@ def git_branch(workspace: str, timeout: float = 1.0) -> str:
 def _hex(app: Any, which: str, fallback: str) -> str:
     """A theme colour as a hex string Rich can use (`primary`, `secondary`, `blue-text`, ...)."""
     try:
-        if which == "blue-text":
-            return app.get_css_variables().get("blue-text") or fallback
+        if which in ("blue-text", "error-text"):
+            return app.get_css_variables().get(which) or fallback
         return getattr(app.get_theme(app.theme), which, None) or fallback
     except Exception:
         return fallback
+
+
+def role_colors(app: Any) -> dict:
+    """Theme colours by meaning, as hex strings for Rich: ok (success), fail (readable error tint),
+    warn, run (what is happening now: the primary colour)."""
+    return {
+        "ok": _hex(app, "success", "#7fd88f"), "fail": _hex(app, "error-text", "#e06c75"),
+        "warn": _hex(app, "warning", "#f5a742"), "run": _hex(app, "primary", "#fab283"), "plain": "",
+    }
 
 
 class StatusBar(Static):

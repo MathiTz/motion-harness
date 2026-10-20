@@ -754,7 +754,7 @@ async def test_the_steps_of_a_turn_can_be_reopened_after_they_disappear(tmp_path
         await wait_idle(app, pilot)
         assert not list(app.screen.query(tui.StepsMessage))  # the live steps line is gone...
         widget = app.screen.query_one(tui.ReasoningMessage)  # ...but the process is one click away
-        assert "2 steps" in _text_of(widget)
+        assert "ran 2 commands" in _text_of(widget)  # says what was done, not just "2 steps"
         await pilot.click(tui.ReasoningMessage)
         await pilot.pause(0.1)
         expanded = _text_of(widget)
