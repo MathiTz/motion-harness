@@ -26,7 +26,7 @@ EXPLORE_PROMPT = (
     "Explore this repo and summarize how it's organized: the main modules, the entry points, "
     "and how to run the tests."
 )
-REVIEW_PROMPT = "Review my uncommitted changes (git diff): flag bugs, risky edits and missing tests."
+from ui.turncard import REVIEW_PROMPT  # noqa: E402  (one wording for both "review my changes" entry points)
 
 
 @dataclass
@@ -93,7 +93,8 @@ def build_cards(changes: Optional[int], sessions: List[Dict[str, Any]], tracking
         cards.append(Card(3, "Review my changes", f"Check your {changes} changed file{'s' if changes != 1 else ''} for problems.", "Plan · read-only", "info", prompt=REVIEW_PROMPT, mode="plan"))
     if sessions:
         last = sessions[0]
-        what = " ".join(str(last.get("first_prompt", "")).split())[:24] or "(no prompt)"
+        prompt = " ".join(str(last.get("first_prompt", "")).split()) or "(no prompt)"
+        what = prompt if len(prompt) <= 18 else prompt[:17] + "…"  # short enough that the card stays 3 lines
         turns = int(last.get("turns", 0))
         cards.append(Card(4, "Pick up where I left off",
                           f"“{what}” · {turns} turn{'s' if turns != 1 else ''} · {ago(last.get('modified', ''), now)}",
@@ -111,14 +112,16 @@ def state_chips(memory_count: Optional[int], pending_skills: int, budget_active:
                 tracking_on: bool) -> List[Tuple[str, str]]:
     """Live facts as (text, role). Skills are listed only when something waits for review."""
     chips: List[Tuple[str, str]] = []
+    # Short on purpose: the row must fit on one line at the Launchpad's width, because a chip that
+    # wraps mid-phrase reads as two facts.
     if memory_count:
-        chips.append((f"◆ memory · {memory_count} note{'s' if memory_count != 1 else ''} in this project", "learned"))
+        chips.append((f"◆ memory · {memory_count} note{'s' if memory_count != 1 else ''}", "learned"))
     else:
-        chips.append(("◆ memory · nothing saved in this project yet", "dim"))
+        chips.append(("◆ memory · empty", "dim"))
     if pending_skills:
-        chips.append((f"◆ skills · {pending_skills} awaiting your review", "learned"))
-    chips.append(("● history on · sessions are saved", "ok") if tracking_on else ("○ history off · /tracking on", "dim"))
-    chips.append(("● per-turn budget set", "ok") if budget_active else ("○ budget · no limit set · /budget", "dim"))
+        chips.append((f"◆ {pending_skills} skill{'s' if pending_skills != 1 else ''} to review", "learned"))
+    chips.append(("● history on", "ok") if tracking_on else ("○ history off · /tracking on", "dim"))
+    chips.append(("● budget set", "ok") if budget_active else ("○ no budget · /budget", "dim"))
     return chips
 
 
@@ -194,11 +197,13 @@ class Launchpad(Vertical):
     DEFAULT_CSS = """
     Launchpad {
         height: auto;
-        max-width: 100;
-        margin: 1 2 0 2;
+        width: 100%;
+        margin: 2 0 0 0;
+        align-horizontal: center;
     }
-    Launchpad #lp_title { text-style: bold; margin-bottom: 0; }
-    Launchpad #lp_sub { color: $text-muted; margin-bottom: 1; }
+    Launchpad #lp_title, Launchpad #lp_sub, Launchpad #lp_cards, Launchpad #lp_chips { width: 96; max-width: 100%; }
+    Launchpad #lp_title { text-style: bold; text-align: center; margin-bottom: 0; }
+    Launchpad #lp_sub { color: $text-muted; text-align: center; margin-bottom: 1; }
     Launchpad #lp_cards { layout: grid; grid-size: 2; grid-gutter: 0 1; height: auto; }
     Launchpad #lp_chips { color: $text-muted; margin-top: 1; height: auto; }
     """

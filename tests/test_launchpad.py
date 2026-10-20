@@ -71,21 +71,21 @@ def test_resume_card_explains_why_it_is_unavailable_and_how_to_fix_it():
 def test_resume_card_truncates_a_long_prompt():
     s = [{"id": "x", "turns": 1, "first_prompt": "a very long first prompt " * 5, "modified": "2026-10-18 11:59"}]
     sub = build_cards(1, s, True, now=NOW)[3].subtitle
-    assert len(sub) < 70 and "1 turn ·" in sub
+    assert len(sub) <= 41 and "1 turn ·" in sub and "…" in sub  # fits a card's width: no wrapped, taller card
 
 
 def test_state_chips_report_live_facts():
     chips = dict(state_chips(128, 2, True, True))
-    assert chips["◆ memory · 128 notes in this project"] == "learned"
-    assert "◆ skills · 2 awaiting your review" in chips
-    assert "● history on · sessions are saved" in chips and "● per-turn budget set" in chips
+    assert chips["◆ memory · 128 notes"] == "learned"
+    assert "◆ 2 skills to review" in chips
+    assert "● history on" in chips and "● budget set" in chips
 
 
 def test_state_chips_when_nothing_is_set_up_point_at_the_command():
     texts = [t for t, _ in state_chips(0, 0, False, False)]
-    assert "◆ memory · nothing saved in this project yet" in texts
-    assert "○ history off · /tracking on" in texts and "○ budget · no limit set · /budget" in texts
-    assert not any("skills" in t for t in texts)  # only listed when something waits for review
+    assert "◆ memory · empty" in texts
+    assert "○ history off · /tracking on" in texts and "○ no budget · /budget" in texts
+    assert not any("skill" in t for t in texts)  # only listed when something waits for review
 
 
 def test_git_changes_is_none_outside_a_repo(tmp_path):
@@ -116,7 +116,7 @@ def test_collect_reads_memory_and_budget_from_the_agent(tmp_path):
     agent = SimpleNamespace(memory=SimpleNamespace(count=lambda: 7), budget=SimpleNamespace(active=True))
     _, chips = collect(str(tmp_path), agent, tracking_on=True)
     texts = [t for t, _ in chips]
-    assert "◆ memory · 7 notes in this project" in texts and "● per-turn budget set" in texts
+    assert "◆ memory · 7 notes" in texts and "● budget set" in texts
 
 
 # ── in the real TUI ──────────────────────────────────────────────────────────
@@ -213,3 +213,16 @@ async def test_new_conversation_brings_the_launchpad_back(tmp_path, monkeypatch)
         await send(app, pilot, "/new")
         await wait_cards(app, pilot)
         assert len(list(app.screen.query(Launchpad))) == 1
+
+
+async def test_the_launchpad_column_is_capped_and_the_facts_fit_on_one_line(tmp_path, monkeypatch):
+    """On a wide terminal the cards used to stretch edge to edge while the title stayed centred over
+    a narrow column; and a fact that wrapped mid-phrase read as two facts."""
+    async with tui_app(tmp_path, monkeypatch, [text("x")]) as (app, pilot):
+        await wait_cards(app, pilot)
+        await pilot.resize_terminal(200, 50)
+        await pilot.pause(0.3)
+        for name in ("#lp_title", "#lp_cards", "#lp_chips"):
+            assert app.screen.query_one(name).size.width <= 96, name
+        chips = app.screen.query_one("#lp_chips")
+        assert chips.size.height == 1 and "memory" in _text_of(chips)

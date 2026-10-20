@@ -227,14 +227,18 @@ class TurnSummary(Vertical):
         border-left: solid $border;
     }
     TurnSummary > #summary_chips { height: 1; }
+    TurnSummary > #summary_next { height: 1; }
+    TurnSummary #summary_next_label { width: auto; margin-right: 1; }
     """
 
-    def __init__(self, headline: Sequence[Tuple[str, str]], chips: Sequence[Chip], colors: Dict[str, str], **kwargs: Any) -> None:
+    def __init__(self, headline: Sequence[Tuple[str, str]], chips: Sequence[Chip], colors: Dict[str, str],
+                 follow_ups: Sequence[Chip] = (), **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._headline = list(headline)
         self._chips = list(chips)
+        self._follow_ups = list(follow_ups)
         self._colors = colors
-        self.active = bool(chips)
+        self.active = bool(chips or follow_ups)
 
     def compose(self):
         text = Text()
@@ -245,16 +249,50 @@ class TurnSummary(Vertical):
             with Horizontal(id="summary_chips"):
                 for chip in self._chips:
                     yield ActionChip(chip, id="chip_" + "".join(c if c.isalnum() else "_" for c in chip.label.lower()))
+        if self._follow_ups:
+            with Horizontal(id="summary_next"):
+                yield Static(Text("Next, fills the box:", style="dim"), id="summary_next_label")
+                for chip in self._follow_ups:
+                    yield ActionChip(chip, id="next_" + "".join(c if c.isalnum() else "_" for c in chip.label.lower()))
 
     def retire(self) -> None:
         """Keep the record of what happened; drop the actions."""
         if not self.active:
             return
         self.active = False
-        try:
-            self.query_one("#summary_chips").remove()
-        except Exception:
-            pass
+        for row in ("#summary_chips", "#summary_next"):
+            try:
+                self.query_one(row).remove()
+            except Exception:
+                pass
+
+
+@dataclass(frozen=True)
+class NextStep:
+    label: str
+    prompt: str
+    mode: Optional[str] = None   # the mode the step switches to, if it needs a different one
+
+
+REVIEW_PROMPT = "Review my uncommitted changes (git diff): flag bugs, risky edits and missing tests."
+
+
+def next_steps(edited: bool, failed: int, mode: str) -> List[NextStep]:
+    """Follow-ups keyed to what just happened. Fixed templates, not model suggestions: they cost no
+    tokens, cannot invent work, and each one only fills the message box for you to edit."""
+    steps: List[NextStep] = []
+    if failed:
+        steps.append(NextStep("Diagnose the failure",
+                              "The last tool call failed. Work out why and try a different approach."))
+    if edited:
+        steps += [
+            NextStep("Add a test for this change", "Add a test that covers the change you just made."),
+            NextStep("Run the full test suite", "Run the full test suite and report any failures."),
+            NextStep("Review my changes", REVIEW_PROMPT, "plan"),
+        ]
+    elif mode == "plan" and not failed:
+        steps.append(NextStep("Switch to Build and do it", "Go ahead and implement the plan.", "build"))
+    return steps[:3]
 
 
 def headline_parts(log: TurnLog, files_changed: int, added: int, removed: int, elapsed: float,

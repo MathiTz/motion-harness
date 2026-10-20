@@ -159,3 +159,54 @@ async def test_status_bar_branch_is_filled_in_after_mount(tmp_path, monkeypatch)
             if "calm-pass" in plain(app.screen.query_one(StatusBar).build()):
                 break
         assert "calm-pass" in plain(app.screen.query_one(StatusBar).build())
+
+
+# ── the one-time move to Cobalt ──────────────────────────────────────────────
+
+def read_cfg(path):
+    import yaml
+
+    return yaml.safe_load(path.read_text()) or {}
+
+
+async def test_first_launch_after_the_redesign_moves_a_saved_theme_to_cobalt_once(tmp_path, monkeypatch):
+    """A saved theme used to win, which meant the redesign was invisible to anyone who had ever
+    opened the theme menu: new layout, old colours. It now switches once and says so."""
+    notes = []
+    monkeypatch.setattr(tui.MotionTUI, "notify", lambda self, msg, **kw: notes.append(msg))
+    async with tui_app(tmp_path, monkeypatch, [text("x")], extra_cfg="default_theme: catppuccin_mocha\n") as (app, pilot):
+        await pilot.pause(0.2)
+        assert app.theme == "cobalt"
+        cfg = read_cfg(tmp_path / "config.yml")
+        assert cfg["default_theme"] == "cobalt" and cfg["ui_theme_migrated"] is True
+        assert any("Cobalt" in n and "Catppuccin Mocha" in n and "Ctrl+T" in n for n in notes)
+
+
+async def test_an_unset_theme_becomes_cobalt_without_a_notice(tmp_path, monkeypatch):
+    notes = []
+    monkeypatch.setattr(tui.MotionTUI, "notify", lambda self, msg, **kw: notes.append(msg))
+    async with tui_app(tmp_path, monkeypatch, [text("x")]) as (app, pilot):
+        await pilot.pause(0.2)
+        assert app.theme == "cobalt" and read_cfg(tmp_path / "config.yml")["ui_theme_migrated"] is True
+        assert not any("New default theme" in n for n in notes)  # nothing was taken away, so nothing to announce
+
+
+async def test_after_the_move_the_users_own_theme_choice_is_respected(tmp_path, monkeypatch):
+    notes = []
+    monkeypatch.setattr(tui.MotionTUI, "notify", lambda self, msg, **kw: notes.append(msg))
+    async with tui_app(tmp_path, monkeypatch, [text("x")], extra_cfg="ui_theme_migrated: true\ndefault_theme: nord\n") as (app, pilot):
+        await pilot.pause(0.2)
+        assert app.theme == "nord" and read_cfg(tmp_path / "config.yml")["default_theme"] == "nord"
+        assert not any("New default theme" in n for n in notes)
+
+
+async def test_picking_a_theme_in_the_menu_survives_the_next_launch(tmp_path, monkeypatch):
+    async with tui_app(tmp_path, monkeypatch, [text("x")], extra_cfg="default_theme: dracula\n") as (app, pilot):
+        await pilot.pause(0.2)
+        assert app.theme == "cobalt"                 # moved once
+        app.screen.set_theme("nord")                 # then the user chooses
+    cfg = read_cfg(tmp_path / "config.yml")
+    assert cfg["default_theme"] == "nord" and cfg["ui_theme_migrated"] is True
+    async with tui_app(tmp_path, monkeypatch, [text("x")], extra_cfg=f"ui_theme_migrated: true\ndefault_theme: {cfg['default_theme']}\n") as (app, pilot):
+        await pilot.pause(0.2)
+        assert app.theme == "nord"                   # and it is not moved again
