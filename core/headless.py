@@ -117,7 +117,7 @@ async def run_headless(
         agent.budget = Budget(**{**base.__dict__, **{k: v for k, v in limits.items() if v is not None}})
     provider_cfg = getattr(agent.provider, "config", None)
     stats: Dict[str, Any] = {
-        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "cached_tokens": 0},
         "steps": 0, "tool_calls": 0, "ttft_s": None, "elapsed_s": None, "error": None,
         "trajectory": [], "budget_hit": None,
     }
@@ -226,7 +226,7 @@ async def run_headless(
     cost = turn_cost(
         getattr(provider_cfg, "provider_type", "cloud"),
         getattr(provider_cfg, "options", {}) or {},
-        usage["prompt_tokens"], usage["completion_tokens"],
+        usage["prompt_tokens"], usage["completion_tokens"], usage["cached_tokens"],
     )
     summary = {
         "type": "result",

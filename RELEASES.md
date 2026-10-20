@@ -5,6 +5,17 @@ This file tracks the evolution of Motion Harness. We follow Semantic Versioning 
 ## 🧪 Beta Releases (Pre-release)
 Current Phase: **Stability & Bug Squashing**
 
+### Unreleased: token usage and prompt caching (issue #35)
+
+The "10x tokens vs opencode" part of [#35](https://github.com/MathiTz/motion-harness/issues/35) was never measured. It now is: same task, same model, both tools (method, numbers and caveats in [docs/token-usage.md](docs/token-usage.md)).
+
+- **Mostly a metric.** opencode also sends over a million prompt tokens on that task; 96% are cache hits, so its fresh total is 54k. We reported the summed figure as "tokens", and priced every prompt token at full input price, so our cost estimate was about 5x opencode's ($0.088 vs $0.016) for a comparable run.
+- **Cached tokens are now tracked and priced.** `cached_tokens` per step in trajectories and totals, in the headless JSON (`usage.cached_tokens`, a new key), and in `/trajectory` ("80% of the 40k prompt tokens were served from the provider's cache"). `estimate_cost` takes an optional per-model `cached_mtok`; without it cached tokens stay priced as input, an upper bound rather than a guessed discount.
+- **Trimming no longer breaks the cache.** Old tool output was trimmed on every step, rewriting messages the previous request had just sent in full and invalidating the provider's cached prefix. For a provider seen to report cached tokens it now waits until the conversation is large (~20k estimated tokens, at most a third of the window) and trims in one batch. Providers that report no caching behave as before.
+- **Measured effect, honestly:** over three runs each, cache hit rate 77% to 81% and fresh tokens per step about 3.9k to 3.2k (about -18%). One task, one model, noisy step counts; modest, not a solved problem.
+- **Not settled:** we still use ~1.7x opencode's fresh tokens per step and issue more tool calls (about 100 vs 41 on this task). opencode has a code-execution tool that batches many operations into one call; Motion has no equivalent.
+- Issue #35 is not closed: only the reporter's retest does that.
+
 ### v0.17.0-beta.0: Cobalt theme, a calmer window, a turn card, a session rail, a launchpad, and guided dialogs — PRs [#40](https://github.com/MathiTz/motion-harness/pull/40)–[#44](https://github.com/MathiTz/motion-harness/pull/44)
 
 First six steps of a UI redesign (design: one page per state, in the redesign canvas shared with the maintainer). Nothing here changes behaviour, keybindings or headless output.

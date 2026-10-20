@@ -586,7 +586,7 @@ async def test_a_long_run_of_big_reads_no_longer_balloons_the_context(tmp_path: 
     monkeypatch.setattr(wt, "READ_DEFAULT_LINES", 2000)
     monkeypatch.setattr(agent_loop, "MAX_RESULT_CHARS", 40_000)
     orig_trim = context.trim_old_tool_results
-    monkeypatch.setattr(agent_loop, "trim_old_tool_results", lambda msgs: orig_trim(msgs, 6, 1500))
+    monkeypatch.setattr(agent_loop, "trim_when_needed", lambda msgs, sp, window, cached: orig_trim(msgs, 6, 1500))
     (tmp_path / "old").mkdir()
     old = await _prompt_tokens_for_long_read_run(tmp_path / "old")
 

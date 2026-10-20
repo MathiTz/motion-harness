@@ -54,7 +54,7 @@ async def test_json_mode_reports_usage_cost_and_stats(tmp_path):
     data = json.loads(out)
     assert code == EXIT_OK and data["ok"] is True and data["result"] == "all done" and data["error"] is None
     assert data["tool_calls"] == 1 and data["steps"] == 2 and data["mode"] == "build"
-    assert data["usage"] == {"prompt_tokens": 2000, "completion_tokens": 1000, "total_tokens": 3000}
+    assert data["usage"] == {"prompt_tokens": 2000, "completion_tokens": 1000, "total_tokens": 3000, "cached_tokens": 0}
     assert data["cost_usd"] == pytest.approx((2000 * 1.0 + 1000 * 2.0) / 1e6)
     assert data["elapsed_s"] is not None and data["workspace"] == str(tmp_path)
 
@@ -229,7 +229,7 @@ def test_cli_json_mode_reports_real_usage_and_cost(cli):
     assert proc.returncode == 0, proc.stderr
     data = json.loads(proc.stdout)
     assert data["ok"] and data["result"] == "The codeword is PELICAN-42." and data["tool_calls"] == 1
-    assert data["usage"] == {"prompt_tokens": 2000, "completion_tokens": 1000, "total_tokens": 3000}
+    assert data["usage"] == {"prompt_tokens": 2000, "completion_tokens": 1000, "total_tokens": 3000, "cached_tokens": 0}
     assert data["cost_usd"] == pytest.approx(0.004) and data["model"] == "m"
 
 

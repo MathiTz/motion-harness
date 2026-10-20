@@ -6,6 +6,6 @@ Add a row when you file a report; update it when a PR ships; only the reporter o
 
 | Report | Task attempted | PR(s) | Shipped | Retest |
 | --- | --- | --- | --- | --- |
-| [#35](https://github.com/MathiTz/motion-harness/issues/35) | Using Motion for a coding task; compared token/tool-call usage against opencode for the same task | [#25](https://github.com/MathiTz/motion-harness/pull/25), [#26](https://github.com/MathiTz/motion-harness/pull/26)/[#28](https://github.com/MathiTz/motion-harness/pull/28), [#27](https://github.com/MathiTz/motion-harness/pull/27) | 2026-09-27 | ⏳ awaiting reporter retest |
+| [#35](https://github.com/MathiTz/motion-harness/issues/35) | Using Motion for a coding task; compared token/tool-call usage against opencode for the same task | [#25](https://github.com/MathiTz/motion-harness/pull/25), [#26](https://github.com/MathiTz/motion-harness/pull/26)/[#28](https://github.com/MathiTz/motion-harness/pull/28), [#27](https://github.com/MathiTz/motion-harness/pull/27), usage measurement and cache fix: see [token-usage.md](token-usage.md) | 2026-09-27; usage follow-up 2026-10-19 | ⏳ awaiting reporter retest |
 
 This table starts with one entry, filed for real from this session's own conversation (not invented — see [#35](https://github.com/MathiTz/motion-harness/issues/35) for the reporter's own words) precisely so the fields above are proven usable, not just theoretical, per this feature's own acceptance criteria.

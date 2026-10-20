@@ -34,7 +34,7 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 
-from core.context import compact_messages, messages_tokens, trim_old_tool_results
+from core.context import compact_messages, messages_tokens, trim_when_needed
 from core.textbound import bound_text
 from core.trajectory import preview_args
 from core.budget import Budget
@@ -280,7 +280,7 @@ class TurnRunner:
         self.inspection_only_loops = 0
         self.last_call_signature: Optional[tuple] = None
         self.repeat_count = 0
-        self.turn_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        self.turn_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "cached_tokens": 0}
         self._pending_images: List[Dict[str, str]] = []
         self.tool_call_count = 0
         self.hit_step_cap = False  # the turn ended because it ran out of steps, not because it finished
@@ -327,6 +327,11 @@ class TurnRunner:
         if usage:
             for k in self.turn_usage:
                 self.turn_usage[k] += int(usage.get(k) or 0)
+            if usage.get("cached_tokens"):
+                try:  # remembered across turns: this provider caches the prefix, so keep it stable
+                    self.agent.prompt_cache_seen = True
+                except Exception:
+                    pass
             await self.trace("usage", f"{label} usage", **usage)
 
     # ── memory / context ─────────────────────────────────────────────────
@@ -569,6 +574,7 @@ class TurnRunner:
             "ttft_s": round(step.ttft, 3) if step.ttft is not None else None,
             "prompt_tokens": usage.get("prompt_tokens"),
             "completion_tokens": usage.get("completion_tokens"),
+            "cached_tokens": usage.get("cached_tokens"),
             "context_tokens_est": ctx_tokens,
             "text_chars": len(step.text or ""),
             "reasoning_chars": len(step.reasoning or ""),
@@ -1032,7 +1038,7 @@ class TurnRunner:
                     wrapping_up, budget_reason = True, reason
                     self.messages.append({"role": "user", "content": BUDGET_WRAPUP.format(reason=reason)})
                     await self.trace("budget_hit", f"Budget reached: {reason}", reason=reason)
-            trim_old_tool_results(self.messages)
+            trim_when_needed(self.messages, self.system_prompt, window, bool(getattr(self.agent, "prompt_cache_seen", False)))
             if compact_messages(self.messages, self.system_prompt, window, prompt_index):
                 await self.trace("context_compacted", "Trimmed older tool steps to stay within the context window")
 
