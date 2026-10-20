@@ -32,6 +32,7 @@ First six steps of a UI redesign (design: one page per state, in the redesign ca
 - **Next-step chips** under the Done strip, keyed to what happened (after an edit: add a test, run the suite, review my changes; after a failure: diagnose it; after a Plan-mode answer: switch to Build and do it). Fixed templates, so no tokens and no invented work; each one only fills the message box.
 - Bug fixes found while building it: option labels like `[y]` were swallowed as Rich markup, and the approval box stretched to the full screen height.
 - Not changed: the "/" completion menu keeps its own list.
+- **Follow-ups from using it for real:** the Launchpad is a centred column of at most 96 columns (cards had stretched edge to edge on wide terminals) and its facts fit on one line; a resume card's prompt snippet is shortened so the card stays the same height as its neighbours. `Ctrl+B` now saves your choice as `session_rail: auto|on|off` (a hand-written YAML `on`/`off` is accepted), because the width-based auto-hide showed the wrong answer on at least one real terminal that could not be reproduced here; the sizes it sees are written to `motion.log` so that can be diagnosed from a real run.
 
 ### v0.16.0-beta.0: headless subcommands — [#39](https://github.com/MathiTz/motion-harness/pull/39)
 

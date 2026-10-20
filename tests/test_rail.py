@@ -224,3 +224,26 @@ async def test_the_rail_hides_on_a_narrow_terminal_and_ctrl_b_still_brings_it_ba
         await pilot.resize_terminal(150, 40)
         await pilot.pause(0.2)
         assert rail.styles.display == "none"   # the user turned it off: wide terminals don't override that
+
+
+async def test_ctrl_b_is_remembered_for_the_next_launch(tmp_path, monkeypatch):
+    """The auto-hide guessed wrong on at least one real terminal, so one toggle must stick."""
+    import yaml
+
+    async with tui_app(tmp_path, monkeypatch, [text("x")]) as (app, pilot):
+        await pilot.press("ctrl+b")        # shown (wide terminal) -> hide
+        await pilot.pause(0.1)
+        assert yaml.safe_load((tmp_path / "config.yml").read_text())["session_rail"] == "off"
+        await pilot.press("ctrl+b")        # and back
+        await pilot.pause(0.1)
+        assert yaml.safe_load((tmp_path / "config.yml").read_text())["session_rail"] == "on"
+
+
+async def test_a_saved_rail_preference_wins_over_the_width_guess(tmp_path, monkeypatch):
+    async with tui_app(tmp_path, monkeypatch, [text("x")], extra_cfg="session_rail: on\n") as (app, pilot):
+        await pilot.resize_terminal(RAIL_MIN_WIDTH - 40, 40)
+        await pilot.pause(0.2)
+        assert app.screen.query_one("#context_panel").styles.display == "block"  # narrow, but you asked for it
+    async with tui_app(tmp_path, monkeypatch, [text("x")], extra_cfg="session_rail: off\n") as (app, pilot):
+        await pilot.pause(0.2)
+        assert app.screen.query_one("#context_panel").styles.display == "none"   # wide, but you turned it off

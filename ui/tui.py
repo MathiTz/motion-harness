@@ -169,6 +169,15 @@ class AppState:
         # What the session rail shows that nothing else keeps (files touched, recall, sandbox, budget use).
         self.rail = RailData()
         self.rail_forced = False  # the user asked for the rail on a terminal too narrow to show it by default
+        # `session_rail` in config.yml: auto (default: shown when the terminal is wide enough), on, or
+        # off. Ctrl+B writes it, so one toggle is remembered instead of being redone every launch.
+        raw = self.config_manager.get("session_rail")
+        # YAML turns a hand-written `session_rail: on` / `off` into True / False, so accept both spellings
+        pref = "on" if raw is True else "off" if raw is False else str(raw or "auto").lower()
+        if pref in ("off", "false", "no"):
+            self.show_activity_rail = False
+        elif pref in ("on", "true", "yes"):
+            self.rail_forced = True
         # One record per model step of every turn this session (see core/trajectory.py),
         # plus the last turn's full message transcript for `/trajectory save full`.
         self.trajectory: list[dict] = []
@@ -2658,8 +2667,13 @@ class MainScreen(Screen):
         return self.state.show_activity_rail and (wide or self.state.rail_forced)
 
     def _apply_rail_visibility(self) -> None:
+        shown = self._rail_shown()
+        logger.info(  # motion.log: lets a "the rail is missing" report be diagnosed from real sizes
+            "session rail: shown=%s screen=%s app=%s pref_on=%s forced=%s",
+            shown, self.size.width, self.app.size.width, self.state.show_activity_rail, self.state.rail_forced,
+        )
         try:
-            self.query_one("#context_panel", SessionRail).styles.display = "block" if self._rail_shown() else "none"
+            self.query_one("#context_panel", SessionRail).styles.display = "block" if shown else "none"
         except Exception:
             pass
 
@@ -2694,8 +2708,14 @@ class MainScreen(Screen):
     def action_toggle_context_panel(self) -> None:
         if self._rail_shown():
             self.state.show_activity_rail, self.state.rail_forced = False, False
+            pref = "off"
         else:  # asking for it on a narrow terminal is an explicit choice, so it overrides the auto-hide
             self.state.show_activity_rail, self.state.rail_forced = True, True
+            pref = "on"
+        try:
+            self.state.config_manager.set("session_rail", pref)  # remembered for the next launch
+        except Exception:
+            pass
         self._apply_rail_visibility()
 
     def action_show_shortcuts(self) -> None:
