@@ -77,6 +77,7 @@ from core.toolstate import ToolSession
 from core import auth
 from main import MotionAgent, REPO_DIR
 from ui.chrome import HintBar, StatusBar, role_colors
+from ui.launchpad import LaunchCard, Launchpad
 from ui.rail import RAIL_MIN_WIDTH, RailData, SessionRail
 from ui.turncard import EDIT_TOOLS, Chip, TurnLog, TurnSummary, headline_parts, render_card
 from ui.themes import ThemeRegistry
@@ -2776,12 +2777,39 @@ class ChatPane(Vertical):
     def on_mount(self) -> None:
         log = self.query_one("#chat_log", VerticalScroll)
         log.mount(SystemMessage("⚡ Motion Harness", id="connection_line"))
-        log.mount(SystemMessage("Tip: Ctrl+K commands · Ctrl+O model · Tab plan/build · F8 trace · ? all shortcuts"))
+        self._show_launchpad()
         self._refresh_connection_line()
         self._append_trace("session_start", f"provider={self.state.current_provider_id}")
         self._set_trace_panel_visible(self.state.show_trace_panel)
         self._refresh_meta()
         self.query_one("#chat_input", ChatComposer).focus()
+
+    def _show_launchpad(self) -> None:
+        """An empty session shows the Launchpad (starting moves and live facts) instead of a tip."""
+        if self.state.conversation_turns or list(self.query(Launchpad)):
+            return
+        self.query_one("#chat_log", VerticalScroll).mount(Launchpad(self.state, WORKSPACE, id="launchpad"))
+
+    def _dismiss_launchpad(self) -> None:
+        for pad in list(self.query(Launchpad)):
+            pad.remove()
+
+    def on_launch_card_chosen(self, event: LaunchCard.Chosen) -> None:
+        """A card sets the mode and puts its prompt in the composer to edit; it never sends anything."""
+        card = event.card
+        event.stop()
+        self._dismiss_launchpad()
+        if card.kind == "resume":
+            self._run_session_cmd(f"/resume {card.session_id}")
+            return
+        if card.mode and self.state.agent_mode != card.mode:
+            self.state.agent_mode = card.mode
+            self._refresh_meta()
+        box = self.query_one("#chat_input", ChatComposer)
+        box.value = card.prompt
+        box.cursor_position = len(card.prompt)
+        box.refresh()
+        box.focus()
 
     def _refresh_connection_line(self) -> None:
         """Update the intro "connected to" line whenever the provider/model
@@ -3303,6 +3331,7 @@ class ChatPane(Vertical):
         input_box.refresh()
         input_box.focus()
         self.state.record_prompt(text)
+        self._dismiss_launchpad()  # the first message ends the empty state
 
         log = self.query_one("#chat_log", VerticalScroll)
         if text.startswith("/skill"):
@@ -4229,6 +4258,7 @@ class ChatPane(Vertical):
                 if getattr(child, "id", None) != "connection_line":
                     child.remove()
             log.mount(SystemMessage("✨ New conversation. (Approvals and settings are kept.)"))
+            self._show_launchpad()
             self._refresh_context_panel_safe()
             self._refresh_status()
             return
